@@ -229,8 +229,8 @@ def hybrid_search_p(lut_list, func_distribution_arr, leftover_resource_time_arr,
         pareto_front=copy.deepcopy(value_arr)
         for j in range(20):
             pareto_front[j][0]=100-pareto_front[j][0]
-        phv_value = hvwfg.wfg(np.array(scaler.transform(pareto_front)).astype('double'), np.array(scaler.transform([reference_point])[0]).astype('double'))
-        print(search_epoch, phv_value, time.time()-start_time)
+        # phv_value = hvwfg.wfg(np.array(scaler.transform(pareto_front)).astype('double'), np.array(scaler.transform([reference_point])[0]).astype('double'))
+        # print(search_epoch, phv_value, time.time()-start_time)
         search_epoch+=1
             
     return design_arr, value_arr, standard_objective  ##should return pareto front

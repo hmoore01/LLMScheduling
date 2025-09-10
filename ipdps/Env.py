@@ -3,7 +3,7 @@ import math
 import random
 import copy
 import csv
-import hvwfg
+# import hvwfg
 import geo_simulator
 numbe_of_region = 4
 epoch_length = 900

@@ -1,0 +1,6 @@
+time_model:
+  time_val: 197.8932
+carbon_model:
+  carbon_val: 33030.4060
+water_model:
+  water_val: 287.3091
