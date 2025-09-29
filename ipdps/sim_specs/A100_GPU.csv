@@ -1,0 +1,5 @@
+num_GPUs,Mem_Size,Llama7b_Process,Llama70b_Process,prefill_token_size,gen_token_size,batch_size,TDP
+1,80GB,2190,-,200,200,1,400
+2,160GB,1544,10500,200,200,1,800
+4,240GB,1280,6403,200,200,1,1600
+8,320GB,1187,4735,200,200,1,3200

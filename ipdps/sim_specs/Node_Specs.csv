@@ -1,0 +1,7 @@
+Node_Num,Node_Type,Inter_GPU_Bandwidth,Load_Bandwidth_PCIE,Load_Delay_NVLinkNum_GPUs
+0,8_A100s,600GB/s,64GB/s,600GB/s
+1,8_H100s,900GB/s,128GB/s,900GB/s
+2,4_A100s,600GB/s,64GB/s,600GB/s
+3,4_H100s,900GB/s,128GB/s,900GB/s
+4,2_A100s,600GB/s,64GB/s,600GB/s
+5,2_H100s,900GB/s,128GB/s,900GB/s

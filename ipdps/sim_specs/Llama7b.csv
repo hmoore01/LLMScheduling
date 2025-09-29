@@ -1,0 +1,3 @@
+Model_Name,Head,Layers,Dimension,Parameters,Parameter_Mem,Mem_per_Token
+Llama7b,32,32,4096,7B,13,0.000262
+Llama70b,64,80,8192,70B,138,0.00131
