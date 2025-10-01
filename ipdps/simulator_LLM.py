@@ -409,7 +409,7 @@ if __name__ == "__main__":
             for agent_id in all_agents
         }
 
-    for epoch_idx in range(0,1):
+    for epoch_idx in range(0,96):
         if epoch_idx not in grouped_trace.groups:
             continue
 
@@ -505,7 +505,7 @@ if __name__ == "__main__":
 
 
         if framework == 'Helix':
-            import Helix
+            from Helix import Helix
             stats, results, leftover_requests = Helix.milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary)
             cumulative_carbon += stats["carbon_emissions"]
             cumulative_water += stats["water_usage"]
@@ -514,7 +514,10 @@ if __name__ == "__main__":
             total_invocations += len(results)
 
             write_epoch_stats("Helix", epoch_idx, stats)
-
+            print(f"Carbon emissions: {stats['carbon_emissions']}")
+            print(f"Water usage: {stats['water_usage']}")
+            print(f"Enery cost: {stats['energy_cost']}")
+            print(f"TTFT cost: {stats['avg_ttft']}")
             if "network_load" in stats:
                 net_load = stats["network_load"].copy()
                 net_load["epoch"] = epoch_idx
@@ -566,9 +569,8 @@ if __name__ == "__main__":
 
 
         elif framework == 'Splitwise':
-            import Splitwise
-
-            stats, results, leftover_requests = Splitwise.splitwise_scheduler(epoch_data, epoch_idx, node_properties, epoch_summary)
+            from Splitwise import Splitwise
+            stats, results, leftover_requests = Splitwise.milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary)
             print(f"Carbon Emissions:")
             print(stats["carbon_emissions"])
             cumulative_carbon += stats["carbon_emissions"]

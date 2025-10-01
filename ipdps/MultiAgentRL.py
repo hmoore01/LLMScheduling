@@ -22,58 +22,10 @@ import pandas as pd
 import joblib
 
 NUM_NODE_TYPES = 6
-latency_df = pd.read_csv("/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Geo_Latencies.csv", index_col=0)
+latency_df = pd.read_csv("/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/Geo_Latencies.csv", index_col=0)
 METRIC_ORDER = ["ttft", "carbon", "water", "cost"]
 
 # estimator_model = joblib.load("checkpoint_epoch_1050.pkl")
-
-from train_predictor import STATIC_FEATURES
-
-def extract_features(epoch_df, schedule_plan, power_plan, num_datacenters=12):
-    total_requests = len(schedule_plan)
-    avg_tokens = epoch_df["num_tokens"].mean()
-    max_tokens = epoch_df["num_tokens"].max()
-    pct_llama70b = (epoch_df["model_type"] == "Llama70b").mean()
-    avg_batch = epoch_df["batch_size"].mean()
-    std_batch = epoch_df["batch_size"].std()
-
-    # Token-to-batch ratio
-    token_batch_ratio = avg_tokens / avg_batch if avg_batch > 0 else 0
-
-    # Datacenter usage features
-    dc_ids = [req["target_dc_id"] for req in schedule_plan]
-    dc_counts = pd.Series(dc_ids).value_counts(normalize=True)
-    active_dc_ratio = len(dc_counts) / num_datacenters
-    std_dc_usage = dc_counts.std() if len(dc_counts) > 1 else 0.0
-
-    # Average latency between source and target DCs
-    latencies = []
-    for req, sched in zip(epoch_df.to_dict("records"), schedule_plan):
-        src = int(req["source_dc_id"])
-        tgt = int(sched["target_dc_id"])
-        lat = latency_df.iloc[src, tgt]
-        if lat > 0:
-            latencies.append(lat)
-    avg_route_latency = np.mean(latencies) if latencies else 0.0
-
-    # Power plan features
-    total_idle = sum(1 for dc in power_plan.values() for state in dc.values() if state == "Idle")
-    total_off = sum(1 for dc in power_plan.values() for state in dc.values() if state == "Off")
-    num_active_nodes = num_datacenters * NUM_NODE_TYPES - total_off
-    peak_batch = epoch_df["batch_size"].max()
-
-    # Weighted model intensity
-    model_weights = epoch_df["model_type"].apply(lambda x: 2 if x == "Llama70b" else 1)
-    model_load_intensity = model_weights.mean()
-
-    dynamic = [
-        total_requests, avg_tokens, max_tokens, pct_llama70b,
-        avg_batch, std_batch, active_dc_ratio, std_dc_usage, total_idle,
-        num_active_nodes, peak_batch, token_batch_ratio,
-        avg_route_latency, model_load_intensity
-    ]
-
-    return dynamic + STATIC_FEATURES
 
 
  # def estimate_metrics(epoch_df, schedule_plan, power_plan):

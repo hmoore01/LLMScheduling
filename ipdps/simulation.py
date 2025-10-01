@@ -5,6 +5,8 @@ import random
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from numba import njit
 import math
+from typing import Dict, List, Set, Any, Iterable, Union, Tuple
+from collections import defaultdict
 
 EPOCH_LENGTH = 900
 NUM_EPOCHS = 3
@@ -12,6 +14,233 @@ REQUESTS_PER_EPOCH = 1000
 TOTAL_REQUESTS = NUM_EPOCHS * REQUESTS_PER_EPOCH
 NUM_DATACENTERS = 12
 WORKLOAD_FILE = "simulator_ready_trace.csv"
+
+# Adjust this registry to your environment once, centrally.
+MODEL_CODE: Dict[str, int] = {
+    "Llama7b": 0,
+    "Llama13b": 1,
+    "Llama70b": 2,
+    "Mistral7b": 3,
+    "Mixtral8x7b": 4,
+    "GPT4": 5,
+}
+
+ModelType = Union[int, str]
+
+def coerce_model_type(mt: ModelType, model_registry: Dict[str, int]) -> int:
+    """
+    Convert model type to the internal int code.
+    Accepts: int (kept), digit-like str (e.g. '2'), or name (e.g. 'Llama70b').
+    """
+    if isinstance(mt, int):
+        return mt
+    s = str(mt).strip()
+    if s.isdigit():
+        return int(s)
+    try:
+        return model_registry[s]
+    except KeyError:
+        raise ValueError(f"Unknown model_type '{mt}'. Add to registry or pass a custom mapping.")
+
+
+# --- 2) Normalize schedule plan rows -----------------------------------------
+
+def normalize_plan_row(row: Dict[str, Any], model_registry: Dict[str, int]) -> Dict[str, int]:
+    """
+    Ensure every field has the right type and model_type is an INT code.
+    """
+    return {
+        "target_dc_id": int(row.get("target_dc_id", 0) or 0),  # 0 = wildcard
+        "model_type": coerce_model_type(row["model_type"], model_registry),
+        "num_tokens": int(row["num_tokens"]),
+        "batch_size": int(row["batch_size"]),
+        "source_dc_id": int(row["source_dc_id"]),
+        "time_index": int(row["time_index"]),
+    }
+
+def normalize_schedule_plan(plan_rows: List[Dict[str, Any]], model_registry: Dict[str, int]) -> List[Dict[str, int]]:
+    return [normalize_plan_row(r, model_registry) for r in plan_rows]
+
+
+# --- 3) Coerce allowed_types to int sets -------------------------------------
+
+def coerce_allowed_types(
+    allowed_types_raw: Dict[Union[int, str], Iterable[ModelType]],
+    model_registry: Dict[str, int],
+) -> Dict[int, Set[int]]:
+    """
+    allowed_types_raw example (from your logs):
+      { 0: ['0','1','2','3','4','5'], 1: ['0','1',...], ... }
+    Produces: { dc_id:int -> {model_code_int, ...} }
+    """
+    out: Dict[int, Set[int]] = {}
+    for dc, types in allowed_types_raw.items():
+        dc_id = int(dc)
+        out[dc_id] = {coerce_model_type(t, model_registry) for t in types}
+    return out
+
+
+# --- 4) Build a DC-indexed quotas view ---------------------------------------
+
+def plan_to_quotas_by_dc(
+    plan_rows: List[Dict[str, int]],
+    strategy: str = "max_time_index",
+) -> Dict[int, Dict[str, int]]:
+    """
+    Build a single 'current' quota record per DC, keyed by source_dc_id (real DC id).
+
+    If multiple rows exist per DC, choose using `strategy`:
+      - "max_time_index": pick the row with the largest time_index
+      - "min_time_index": pick the row with the smallest time_index
+      - "last": last-seen wins (stream order)
+    """
+    grouped: Dict[int, List[Dict[str, int]]] = defaultdict(list)
+    for r in plan_rows:
+        grouped[r["source_dc_id"]].append(r)
+
+    out: Dict[int, Dict[str, int]] = {}
+    for dc_id, rows in grouped.items():
+        if strategy == "max_time_index":
+            out[dc_id] = max(rows, key=lambda x: x["time_index"])
+        elif strategy == "min_time_index":
+            out[dc_id] = min(rows, key=lambda x: x["time_index"])
+        elif strategy == "last":
+            out[dc_id] = rows[-1]
+        else:
+            raise ValueError(f"Unknown strategy '{strategy}'")
+    return out
+
+
+# --- 5) Candidate DC sanity filter -------------------------------------------
+
+def filter_candidate_dcs(
+    candidate_dcs: Iterable[Union[int, str]],
+    known_dc_ids: Iterable[int],
+) -> List[int]:
+    """
+    Remove bogus IDs (e.g., when candidate_dcs accidentally equals range(len(plan_rows))).
+    Keeps only DCs that actually exist in known_dc_ids.
+    """
+    known = set(int(x) for x in known_dc_ids)
+    clean = []
+    for x in candidate_dcs:
+        dc = int(x)
+        if dc in known:
+            clean.append(dc)
+    return clean
+
+
+# --- 6) Eligibility + selection ----------------------------------------------
+
+def eligible_dcs_for_job(
+    job_row: Dict[str, int],
+    quotas_by_dc: Dict[int, Dict[str, int]],
+    allowed_types: Dict[int, Set[int]],
+    candidate_dcs: Iterable[int],
+) -> List[int]:
+    """
+    Compute eligible DCs for a single job row.
+    Conditions:
+      - DC has a quota record
+      - num_tokens > 0
+      - desired model_type is allowed at that DC
+      - target_dc_id is 0 (wildcard) or equals that DC
+    """
+    desired_model = job_row["model_type"]
+    target_dc_id = job_row.get("target_dc_id", 0) or 0
+
+    eligible: List[int] = []
+    for dc in candidate_dcs:
+        q = quotas_by_dc.get(dc)
+        if not q:
+            continue
+        if int(q.get("num_tokens", 0)) <= 0:
+            continue
+        if desired_model not in allowed_types.get(dc, set()):
+            continue
+        if target_dc_id not in (0, dc):
+            continue
+        eligible.append(dc)
+    return eligible
+
+
+def choose_dc_for_job(
+    job_row: Dict[str, int],
+    quotas_by_dc: Dict[int, Dict[str, int]],
+    allowed_types: Dict[int, Set[int]],
+    candidate_dcs: Iterable[int],
+    scoring: str = "max_tokens",
+) -> Union[int, None]:
+    """
+    Pick one DC from the eligible set using a scoring heuristic:
+      - 'max_tokens': maximize q['num_tokens']
+      - 'min_time_index': choose eligible DC whose quota row has smallest time_index
+      - 'max_time_index': choose eligible DC whose quota row has largest time_index
+    Returns the chosen DC id or None if no eligible DCs.
+    """
+    eligible = eligible_dcs_for_job(job_row, quotas_by_dc, allowed_types, candidate_dcs)
+    if not eligible:
+        return None
+
+    if scoring == "max_tokens":
+        return max(eligible, key=lambda dc: int(quotas_by_dc[dc].get("num_tokens", 0)))
+    elif scoring == "min_time_index":
+        return min(eligible, key=lambda dc: int(quotas_by_dc[dc].get("time_index", 0)))
+    elif scoring == "max_time_index":
+        return max(eligible, key=lambda dc: int(quotas_by_dc[dc].get("time_index", 0)))
+    else:
+        raise ValueError(f"Unknown scoring '{scoring}'")
+
+
+# --- 7) One-shot convenience wrapper -----------------------------------------
+
+def prepare_and_choose(
+    raw_plan_rows: List[Dict[str, Any]],
+    allowed_types_raw: Dict[Union[int, str], Iterable[ModelType]],
+    candidate_dcs_raw: Iterable[Union[int, str]],
+    model_registry: Dict[str, int] = MODEL_CODE,
+    pick_strategy: str = "max_time_index",
+    scoring: str = "max_tokens",
+) -> Tuple[Union[int, None], Dict[str, Any]]:
+    """
+    Full pipeline:
+      - normalize plan rows (fix model_type/types)
+      - coerce allowed_types to int sets
+      - build quotas_by_dc
+      - filter candidate_dcs to real DC ids (intersection of quotas & allowed_types)
+      - choose a DC for *the first job* in the normalized plan (adjust as needed)
+
+    Returns: (chosen_dc_or_none, debug_info)
+    """
+    plan = normalize_schedule_plan(raw_plan_rows, model_registry)
+    allowed_types = coerce_allowed_types(allowed_types_raw, model_registry)
+    quotas_by_dc = plan_to_quotas_by_dc(plan, strategy=pick_strategy)
+
+    known_dc_ids = set(quotas_by_dc.keys()) & set(allowed_types.keys())
+    candidate_dcs = filter_candidate_dcs(candidate_dcs_raw, known_dc_ids)
+
+    job = plan[0] if plan else None
+    if not job:
+        return None, {
+            "reason": "empty_plan",
+            "candidate_dcs": list(candidate_dcs),
+            "known_dc_ids": list(known_dc_ids),
+        }
+
+    chosen = choose_dc_for_job(job, quotas_by_dc, allowed_types, candidate_dcs, scoring=scoring)
+    return chosen, {
+        "job": job,
+        "candidate_dcs": list(candidate_dcs),
+        "eligible": eligible_dcs_for_job(job, quotas_by_dc, allowed_types, candidate_dcs),
+        "quotas_by_dc_sample": {k: quotas_by_dc[k] for k in list(quotas_by_dc)[:5]},
+        "allowed_types_sample": {k: sorted(list(v)) for k, v in list(allowed_types.items())[:5]},
+    }
+
+DEBUG_SCHED = True   # set False to silence
+def dbg(*args, **kwargs):
+    if DEBUG_SCHED:
+        print(*args, **kwargs)
+
 
 def my_scheduler(epoch_df: pd.DataFrame, epoch_idx: int) -> tuple:
 
@@ -75,8 +304,287 @@ def generate_random_workload():
     df.to_csv(WORKLOAD_FILE, index=False)
     print(f"Generated {len(df)} requests → {WORKLOAD_FILE}")
 
+from collections import defaultdict
 
-def LLM_Simulator(epoch_idx, workload_df, schedule_plan, power_plan):
+def _as_int(x, d=None):
+    try:
+        return int(x)
+    except Exception:
+        try:
+            return int(float(x))
+        except Exception:
+            return d
+
+def _norm_model(m):
+    return str(m).strip().lower() if m is not None else None
+
+class PlanEnforcer:
+    def __init__(self, schedule_plan, power_plan=None, epoch_summary=None,
+                 dc_latencies=None, valid_dc_ids=None, verbose=True):
+        self.verbose = bool(verbose)
+        self.dc_latencies = dict(dc_latencies or {})
+
+        # >>> COERCE valid_dc_ids TO INTS <<<
+        if valid_dc_ids is not None:
+            coerced = set()
+            for x in valid_dc_ids:
+                xi = _as_int(x, None)
+                if xi is not None:
+                    coerced.add(xi)
+            self.valid_dc_ids = coerced
+        else:
+            self.valid_dc_ids = None
+
+        rows = self._collect_rows(schedule_plan)
+        self.quotas = self._aggregate_rows(rows)
+        self.tokens_used = {dc: {m: 0 for m in models} for dc, models in self.quotas.items()}
+        self.allowed_types = {dc: sorted(list(models.keys())) for dc, models in self.quotas.items()}
+
+        self.counters = defaultdict(int)
+        self.req_log = []
+
+        if self.verbose:
+            print(f"[ENF] rows_in={len(rows)} sample_row={rows[0] if rows else None}")
+            print(f"[ENF] valid_dc_ids={sorted(self.valid_dc_ids) if self.valid_dc_ids else None}")
+            dc_keys = sorted(self.quotas.keys())
+            print(f"[ENF] dc_ids_in_quotas={dc_keys[:20]}{'...+' if len(dc_keys) > 20 else ''}")
+            for dc in dc_keys[:8]:
+                models = sorted(self.quotas[dc].keys())
+                caps = {m: int(self.quotas[dc][m].get('num_tokens', 0) or 0) for m in models}
+                print(f"[ENF] dc={dc} models={models} caps={caps}")
+
+    # ---- router API ----
+    def choose_dc_for_request(self, req_view, candidate_dcs):
+        model_in = (req_view.get("model_type")
+                    or req_view.get("model")
+                    or req_view.get("model_name"))
+        model = _norm_model(model_in)
+        if not model:
+            return (None, "defer-no-model")
+
+        eligible = []
+        for dc in candidate_dcs:
+            if dc not in self.quotas:           # only DCs we actually have quotas for
+                continue
+            if model not in self.quotas[dc]:
+                continue
+            if self.remaining_tokens(dc, model) > 0:
+                eligible.append(dc)
+
+        dbg_quotas = {dc: self.q(dc, model) for dc in candidate_dcs}
+        print(f"[ENF] choose: model={model_in} candidates={candidate_dcs} "
+              f"quotas={dbg_quotas} -> eligible={eligible}")
+
+        if not eligible:
+            return (None, "defer-no-quota")
+
+        def score(dc):
+            rem = self.remaining_tokens(dc, model)
+            lat = float(self.dc_latencies.get(dc, 0.0))
+            return (rem, -lat)
+
+        return (max(eligible, key=score), "ok")
+
+    def choose(self, model, candidate_dcs):
+        return self.choose_dc_for_request({"model_type": model}, candidate_dcs)
+
+    def consume(self, dc_id, req_view, tokens=None):
+        if dc_id is None:
+            return 0
+        model_in = (req_view.get("model_type")
+                    or req_view.get("model")
+                    or req_view.get("model_name"))
+        model = _norm_model(model_in)
+        if not model or dc_id not in self.quotas or model not in self.quotas[dc_id]:
+            return 0
+        if tokens is None:
+            tokens = int(req_view.get("num_tokens", 0) or 0)
+        take = min(max(int(tokens), 0), self.remaining_tokens(dc_id, model))
+        if take > 0:
+            self.tokens_used[dc_id][model] += take
+        return take
+
+    def remaining_tokens(self, dc_id, model):
+        model = _norm_model(model)
+        bucket = self.quotas.get(dc_id, {}).get(model)
+        if not bucket:
+            return 0
+        cap = int(bucket.get("num_tokens", 0) or 0)
+        used = int(self.tokens_used.get(dc_id, {}).get(model, 0) or 0)
+        return max(cap - used, 0)
+
+    def q(self, dc_id, model=None):
+        if model is not None:
+            return self.remaining_tokens(dc_id, model)
+        return {m: self.remaining_tokens(dc_id, m) for m in self.quotas.get(dc_id, {})}
+
+    def mark(self, reason, inc=1):
+        self.counters[str(reason)] += int(inc)
+
+    def report(self):
+        return dict(self.counters)
+
+    def log_req(self, **entry):
+        self.req_log.append(entry)
+
+    def get_request_log(self):
+        return list(self.req_log)
+
+    # ---- internals ----
+    def _collect_rows(self, plan):
+        rows = []
+        if plan is None:
+            return rows
+        if isinstance(plan, (list, tuple)):
+            rows.extend([r for r in plan if isinstance(r, dict)])
+            return rows
+        if isinstance(plan, dict):
+            vals = list(plan.values())
+            if vals and all(isinstance(v, dict) for v in vals) and any(
+                ("target_dc_id" in v) or ("model_type" in v) or ("num_tokens" in v) or ("tokens" in v)
+                for v in vals
+            ):
+                rows.extend(vals)
+                return rows
+            for maybe_dc, val in plan.items():
+                dcid = _as_int(maybe_dc, None)
+                if isinstance(val, (list, tuple)):
+                    for r in val:
+                        if isinstance(r, dict):
+                            rr = dict(r); rr.setdefault("target_dc_id", dcid); rows.append(rr)
+                elif isinstance(val, dict):
+                    looks_like_bucket = (
+                        (("num_tokens" in val) or ("tokens" in val)) and
+                        (("model_type" in val) or ("model" in val) or ("model_name" in val))
+                    )
+                    if looks_like_bucket:
+                        rr = dict(val); rr.setdefault("target_dc_id", dcid); rows.append(rr)
+                    else:
+                        for model_key, bucket in val.items():
+                            if isinstance(bucket, dict):
+                                rr = dict(bucket)
+                                rr.setdefault("target_dc_id", dcid)
+                                rr["model_type"] = model_key
+                                rows.append(rr)
+        return rows
+
+    def _aggregate_rows(self, rows):
+        from collections import defaultdict
+        quotas = defaultdict(dict)
+
+        for row in rows:
+            # --- ZERO-SAFE FIELD EXTRACTION ---
+            if "target_dc_id" in row:
+                dcid = row["target_dc_id"]
+            else:
+                dcid = row.get("dc_id")
+
+            if "model_type" in row:
+                model_in = row["model_type"]
+            else:
+                model_in = row.get("model") or row.get("model_name")
+
+            if "num_tokens" in row:
+                tokens = row["num_tokens"]
+            else:
+                tokens = row.get("tokens", 0)
+
+            # Skip incomplete rows
+            if dcid is None or model_in is None:
+                continue
+
+            dcid = _as_int(dcid, None)
+            if dcid is None:
+                continue
+
+            # Respect valid_dc_ids if provided
+            if self.valid_dc_ids is not None and dcid not in self.valid_dc_ids:
+                continue
+
+            model = _norm_model(model_in)
+            try:
+                tokens = int(tokens or 0)
+            except Exception:
+                tokens = 0
+
+            # Merge into quota bucket
+            bucket = quotas.setdefault(dcid, {}).setdefault(model, {"num_tokens": 0})
+            bucket["num_tokens"] = int(bucket.get("num_tokens", 0)) + tokens
+
+            # Carry through optional metadata once
+            for k in ("batch_size", "source_dc_id", "time_index"):
+                if k in row and k not in bucket:
+                    bucket[k] = row[k]
+
+        # return as plain dicts
+        return {dc: dict(models) for dc, models in quotas.items()}
+
+
+
+
+
+
+def apply_time_weighted_penalties(
+    stats,
+    req_log,
+    epoch_length,
+    *,
+    weights=None,
+    shape="linear"
+):
+    """
+    Time-weighted penalties:
+      - Earlier arrivals (small arrival_t) get LARGER penalties.
+      - No hard cap; weight grows with (epoch_length - arrival_t).
+    shape:
+      - "linear":   w = base * (1 + alpha * (E - t)/E)
+      - "quadratic":w = base * (1 + alpha * ((E - t)/E)**2)
+      - "exp":      w = base * exp(alpha * (E - t)/E)
+    tags charged: 'deferred' and 'impossible' (you can include 'spill' if desired)
+    """
+    E = float(epoch_length)
+    w = {
+        "base_penalty": 1.0,     # base per-miss cost unit
+        "alpha": 2.0,            # growth factor; tune per study
+        "tag_multipliers": {     # optional per-tag scaling
+            "deferred": 1.0,
+            "impossible": 1.5,
+            "spill": 0.5,        # if you keep spill enabled
+        },
+    }
+    if weights: w.update(weights)
+
+    def time_weight(t):
+        frac = max(0.0, min(1.0, (E - float(t)) / E))  # early -> close to 1, late -> close to 0
+        if shape == "linear":
+            return 1.0 + w["alpha"] * frac
+        elif shape == "quadratic":
+            return 1.0 + w["alpha"] * (frac ** 2)
+        elif shape == "exp":
+            import math
+            return math.exp(w["alpha"] * frac)
+        else:
+            return 1.0 + w["alpha"] * frac
+
+    total_pen = 0.0
+    counts = {"deferred": 0, "impossible": 0, "spill": 0}
+
+    for r in req_log:
+        tag = r["tag"]
+        if tag not in counts:
+            continue
+        counts[tag] += 1
+        mult = w["tag_multipliers"].get(tag, 1.0)
+        total_pen += w["base_penalty"] * mult * time_weight(r["arrival_t"])
+
+    # attach to stats/objective
+    stats["time_weighted_penalty"] = total_pen
+    stats["miss_counts"] = counts
+    stats["objective"] = stats.get("objective", 0.0) + total_pen
+    return stats
+
+
+def LLM_Simulator(epoch_idx, workload_df, schedule_plan, power_plan, epoch_summary):
     t0 = time.time()
     geo_network = Geo_Network.load_network()
     # print(f"[Timer] load_network: {time.time() - t0:.2f}s")
@@ -87,18 +595,26 @@ def LLM_Simulator(epoch_idx, workload_df, schedule_plan, power_plan):
     # print(f"[Timer] reset + power plan: {time.time() - t1:.2f}s")
 
     t2 = time.time()
-    results = geo_network.apply_schedule_plan(schedule_plan)
+    results, leftovers, adherence_report, req_log = geo_network.apply_schedule_plan(workload_df, schedule_plan, power_plan, epoch_summary)
     # print(f"[Timer] schedule plan applied: {time.time() - t2:.2f}s")
 
-    leftover_requests_out = getattr(geo_network, "leftover_request_arr", [])
     # Ensure policy: leftovers arrive at t=0 next epoch
-    if leftover_requests_out:
-        for r in leftover_requests_out:
+    if leftovers:
+        for r in leftovers:
             r["time_index"] = 0
 
     t3 = time.time()
     hour = ((epoch_idx * 15) // 60) % 24
     stats = geo_network.report_global_stats(current_hour=hour)
+    stats = apply_time_weighted_penalties(
+        stats, req_log, epoch_length=EPOCH_LENGTH,
+        weights={
+            "base_penalty": 1.0,
+            "alpha": 2.0,
+            "tag_multipliers": {"deferred": 1.0, "impossible": 1.5}
+        },
+        shape="linear"  # try "linear" first, then increase severity if needed
+    )
     # print(f"[Timer] report global stats: {time.time() - t3:.2f}s")
 
     t4 = time.time()
@@ -113,7 +629,7 @@ def LLM_Simulator(epoch_idx, workload_df, schedule_plan, power_plan):
         "water_usage": stats["water_used_liters"],
         "total_energy": stats["total_energy_kWh"],
         "network_load": stats["network_load"]
-    }, results, leftover_requests_out
+    }, results, leftovers
 
 
 from dataclasses import dataclass
@@ -148,6 +664,8 @@ DEFAULT_COOLING_PROFILES = {
 }
 
 
+
+
 class Processor:
     PROCESSOR_STATE_ACTIVE = 'Active'
     PROCESSOR_STATE_IDLE = 'Idle'
@@ -156,7 +674,7 @@ class Processor:
         self.state = Processor.PROCESSOR_STATE_OFF
         self.processor_id = processor_id
         self.processor_type = processor_type
-        base_path = '/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/'
+        base_path = '/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/'
 
         self.performance_file = performance_file if os.path.isabs(performance_file) else os.path.join(base_path,performance_file)
         self.model_file = model_file if os.path.isabs(model_file) else os.path.join(base_path, model_file)
@@ -218,50 +736,59 @@ class Processor:
     def load_processor_config(self):
         if os.path.exists(self.performance_file):
             df = pd.read_csv(self.performance_file)
-            if "num_GPUs" in df.columns:
-                matched_rows = df[df["num_GPUs"] == int(self.processor_type)]
-                if not matched_rows.empty:
-                    self.performance_metrics = matched_rows.iloc[0].to_dict()
 
-                    # Normalize Mem_Size like "80GB" -> 80
-                    if isinstance(self.performance_metrics.get("Mem_Size"), str):
-                        self.performance_metrics["Mem_Size"] = int(
-                            self.performance_metrics["Mem_Size"].replace("GB", "")
-                        )
-
-                    # numeric TDP
-                    if "TDP" in self.performance_metrics:
-                        self.performance_metrics["TDP"] = float(self.performance_metrics["TDP"])
-
-                    # *** DO NOT divide by 1000 here; keep MS ***
-                    for key in ("Llama7b_Process", "Llama70b_Process"):
-                        if key in self.performance_metrics and not pd.isna(self.performance_metrics[key]):
-                            self.performance_metrics[key] = float(self.performance_metrics[key])  # ms
-
-                    # map your CSV column(s) to the key your code reads
-                    if "base_token_size" not in self.performance_metrics:
-                        if "prefill_token_size" in self.performance_metrics and not pd.isna(
-                                self.performance_metrics["prefill_token_size"]):
-                            self.performance_metrics["base_token_size"] = int(
-                                self.performance_metrics["prefill_token_size"])
-                        elif "gen_token_size" in self.performance_metrics and not pd.isna(
-                                self.performance_metrics["gen_token_size"]):
-                            self.performance_metrics["base_token_size"] = int(
-                                self.performance_metrics["gen_token_size"])
-                        else:
-                            self.performance_metrics["base_token_size"] = 200  # safe default
-
-                    # batch_size is already present in your CSV
-                    if "batch_size" in self.performance_metrics and not pd.isna(self.performance_metrics["batch_size"]):
-                        self.performance_metrics["batch_size"] = int(self.performance_metrics["batch_size"])
-                    else:
-                        self.performance_metrics["batch_size"] = 1
-                else:
-                    print(f"Warning: No match for processor type {self.processor_type}. Using defaults.")
-                    self.performance_metrics = self.default_metrics.copy()
-            else:
+            # --- case-insensitive column access ---
+            cols = {c.lower(): c for c in df.columns}
+            num_col = cols.get("num_gpus")  # works for "Num_GPUs" or "num_GPUs"
+            if num_col is None:
                 print(f"Warning: Malformed CSV structure in {self.performance_file}. Using defaults.")
                 self.performance_metrics = self.default_metrics.copy()
+                return
+
+            # processor_type may be like "8" (from "8_A100s") → int
+            try:
+                want = int(self.processor_type)
+            except Exception:
+                # fallback: extract leading digits if present
+                import re
+                m = re.match(r"(\d+)", str(self.processor_type))
+                want = int(m.group(1)) if m else 1
+
+            matched_rows = df[df[num_col].astype(int) == want]
+            if matched_rows.empty:
+                print(f"Warning: No match for processor type {self.processor_type}. Using defaults.")
+                self.performance_metrics = self.default_metrics.copy()
+                return
+
+            self.performance_metrics = matched_rows.iloc[0].to_dict()
+
+            # Normalize fields
+            if isinstance(self.performance_metrics.get("Mem_Size"), str):
+                self.performance_metrics["Mem_Size"] = int(str(self.performance_metrics["Mem_Size"]).replace("GB", ""))
+
+            if "TDP" in self.performance_metrics:
+                self.performance_metrics["TDP"] = float(self.performance_metrics["TDP"])
+
+            for key in ("Llama7b_Process", "Llama70b_Process"):
+                if key in self.performance_metrics and not pd.isna(self.performance_metrics[key]):
+                    self.performance_metrics[key] = float(self.performance_metrics[key])  # ms
+
+            # base_token_size mapping
+            if "base_token_size" not in self.performance_metrics:
+                if "prefill_token_size" in self.performance_metrics and not pd.isna(
+                        self.performance_metrics["prefill_token_size"]):
+                    self.performance_metrics["base_token_size"] = int(self.performance_metrics["prefill_token_size"])
+                elif "gen_token_size" in self.performance_metrics and not pd.isna(
+                        self.performance_metrics["gen_token_size"]):
+                    self.performance_metrics["base_token_size"] = int(self.performance_metrics["gen_token_size"])
+                else:
+                    self.performance_metrics["base_token_size"] = 200
+
+            # batch_size default
+            if "batch_size" in self.performance_metrics and not pd.isna(self.performance_metrics["batch_size"]):
+                self.performance_metrics["batch_size"] = int(self.performance_metrics["batch_size"])
+            else:
+                self.performance_metrics["batch_size"] = 1
         else:
             print(f"Warning: Processor config file {self.performance_file} missing. Using defaults.")
             self.performance_metrics = self.default_metrics.copy()
@@ -750,7 +1277,7 @@ class Node:
         return best[1], best[2]
 
     @classmethod
-    def load_nodes_from_csv(cls, node_file='/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Node_Specs.csv'):
+    def load_nodes_from_csv(cls, node_file='/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/Node_Specs.csv'):
         nodes = []
         if os.path.exists(node_file):
             df = pd.read_csv(node_file)
@@ -958,8 +1485,8 @@ class Datacenter:
     @classmethod
     def load_datacenters_from_csv(
             cls,
-            datacenter_file='/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Datacenter_Specs.csv',
-            node_file='/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Node_Specs.csv'
+            datacenter_file='/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/Datacenter_Specs.csv',
+            node_file='/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/Node_Specs.csv'
     ):
         datacenters = []
         if not os.path.exists(datacenter_file):
@@ -1181,166 +1708,178 @@ class Datacenter:
             migration_latency,
             max_retries=None,
             request_id=None,
+            allowed_node_types=None,
+            honor_power_plan=False,
     ):
-        """
-        DC-local scheduler (no cross-DC moves).
-        - Do NOT add warm-up penalties here; lower layers account for them.
-        - Start time = max(arrival_t, processor.next_available_time).
-        - Choose (full-fit this epoch) over (overflow), then earliest finish, then earliest start.
-        - If no lane fully fits before epoch end, defer whole job to next epoch.
-        """
         import math
 
-        model_type = str(model_type)
+        # --- tiny normalization (ids -> names; names -> lower-case exec key) ---
+        MODEL_ID_TO_NAME = {0: "Llama7b", 1: "Llama70b"}  # extend if needed
+
+        def _canon(mt):
+            if isinstance(mt, int):
+                name = MODEL_ID_TO_NAME.get(mt, str(mt))
+                return name, mt, name.lower()
+            s = str(mt).strip()
+            # accept a few common aliases
+            aliases = {"llama-7b": "Llama7b", "llama7b": "Llama7b",
+                       "llama-70b": "Llama70b", "llama70b": "Llama70b"}
+            s = aliases.get(s.lower(), s)
+            return s, {v: k for k, v in MODEL_ID_TO_NAME.items()}.get(s), s.lower()
+
+        model_name, model_id, model_lc = _canon(model_type)
+
         arrival_t = int(time_index)
         num_tokens = int(num_tokens)
         batch_size = int(batch_size)
-        mig_lat = float(migration_latency) if migration_latency is not None else 0.0
+        mig_lat = float(migration_latency or 0.0)
 
-        # Epoch length (derive from first processor safely)
-        if self.nodes and self.nodes[0].processors:
-            epoch_len = int(getattr(self.nodes[0].processors[0], "epoch_length", 900))
-        else:
-            epoch_len = 900
+        allowed_norm = {str(t).strip().lower() for t in allowed_node_types} if allowed_node_types else None
+        dbg(f"[DC {self.datacenter_id}] schedule_request model={model_name} arrival={arrival_t} mig={mig_lat} allowed={sorted(allowed_norm) if allowed_norm else None} power={honor_power_plan}")
 
-        # Optional: sticky model affinity inside this DC (helps reduce repeated warm-ups downstream)
-        if not hasattr(self, "_model_affinity"):
-            self._model_affinity = {}  # model_type -> (node_id:int, proc_id:str)
-        aff_node_id, aff_proc_id = self._model_affinity.get(model_type, (None, None))
+        def _estimate_exec_seconds_on(proc) -> float:
+            """Prefer lower-case model key for the wrapper; fall back to pretty name and id."""
+            perf = getattr(proc, "performance_metrics", {}) or {}
+            # find a base_ms if present (case-insensitive), else default
+            base_ms = None
+            for k in ("process_ms_per_base",
+                      f"{model_lc}_process", f"{model_lc}_process_ms", f"{model_lc}_process_ms_per_base",
+                      f"{model_name}_Process", f"{model_name}_process"):
+                if k in perf:
+                    try:
+                        base_ms = float(perf[k])
+                        break
+                    except Exception:
+                        pass
+            if base_ms is None:
+                base_ms = 2.0
 
-        def _estimate_exec_seconds_on(p):
-            """
-            Delegate to lower layers. They already include warm-ups (power/model) in exec time.
-            Try wrapper first; fall back to canonical compute if needed.
-            """
-            # Prefer wrapper signature
-            try:
-                exec_seconds, _ = p.compute_execution_metrics_wrapper(
-                    model_type=model_type,
-                    num_tokens=num_tokens,
-                    batch_size=batch_size,
-                    migration_latency=float(mig_lat),
-                )
-                return float(exec_seconds) if exec_seconds is not None else None
-            except Exception:
-                pass
+            for mkey in (model_lc, model_name, model_id):
+                if mkey is None:
+                    continue
+                try:
+                    exec_s, _ = proc.compute_execution_metrics_wrapper(
+                        model_type=mkey,
+                        base_ms=base_ms,
+                        num_tokens=num_tokens,
+                        requested_batch_size=batch_size,
+                        migration_latency=mig_lat,
+                    )
+                    if exec_s is not None and exec_s > 0:
+                        return float(exec_s)
+                except Exception:
+                    # try next representation
+                    pass
+            return None
 
-            # Fallback: canonical compute signature if available
-            try:
-                perf = getattr(p, "performance_metrics", {}) or {}
-                base_ms = float(perf.get(f"{model_type}_Process", perf.get("process_ms_per_base", 2000.0)))
-                base_token_size = int(perf.get("base_token_size", 200))
-                default_batch_size = int(perf.get("batch_size", 1))
-                mm_all = getattr(p, "model_metrics", {}) or {}
-                mm = mm_all.get(model_type, {}) or {}
-                model_param_mem = float(mm.get("Parameter_Mem", 13.0))
-                model_mem_per_token = float(mm.get("Mem_per_Token", 0.262))
-                processor_mem = float(perf.get("Mem_Size", 80.0))
-                exec_seconds, _ = p.compute_execution_metrics(
-                    base_ms, base_token_size, default_batch_size,
-                    num_tokens, batch_size,
-                    model_param_mem, model_mem_per_token, processor_mem,
-                    0.0,  # load_seconds handled internally by lower layers; don’t add here
-                    float(mig_lat),
-                )
-                return float(exec_seconds) if exec_seconds is not None else None
-            except Exception:
-                return None
+        best = None  # (score_key, node, start_tick, chosen_ident)
 
-        best = None  # (full_fit_flag, finish_or_epoch, start, affinity_penalty, node_id, proc_id_str, node, proc, exec_secs)
-
-        # Scan all processors in this DC
         for node in self.nodes:
-            for p in node.processors:
-                # Start time = max(arrival, processor availability). No warm-up math here.
-                st = int(max(arrival_t, int(getattr(p, "next_available_time", 0))))
+            nt_raw = str(getattr(node, "node_type", "")).strip()
+            nt = nt_raw.lower()
 
-                exec_secs = _estimate_exec_seconds_on(p)
-                if not exec_secs or exec_secs <= 0:
+            if allowed_norm is not None and nt not in allowed_norm:
+                dbg(f"[DC {self.datacenter_id}]  skip node={getattr(node, 'node_id', None)} type={nt_raw} (not allowed)")
+                continue
+            if honor_power_plan and hasattr(self, "is_node_powered") and not self.is_node_powered(node):
+                dbg(f"[DC {self.datacenter_id}]  skip node={getattr(node, 'node_id', None)} (node power off)")
+                continue
+
+            cand_proc = None
+            start_tick = None
+            chosen_ident = None
+
+            # For picking a slot we try "nice" then id then lower-case (usually all work)
+            for ident in (model_name, model_id, model_lc):
+                if ident is None:
+                    continue
+                try:
+                    cand_proc, start_tick = node.pick_processor_scored(arrival_t, ident)
+                    dbg(f"[DC {self.datacenter_id}]   node={getattr(node, 'node_id', None)} -> candidate proc={getattr(cand_proc, 'processor_id', None)} start={start_tick} (mkey={ident})")
+                except Exception as e:
+                    dbg(f"[DC {self.datacenter_id}]   node={getattr(node, 'node_id', None)} pick_processor FAILED (mkey={ident}): {e}")
+                    cand_proc, start_tick = (None, None)
+
+                if cand_proc is None or start_tick is None:
                     continue
 
-                exec_ticks = int(math.ceil(exec_secs))
-                finish = st + exec_ticks
+                if honor_power_plan and hasattr(self, "is_processor_powered") and not self.is_processor_powered(
+                        cand_proc):
+                    dbg(f"[DC {self.datacenter_id}]   skip proc={getattr(cand_proc, 'processor_id', None)} (proc power off)")
+                    continue
 
-                # Prefer lanes that fully finish within this epoch
-                full_fit_flag = 0 if finish <= epoch_len else 1
+                exec_secs = _estimate_exec_seconds_on(cand_proc)
+                if not exec_secs or exec_secs <= 0:
+                    dbg(f"[DC {self.datacenter_id}]   skip proc={getattr(cand_proc, 'processor_id', None)} (exec_secs={exec_secs})")
+                    continue
 
-                # Affinity bias (0 = prefer sticky lane; helps lower layers avoid re-warm)
-                proc_id_str = str(getattr(p, "processor_id", ""))
-                affinity_penalty = 0 if (aff_node_id == int(node.node_id) and aff_proc_id == proc_id_str) else 1
+                epoch_len = int(getattr(cand_proc, "epoch_length", 900))
+                finish_tick = int(max(arrival_t, int(start_tick)) + math.ceil(exec_secs))
+                full_fit = 0 if finish_tick <= epoch_len else 1
+                key = (full_fit, min(finish_tick, epoch_len), int(start_tick))
+                dbg(f"[DC {self.datacenter_id}]   candidate node={getattr(node, 'node_id', None)} proc={getattr(cand_proc, 'processor_id', None)} key={key} (mkey={ident})")
 
-                key = (full_fit_flag, min(finish, epoch_len), st, affinity_penalty, int(node.node_id), proc_id_str)
                 if best is None or key < best[0]:
-                    best = (key, node, p, st, exec_secs)
+                    best = (key, node, int(start_tick), ident)
+                break  # don’t try other idents once we found a viable proc
 
-        # If nothing can even start before epoch end, defer whole job to next epoch
         if best is None:
-            if not hasattr(self, "leftover_requests"):
-                self.leftover_requests = []
+            dbg(f"[DC {self.datacenter_id}]  NO CANDIDATES -> leftover")
+            if not hasattr(self, "leftover_requests"): self.leftover_requests = []
             self.leftover_requests.append({
-                "request_id": request_id,
-                "model_type": model_type,
-                "num_tokens": num_tokens,
-                "batch_size": batch_size,
-                "target_dc_id": self.datacenter_id,
-                "time_index": 0,
+                "request_id": request_id, "model_type": model_name,
+                "num_tokens": num_tokens, "batch_size": batch_size,
+                "target_dc_id": self.datacenter_id, "time_index": 0,
                 "original_time_index": arrival_t,
             })
-            return {
-                "scheduled": False,
-                "datacenter_id": self.datacenter_id,
-                "location": self.location,
-                "model_type": model_type,
-                "retry_attempts": 0,
-                "leftover": True,
-                "request_id": request_id,
-            }
+            return {"scheduled": False, "datacenter_id": self.datacenter_id,
+                    "location": getattr(self, "location", None),
+                    "model_type": model_name, "leftover": True,
+                    "request_id": request_id}
 
-        # Commit the chosen lane and execute (lower layers handle warm-ups & residency)
-        (_, node, proc, start_tick, exec_secs) = best
+        _, chosen_node, chosen_start, chosen_ident = best
+        dbg(f"[DC {self.datacenter_id}]  CHOOSE node={getattr(chosen_node, 'node_id', None)} start={chosen_start} -> execute (mkey={chosen_ident})")
 
-        # Optional: remember the sticky lane for this model
-        self._model_affinity[model_type] = (int(node.node_id), str(getattr(proc, "processor_id", "")))
+        # Execute: prefer lower-case (what processors advertise), then what we picked, then id.
+        def _exec_with_fallback(node):
+            for ident in (model_lc, chosen_ident, model_name, model_id):
+                if ident is None:
+                    continue
+                try:
+                    return node.execute_task_on_available_processor(
+                        model_type=ident,
+                        num_tokens=num_tokens,
+                        batch_size=batch_size,
+                        migration_latency=mig_lat,
+                    )
+                except Exception:
+                    pass
+            return (None, None)
 
-        final_exec_time, success = proc.execute_task(
-            model_type, num_tokens, batch_size, node, float(mig_lat)
-        )
+        final_exec_time, proc_id = _exec_with_fallback(chosen_node)
 
-        if not success:
-            if not hasattr(self, "leftover_requests"):
-                self.leftover_requests = []
+        if final_exec_time is None:
+            dbg(f"[DC {self.datacenter_id}]  EXECUTE FAILED -> leftover")
+            if not hasattr(self, "leftover_requests"): self.leftover_requests = []
             self.leftover_requests.append({
-                "request_id": request_id,
-                "model_type": model_type,
-                "num_tokens": num_tokens,
-                "batch_size": batch_size,
-                "target_dc_id": self.datacenter_id,
-                "time_index": 0,
+                "request_id": request_id, "model_type": model_name,
+                "num_tokens": num_tokens, "batch_size": batch_size,
+                "target_dc_id": self.datacenter_id, "time_index": 0,
                 "original_time_index": arrival_t,
             })
-            return {
-                "scheduled": False,
-                "datacenter_id": self.datacenter_id,
-                "location": self.location,
-                "model_type": model_type,
-                "retry_attempts": 0,
-                "leftover": True,
-                "request_id": request_id,
-            }
+            return {"scheduled": False, "datacenter_id": self.datacenter_id,
+                    "location": getattr(self, "location", None),
+                    "model_type": model_name, "leftover": True,
+                    "request_id": request_id}
 
-        return {
-            "scheduled": True,
-            "datacenter_id": self.datacenter_id,
-            "location": self.location,
-            "node_id": node.node_id,
-            "processor_id": getattr(proc, "processor_id", None),
-            "model_type": model_type,
-            "execution_time": float(final_exec_time),
-            "ttft_seconds": None,  # keep None if Processor tracks TTFT internally
-            "model_already_loaded": True,  # after execution, lower layers keep residency state
-            "retry_attempts": 0,
-            "request_id": request_id,
-        }
+        dbg(f"[DC {self.datacenter_id}]  EXECUTE OK node={getattr(chosen_node, 'node_id', None)} proc={proc_id} exec_s={final_exec_time}")
+        return {"scheduled": True, "datacenter_id": self.datacenter_id,
+                "location": getattr(self, "location", None),
+                "node_id": getattr(chosen_node, "node_id", None),
+                "processor_id": proc_id, "model_type": model_name,
+                "execution_time": float(final_exec_time),
+                "arrival_t": arrival_t, "migration_latency": mig_lat,
+                "request_id": request_id}
 
     def report_epoch_stats(self, current_hour: int):
         processor_stats_all = []
@@ -1350,15 +1889,13 @@ class Datacenter:
 
         for node in self.nodes:
             for p in node.processors:
-                if hasattr(p, "report_epoch_stats"):
-                    stats = p.report_epoch_stats()
-                else:
-                    stats = {}
+                stats = p.report_epoch_stats() if hasattr(p, "report_epoch_stats") else {}
                 processor_stats_all.append(stats)
                 total_it_kwh += stats.get("total_energy_kWh", 0.0)
-                if stats.get("avg_ttft_second", 0.0) > 0:
-                    ttft_total += stats["avg_ttft_second"]
-                    ttft_events += 1
+
+                # Use the processor's true totals, not its average
+                ttft_total += getattr(p, "total_ttft_time", 0.0)
+                ttft_events += getattr(p, "ttft_events", 0)
 
         pue = self.cooling_cfg.pue_at_setpoint(self.cooling_setpoint_c)
         water_int = self.cooling_cfg.water_intensity_at_setpoint(self.cooling_setpoint_c)
@@ -1470,14 +2007,14 @@ class Geo_Network:
 
     def network_delay_seconds_shortest(self, source_id: int, target_id: int) -> int:
         _, total_ms = self.shortest_path_ms(source_id, target_id)
-        return int(round(total_ms / 1000.0))
+        return total_ms / 1000.0
 
 
     @classmethod
     def load_network(cls,
-                     latency_file='/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Geo_Latencies.csv',
-                     dc_file='/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Datacenter_specs.csv',
-                     node_file='/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Node_Specs.csv'):
+                     latency_file='/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/Geo_Latencies.csv',
+                     dc_file='/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/Datacenter_specs.csv',
+                     node_file='/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/Node_Specs.csv'):
 
         if cls._cached_instance is not None:
             return cls._cached_instance
@@ -1567,58 +2104,115 @@ class Geo_Network:
         j = self.id_to_index[target_id]
         return self.latency_matrix[i][j]
 
-    def apply_schedule_plan(self, schedule_plan):
-        # ensure leftover buffer exists
-        if not hasattr(self, "leftover_request_arr"):
-            self.leftover_request_arr = []
+    def apply_schedule_plan(self, workload_df, schedule_plan, power_plan, epoch_summary):
+        # Build a simple latency map (or plug in your real one)
+        dc_latencies = {getattr(dc, "datacenter_id"): 0.0 for dc in self.datacenters}
+        enforcer = PlanEnforcer(schedule_plan, power_plan, epoch_summary, dc_latencies)
 
-        route = self.route_request
-        get = lambda r, k: r.get(k)
+        # Ensure a map for route_request
+        if not hasattr(self, "datacenter_map") or not self.datacenter_map:
+            self.datacenter_map = {dc.datacenter_id: dc for dc in self.datacenters}
 
-        def process_request(i):
-            return route(
-                get(i, "target_dc_id"),
-                get(i, "model_type"),
-                get(i, "num_tokens"),
-                get(i, "batch_size"),
-                get(i, "source_dc_id"),
-                get(i, "time_index"),
+        # Apply power plan to each DC (pass-through)
+        if isinstance(power_plan, dict):
+            for dc in self.datacenters:
+                spec = power_plan.get(dc.datacenter_id, {}) or {}
+                if hasattr(dc, "apply_power_plan"):
+                    dc.apply_power_plan(spec)
+
+        results, leftovers = [], []
+
+        # Candidate DCs: prefer those that have quotas recognized by the enforcer;
+        # otherwise, fall back to every DC id in the topology
+        candidate_dcs = sorted(enforcer.quotas.keys()) or [dc.datacenter_id for dc in self.datacenters]
+
+        # ---- helpers to read workload rows safely ----
+        def _rid(row, default_idx):
+            for k in ("id", "request_id"):
+                if k in row and row[k] is not None:
+                    return int(row[k])
+            return int(default_idx)
+
+        def _arr(row, default_idx):
+            for k in ("arrival_t", "time_index", "timestamp"):
+                if k in row and row[k] is not None:
+                    return int(row[k])
+            return int(default_idx)
+
+        def _model(row):
+            for k in ("model_type", "model", "modelName"):
+                if k in row and row[k] is not None:
+                    return str(row[k])
+            return "unknown"
+
+        def _as_int(x, d=0):
+            try:
+                return int(x)
+            except Exception:
+                try:
+                    return int(float(x))
+                except Exception:
+                    return int(d)
+
+        def _src(row):
+            for k in ("source_dc_id", "source_dc", "origin_dc", "user_region", "region"):
+                if k in row and row[k] is not None:
+                    return _as_int(row[k], 0)
+            return 0
+
+        # ---- schedule loop ----
+        for idx, req in workload_df.iterrows():
+            req_id = _rid(req, idx)
+            arrival = _arr(req, idx)
+            model = str(_model(req))
+            req_view = {"model_type": model}  # enforcer only needs the model
+
+            dc_id, tag = enforcer.choose_dc_for_request(req_view, candidate_dcs)
+
+            # No eligible DC -> defer
+            if dc_id is None:
+                enforcer.mark("deferred")
+                enforcer.log_req(req_id=req_id, arrival_t=arrival, model=model,
+                                 planned_dc=None, chosen_dc=None, tag="deferred")
+                fb = req.to_dict() if hasattr(req, "to_dict") else dict(req)
+                fb.setdefault("id", req_id)
+                fb.setdefault("time_index", arrival)
+                leftovers.append(fb)
+                continue
+
+            # Route (this calls Datacenter.schedule_request)
+            res = self.route_request(
+                target_dc_id=dc_id,
+                model_type=model,
+                num_tokens=_as_int(req.get("num_tokens", 1), 1),
+                batch_size=_as_int(req.get("batch_size", 1), 1),
+                source_dc_id=_src(req),
+                time_index=arrival,
             )
 
-        t1 = time.time()
-        results = []
-        leftovers = []
+            # Normalize if tuple
+            if isinstance(res, tuple) and len(res) == 2:
+                ok, placement = res
+                res = {"scheduled": bool(ok), **(placement or {})}
 
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=4) as executor:  # tune as needed
-            futures = [executor.submit(process_request, i) for i in schedule_plan]
-            for f in as_completed(futures):
-                r = f.result()
-                results.append(r)
-                # collect leftovers for next epoch
-                if (not r.get("scheduled")) and r.get("leftover"):
-                    # prefer explicit leftover_request if provided by route_request
-                    lo = r.get("leftover_request")
-                    if lo is None:
-                        lo = {
-                            "model_type": r.get("model_type"),
-                            "num_tokens": int(r.get("num_tokens", 0)),
-                            "batch_size": int(r.get("batch_size", 1)),
-                            "source_dc_id": r.get("source_dc"),
-                            "target_dc_id": r.get("target_dc"),
-                            "time_index": 0,
-                            "original_time_index": int(r.get("time_index", 0)),
-                        }
-                    leftovers.append(lo)
+            if isinstance(res, dict) and res.get("scheduled"):
+                enforcer.consume_quota_if_planned(dc_id, model)
+                enforcer.mark(tag)  # usually "plan"
+                enforcer.log_req(req_id=req_id, arrival_t=arrival, model=model,
+                                 planned_dc=dc_id, chosen_dc=dc_id, tag="plan")
+                results.append(res)
+            else:
+                enforcer.mark("deferred")
+                enforcer.log_req(req_id=req_id, arrival_t=arrival, model=model,
+                                 planned_dc=dc_id, chosen_dc=None, tag="deferred")
+                fb = (res.get("leftover_request") if isinstance(res, dict) else None) or \
+                     (req.to_dict() if hasattr(req, "to_dict") else dict(req))
+                fb.setdefault("id", req_id)
+                fb.setdefault("time_index", arrival)
+                leftovers.append(fb)
 
-        # stash for the next epoch
-        if leftovers:
-            self.leftover_request_arr.extend(leftovers)
-            print(f"[LEFTOVER] queued {len(leftovers)} request(s) for next epoch @ t=0")
-
-        # (optional) timing
-        # print(f"[Timer] total apply_schedule time (parallel): {time.time() - t1:.2f}s")
-        return results
+        # You can return adherence if you want to optimize against it later
+        return results, leftovers, enforcer.report(), enforcer.req_log
 
     def route_request(self, target_dc_id, model_type, num_tokens, batch_size, source_dc_id, time_index):
         target_dc = self.datacenter_map.get(target_dc_id)
