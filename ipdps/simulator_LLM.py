@@ -399,17 +399,17 @@ if __name__ == "__main__":
     epoch_summaries = []
     network_load_history = []
     leftover_pool = []
-    if framework =="MARL":
+    if framework == "MARL":
         import MultiAgentRL
-        from MultiAgentRL import ResourceEnv
 
-        all_agents = list(ResourceEnv.agent_reward_weights.keys())
+        agent_specs = build_agent_specs(num_datacenters=12)
+        all_agents = list(agent_specs.keys())
         cumulative_sums = {
             agent_id: {"carbon_emissions": 0, "water_usage": 0, "avg_ttft": 0, "energy_cost": 0}
             for agent_id in all_agents
         }
 
-    for epoch_idx in range(0,1):
+    for epoch_idx in range(0, number_of_epoch):
         if epoch_idx not in grouped_trace.groups:
             continue
 
@@ -479,9 +479,6 @@ if __name__ == "__main__":
             import MultiAgentRL
             from MultiAgentRL import ResourceEnv  # to get the agent list
 
-            # === Prepare agent list ===
-            all_agents = list(ResourceEnv.agent_reward_weights.keys())
-
             # === Run multi-agent inference ===
             metrics = MultiAgentRL.run_multiagent(epoch_data, epoch_summary, epoch_idx, node_properties)
 
@@ -505,7 +502,7 @@ if __name__ == "__main__":
 
 
         if framework == 'Helix':
-            import Helix
+            from Helix import Helix
             stats, results, leftover_requests = Helix.milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary)
             cumulative_carbon += stats["carbon_emissions"]
             cumulative_water += stats["water_usage"]
@@ -522,14 +519,10 @@ if __name__ == "__main__":
 
 
         elif framework == 'NSGA2':
-            import NSGA2
+            from NSGA2 import NSGA2
 
-            plans, stats_list, leftover_requests = NSGA2.nsga2_scheduler(epoch_data, epoch_idx, node_properties, epoch_summary)
+            stats, results, leftover_requests = NSGA2.milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary)
 
-            print(stats_list)
-            stats = stats_list[0]
-            print(f"Carbon Emissions:")
-            print(stats["carbon_emissions"])
             cumulative_carbon += stats["carbon_emissions"]
             cumulative_water += stats["water_usage"]
             cumulative_ttft += stats["avg_ttft"]
@@ -544,17 +537,14 @@ if __name__ == "__main__":
             write_epoch_stats("NSGA2", epoch_idx, stats)
 
         elif framework == 'PerLLM':
-            import PerLLM
+            from PerLLM import PerLLM
 
-            stats_list, results_list, leftover_requests = PerLLM.perllm_scheduler(epoch_data, epoch_idx, node_properties, epoch_summary)
-            results = results_list[0]
+            stats, results, leftover_requests = PerLLM.milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary)
 
-            print(f"Carbon Emissions:")
-            print(results["carbon_emissions"])
-            cumulative_carbon += results["carbon_emissions"]
-            cumulative_water += results["water_usage"]
-            cumulative_ttft += results["avg_ttft"]
-            cumulative_energy_costs += results["energy_cost"]
+            cumulative_carbon += stats["carbon_emissions"]
+            cumulative_water += stats["water_usage"]
+            cumulative_ttft += stats["avg_ttft"]
+            cumulative_energy_costs += stats["energy_cost"]
             total_invocations += len(epoch_data)
 
             if "network_load" in stats:
@@ -562,13 +552,13 @@ if __name__ == "__main__":
                 net_load["epoch"] = epoch_idx
                 network_load_history.append(net_load)
 
-            write_epoch_stats("PerLLM", epoch_idx, results)
+            write_epoch_stats("PerLLM", epoch_idx, stats)
 
 
         elif framework == 'Splitwise':
-            import Splitwise
+            from Splitwise import Splitwise
 
-            stats, results, leftover_requests = Splitwise.splitwise_scheduler(epoch_data, epoch_idx, node_properties, epoch_summary)
+            stats, results, leftover_requests = Splitwise.milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary)
             print(f"Carbon Emissions:")
             print(stats["carbon_emissions"])
             cumulative_carbon += stats["carbon_emissions"]

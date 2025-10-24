@@ -22,58 +22,9 @@ import pandas as pd
 import joblib
 
 NUM_NODE_TYPES = 6
-latency_df = pd.read_csv("/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Geo_Latencies.csv", index_col=0)
 METRIC_ORDER = ["ttft", "carbon", "water", "cost"]
 
 # estimator_model = joblib.load("checkpoint_epoch_1050.pkl")
-
-from train_predictor import STATIC_FEATURES
-
-def extract_features(epoch_df, schedule_plan, power_plan, num_datacenters=12):
-    total_requests = len(schedule_plan)
-    avg_tokens = epoch_df["num_tokens"].mean()
-    max_tokens = epoch_df["num_tokens"].max()
-    pct_llama70b = (epoch_df["model_type"] == "Llama70b").mean()
-    avg_batch = epoch_df["batch_size"].mean()
-    std_batch = epoch_df["batch_size"].std()
-
-    # Token-to-batch ratio
-    token_batch_ratio = avg_tokens / avg_batch if avg_batch > 0 else 0
-
-    # Datacenter usage features
-    dc_ids = [req["target_dc_id"] for req in schedule_plan]
-    dc_counts = pd.Series(dc_ids).value_counts(normalize=True)
-    active_dc_ratio = len(dc_counts) / num_datacenters
-    std_dc_usage = dc_counts.std() if len(dc_counts) > 1 else 0.0
-
-    # Average latency between source and target DCs
-    latencies = []
-    for req, sched in zip(epoch_df.to_dict("records"), schedule_plan):
-        src = int(req["source_dc_id"])
-        tgt = int(sched["target_dc_id"])
-        lat = latency_df.iloc[src, tgt]
-        if lat > 0:
-            latencies.append(lat)
-    avg_route_latency = np.mean(latencies) if latencies else 0.0
-
-    # Power plan features
-    total_idle = sum(1 for dc in power_plan.values() for state in dc.values() if state == "Idle")
-    total_off = sum(1 for dc in power_plan.values() for state in dc.values() if state == "Off")
-    num_active_nodes = num_datacenters * NUM_NODE_TYPES - total_off
-    peak_batch = epoch_df["batch_size"].max()
-
-    # Weighted model intensity
-    model_weights = epoch_df["model_type"].apply(lambda x: 2 if x == "Llama70b" else 1)
-    model_load_intensity = model_weights.mean()
-
-    dynamic = [
-        total_requests, avg_tokens, max_tokens, pct_llama70b,
-        avg_batch, std_batch, active_dc_ratio, std_dc_usage, total_idle,
-        num_active_nodes, peak_batch, token_batch_ratio,
-        avg_route_latency, model_load_intensity
-    ]
-
-    return dynamic + STATIC_FEATURES
 
 
  # def estimate_metrics(epoch_df, schedule_plan, power_plan):
@@ -1719,123 +1670,100 @@ def timed(name):
         return inner
     return wrapper
 
-def run_agent_inference(scheme_id, epoch_df, epoch_summary, epoch_idx, node_properties, model_base_path):
-    print(f"[{scheme_id}] Starting inference...")
-    total_start = time.perf_counter()
+def run_agent_inference(agent_id, epoch_df, epoch_summary, epoch_idx, node_properties,
+                        model_base_path="trained_models/sb3_agents"):
+    import os
+    import numpy as np
+    from stable_baselines3 import PPO
+    import supersuit
+    from supersuit import black_death_v3
 
-    # === 1. Create env config ===
-    t0 = time.perf_counter()
-    env_config = {
+    # Build/derive agent_specs and num_datacenters
+    try:
+        from simulator_LLM import build_agent_specs
+        if isinstance(epoch_summary, dict) and "num_datacenters" in epoch_summary:
+            num_dc = int(epoch_summary["num_datacenters"])
+        else:
+            try:
+                num_dc = int(epoch_df["source_dc_id"].max()) + 1
+            except Exception:
+                num_dc = 12
+        agent_specs = build_agent_specs(num_datacenters=num_dc)
+    except Exception:
+        # Minimal default profiles if builder isn’t available
+        agent_specs = {
+            "time_agent":   {"weights": {"ttft": 10}},
+            "carbon_agent": {"weights": {"carbon": 10}},
+            "water_agent":  {"weights": {"water": 10}},
+            "cost_agent":   {"weights": {"cost": 10}},
+        }
+        num_dc = 12
+
+    # === REQUIRED by ResourceEnv (__init__) ===
+    # - active_agent_profile
+    # - agent_specs
+    # - epoch_df, node_properties, epoch_idx, num_datacenters, epoch_summary
+    config = {
         "epoch_df": epoch_df,
-        "epoch_summary": epoch_summary,
-        "epoch_idx": epoch_idx,
         "node_properties": node_properties,
-        "num_datacenters": 12,
-        "max_steps": 50,
-        "reward_agent_type": scheme_id,
+        "epoch_idx": epoch_idx,
+        "num_datacenters": num_dc,
+        "max_steps": 1,                # single decision/step per inference
+        "epoch_summary": epoch_summary,
+        "active_agent_profile": agent_id,  # <— this fixes your KeyError
+        "agent_specs": agent_specs,        # <— profiles dictionary
     }
 
-    raw_env = ResourceEnv(env_config)
-    wrapped_env = black_death_v3(raw_env)
-    vec_env = pettingzoo_env_to_vec_env_v1(wrapped_env)
-    vec_env = concat_vec_envs_v1(vec_env, num_vec_envs=1, base_class="stable_baselines3")
-    print(f"[{scheme_id}] Environment ready in {time.perf_counter() - t0:.4f}s")
+    # Build env and keep a handle to the raw ResourceEnv to collect metrics
+    raw_env = ResourceEnv(config)  # uses config["active_agent_profile"] immediately:contentReference[oaicite:1]{index=1}
+    env = black_death_v3(raw_env)
+    vec = supersuit.pettingzoo_env_to_vec_env_v1(env)
+    venv = supersuit.concat_vec_envs_v1(vec, num_vec_envs=1, base_class="stable_baselines3")
 
-    # === 2. Load model ===
-    t1 = time.perf_counter()
-    model_path = os.path.join(model_base_path, scheme_id, "final_model.zip")
-    if not os.path.exists(model_path):
-        print(f"[{scheme_id}] ERROR: Model not found at {model_path}")
-        return scheme_id, {"error": "Model file missing"}
+    # Load trained policy for this agent/profile
+    # Try final model; you can add checkpoint fallback if needed
+    model_file = os.path.join(model_base_path, agent_id, "final_model.zip")
+    model = PPO.load(model_file, env=venv, device="cpu")
 
-    model = PPO.load(model_path, env=vec_env, device='cpu')
-    print(f"[{scheme_id}] Model loaded in {time.perf_counter() - t1:.4f}s")
+    # Roll one episode (max_steps=1 → one predict/step)
+    obs = venv.reset()
+    action, _ = model.predict(obs, deterministic=True)
+    obs, rewards, dones, infos = venv.step(action)
 
-    # === 3. Run rollout ===
-    rollout_start = time.perf_counter()
-    obs = vec_env.reset()
-    done = False
-    step_count = 0
-    last_action = None
+    # Fetch metrics produced by the simulator inside the env step
+    metrics = raw_env.get_last_metrics() or {}
+    return agent_id, metrics
 
-    while not done and step_count < raw_env.max_steps:
-        step_t = time.perf_counter()
-        action, _ = model.predict(obs, deterministic=True)
-        obs, reward, dones, infos = vec_env.step(action)
-        done = dones["__all__"] if isinstance(dones, dict) else all(dones)
-        step_count += 1
-        last_action = action
-
-        if step_count in {1, 10, 20, 30, 40, 50} or done:
-            print(f"[{scheme_id}] Step {step_count}/{raw_env.max_steps}...", flush=True)
-
-    print(f"[{scheme_id}] Rollout completed in {time.perf_counter() - rollout_start:.4f}s")
-
-    if last_action is None:
-        print(f"[{scheme_id}] No actions executed.")
-        return scheme_id, {"error": "No steps run"}
-
-    # === 4. Extract plan ===
-    plan_start = time.perf_counter()
-
-    def _unwrap_to_resource_env(env):
-        def recursive_find(env, max_depth=20):
-            visited = set()
-            stack = [(env, 0)]
-            while stack:
-                current, depth = stack.pop()
-                if id(current) in visited or depth > max_depth:
-                    continue
-                visited.add(id(current))
-                if isinstance(current, ResourceEnv):
-                    return current
-                for attr in dir(current):
-                    if attr.startswith("__"):
-                        continue
-                    try:
-                        sub = getattr(current, attr)
-                        if isinstance(sub, (list, tuple)):
-                            stack.extend((item, depth + 1) for item in sub)
-                        elif hasattr(sub, "__class__"):
-                            stack.append((sub, depth + 1))
-                    except Exception:
-                        continue
-            return None
-        return recursive_find(env)
-
-    unwrapped_env = _unwrap_to_resource_env(vec_env)
-    schedule_plan = unwrapped_env.schedule_plan
-    power_plan = unwrapped_env.power_plan
-
-    print(f"[{scheme_id}] Plan extraction took {time.perf_counter() - plan_start:.4f}s")
-
-    if not schedule_plan:
-        print(f"[{scheme_id}] WARNING: schedule_plan is empty")
-    if not power_plan:
-        print(f"[{scheme_id}] WARNING: power_plan is empty")
-
-    # === 5. Run final simulator ===
-    sim_start = time.perf_counter()
-    print(f"[{scheme_id}] Running full simulator...")
-    metrics, _ = LLM_Simulator(epoch_idx, epoch_df, schedule_plan, power_plan)
-    print(f"[{scheme_id}] Simulator took {time.perf_counter() - sim_start:.4f}s")
-    print(f"[{scheme_id}] Final metrics: {metrics}")
-
-    print(f"[{scheme_id}] Total time: {time.perf_counter() - total_start:.4f}s")
-
-    return scheme_id, metrics
 
 import cloudpickle
 
-def run_multiagent(epoch_df, epoch_summary, epoch_idx, node_properties, model_base_path="trained_models/sb3_agents"):
-    agent_ids = list(ResourceEnv.agent_reward_weights.keys())
-    results = {}
+def run_multiagent(epoch_df, epoch_summary, epoch_idx, node_properties,
+                   model_base_path="trained_models/sb3_agents"):
+    # --- Determine which profiles to run ---
+    try:
+        from simulator_LLM import build_agent_specs  # your helper that defines profiles
+        # Infer number of datacenters (prefer explicit, fall back to data)
+        if isinstance(epoch_summary, dict) and "num_datacenters" in epoch_summary:
+            num_dc = int(epoch_summary["num_datacenters"])
+        else:
+            try:
+                num_dc = int(epoch_df["source_dc_id"].max()) + 1
+            except Exception:
+                num_dc = 12  # sensible default
+        agent_specs = build_agent_specs(num_datacenters=num_dc)
+        agent_ids = list(agent_specs.keys())
+    except Exception:
+        # Fallback to base agents if helper isn't available
+        agent_ids = ["time_agent", "carbon_agent", "water_agent", "cost_agent"]
 
+    results = {}
     print("[Multiagent] Running agents one by one (no multiprocessing)...")
 
     for agent_id in agent_ids:
         try:
-            agent_id, metrics = run_agent_inference(agent_id, epoch_df, epoch_summary, epoch_idx, node_properties, model_base_path)
+            agent_id, metrics = run_agent_inference(
+                agent_id, epoch_df, epoch_summary, epoch_idx, node_properties, model_base_path
+            )
             results[agent_id] = metrics
         except Exception as e:
             print(f"[Multiagent] ERROR: Exception during inference for {agent_id}: {e}")
@@ -1843,6 +1771,7 @@ def run_multiagent(epoch_df, epoch_summary, epoch_idx, node_properties, model_ba
 
     print("[Multiagent] Inference complete.")
     return results
+
 
 
 

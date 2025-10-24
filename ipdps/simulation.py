@@ -156,7 +156,7 @@ class Processor:
         self.state = Processor.PROCESSOR_STATE_OFF
         self.processor_id = processor_id
         self.processor_type = processor_type
-        base_path = '/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/'
+        base_path = '/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/'
 
         self.performance_file = performance_file if os.path.isabs(performance_file) else os.path.join(base_path,performance_file)
         self.model_file = model_file if os.path.isabs(model_file) else os.path.join(base_path, model_file)
@@ -750,7 +750,7 @@ class Node:
         return best[1], best[2]
 
     @classmethod
-    def load_nodes_from_csv(cls, node_file='/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Node_Specs.csv'):
+    def load_nodes_from_csv(cls, node_file='/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/Node_Specs.csv'):
         nodes = []
         if os.path.exists(node_file):
             df = pd.read_csv(node_file)
@@ -897,12 +897,13 @@ class Datacenter:
             solids_ratio=0.3,
             potable_energy_intensity=0.005,
             wastewater_energy_intensity=0.01,
-            **kwargs,  # swallow any other CSV columns without errors
-    ):
+        ):
+
         import numpy as np
 
         self.datacenter_id = datacenter_id
         self.location = location
+
 
         # Parse a 24h cost profile (semicolon/comma separated string → list[float] length 24)
         def _parse_profile(v, default_len=24, default_val=0.0):
@@ -955,11 +956,15 @@ class Datacenter:
         self._ttft_sum_epoch = 0.0
         self._ttft_cnt_epoch = 0
 
+        # Initialized lazily in _battery_capacity_kwh_auto() on first use.
+        self._battery_soc_kwh = 0.0
+        self._battery_cum_throughput_kwh = 0.0  # charge_in + discharge_out over time
+
     @classmethod
     def load_datacenters_from_csv(
             cls,
-            datacenter_file='/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Datacenter_Specs.csv',
-            node_file='/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Node_Specs.csv'
+            datacenter_file='/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/Datacenter_Specs.csv',
+            node_file='/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/Node_Specs.csv'
     ):
         datacenters = []
         if not os.path.exists(datacenter_file):
@@ -1069,6 +1074,171 @@ class Datacenter:
             ))
 
         return datacenters
+
+    # === Auto PV + Battery helpers (no CSV required) =========================
+
+    def _epoch_hours(self) -> float:
+        """Epoch length (s) → hours, derived from first processor."""
+        try:
+            epoch_len = int(getattr(self.nodes[0].processors[0], "epoch_length", 900))
+        except Exception:
+            epoch_len = 900
+        return float(epoch_len) / 3600.0
+
+    def _location_solar_factor(self) -> float:
+        """
+        Very simple resource scalar by location keyword.
+        1.0 ≈ good US Southwest. Tilt/soiling ignored (baked in).
+        """
+        loc = str(self.location).lower()
+        table = [
+            (("phoenix", "las vegas", "abu dhabi", "dubai"), 1.20),
+            (("los angeles", "san diego", "austin", "denver", "madrid"), 1.05),
+            (("dallas", "atlanta", "rome", "istanbul", "tokyo"), 0.95),
+            (("frankfurt", "paris", "seoul", "new york", "chicago"), 0.85),
+            (("london", "dublin", "seattle", "vancouver", "amsterdam"), 0.75),
+            (("stockholm", "oslo", "helsinki"), 0.70),
+        ]
+        for names, f in table:
+            if any(n in loc for n in names):
+                return f
+        return 0.90  # generic default
+
+    def _pv_capacity_kw_auto(self) -> float:
+        """
+        Size PV vs IT nameplate with simple heuristics:
+        - Assume each GPU node ≈ 3.0 kW nameplate IT.
+        - Target PV DC capacity ≈ 50% of IT nameplate.
+        - Scale by a crude location factor.
+        Example: 1000 nodes → 1000*3.0*0.5 = 1.5 MWdc (× location factor).
+        """
+        nodes = len(getattr(self, "nodes", [])) if getattr(self, "nodes", None) is not None else 1000
+        per_node_kw = 3.0       # ≈ 4x H100 @ ~700–750W each
+        sizing_ratio = 0.50     # PV sized to ~50% of IT nameplate
+        base_kw = nodes * per_node_kw * sizing_ratio
+        return base_kw * self._location_solar_factor()
+
+    def _pv_cf_diurnal(self, hour_0_23: int) -> float:
+        """
+        Very coarse hourly capacity factor shape, noon-peaked, zero at night.
+        Weather/season not modeled (simple).
+        """
+        h = int(hour_0_23) % 24
+        cf_table = [0,0,0,0,0,0, 0.06,0.20,0.45,0.70,0.88,1.00, 0.95,0.85,0.65,0.40,0.20,0.07, 0,0,0,0,0,0]
+        return float(cf_table[h])
+
+    def _pv_kwh_for_hour(self, current_hour: int) -> float:
+        """On-site PV generation for this epoch (kWh)."""
+        capacity_kw = self._pv_capacity_kw_auto()
+        cf = self._pv_cf_diurnal(int(current_hour))
+        return max(0.0, capacity_kw * cf * self._epoch_hours())
+
+    # --- Battery sizing & lifecycle -----------------------------------------
+
+    def _battery_capacity_kwh_auto(self) -> float:
+        """Size battery as ~1 hour of PV nameplate (kWh)."""
+        cap = max(0.0, self._pv_capacity_kw_auto() * 1.0)  # kWh
+        return cap
+
+    def _battery_params(self):
+        # Round-trip
+        charge_eff = 0.95
+        discharge_eff = 0.95
+        eta_rt = charge_eff * discharge_eff  # ~0.90
+        # Lifetime assumptions
+        cycle_life = 4000.0  # equivalent full cycles (EFC)
+        embodied_total_kg = 1_000_000.0  # 1,000 tCO2e per DC (heuristic baseline)
+        return charge_eff, discharge_eff, eta_rt, cycle_life, embodied_total_kg
+
+    def _battery_embodied_per_kwh_throughput(self) -> float:
+        """
+        Embodied carbon amortized per kWh of *throughput* (charge input + discharge output).
+        """
+        cap = self._battery_capacity_kwh_auto()
+        _, _, _, cycle_life, embodied_total = self._battery_params()
+        if cap <= 0 or cycle_life <= 0:
+            return 0.0
+        # Throughput basis = 2 * capacity * cycles (charge + discharge)
+        return embodied_total / (2.0 * cap * cycle_life)
+
+    # --- Battery dispatch using PV surplus first -----------------------------
+
+    def _battery_dispatch(self, demand_kwh: float, pv_kwh: float):
+        """
+        PV-first heuristic:
+          1) Serve load immediately from PV
+          2) Charge battery from remaining PV (no grid charging in this version)
+          3) Discharge battery to cover remaining load
+        Returns dict with:
+          pv_to_load_kwh, pv_to_batt_input_kwh, batt_charge_input_kwh,
+          batt_discharge_delivered_kwh, grid_kwh, pv_curtailed_kwh
+        Updates SOC and cumulative throughput internally.
+        """
+        charge_eff, discharge_eff, _, _, _ = self._battery_params()
+        cap = self._battery_capacity_kwh_auto()
+        if cap > 0 and self._battery_soc_kwh > cap:
+            self._battery_soc_kwh = cap  # clamp
+
+        # Step 1: direct PV to load
+        pv_to_load = min(demand_kwh, pv_kwh)
+        remaining_demand = demand_kwh - pv_to_load
+        pv_left = pv_kwh - pv_to_load
+
+        batt_charge_input = 0.0
+        pv_to_batt_input = 0.0
+        batt_discharge_delivered = 0.0
+
+        # Step 2: charge battery from PV surplus
+        if cap > 0 and pv_left > 1e-9:
+            space_kwh = cap - self._battery_soc_kwh
+            if space_kwh > 1e-9:
+                # store_from_pv is energy *in battery*; input from PV = store/η_charge
+                store_from_pv = min(space_kwh, pv_left * charge_eff)
+                if store_from_pv > 0:
+                    pv_input_used = store_from_pv / charge_eff
+                    self._battery_soc_kwh += store_from_pv
+                    batt_charge_input = store_from_pv
+                    pv_to_batt_input = pv_input_used
+                    pv_left -= pv_input_used
+                    # throughput counts charge input energy now; discharge output later
+                    self._battery_cum_throughput_kwh += pv_input_used
+
+        # Step 3: discharge to meet remaining demand
+        if cap > 0 and remaining_demand > 1e-9 and self._battery_soc_kwh > 1e-9:
+            # withdraw x → delivered = x * η_discharge
+            withdraw_needed = remaining_demand / discharge_eff
+            withdraw = min(self._battery_soc_kwh, withdraw_needed)
+            delivered = withdraw * discharge_eff
+            if withdraw > 0:
+                self._battery_soc_kwh -= withdraw
+                batt_discharge_delivered = delivered
+                remaining_demand -= delivered
+                # throughput add discharge *output* energy
+                self._battery_cum_throughput_kwh += delivered
+
+        grid_kwh = max(0.0, remaining_demand)
+        pv_curtailed_kwh = max(0.0, pv_left)
+
+        return {
+            "pv_to_load_kwh": pv_to_load,
+            "pv_to_batt_input_kwh": pv_to_batt_input,
+            "batt_charge_input_kwh": batt_charge_input,       # stored energy increase (kWh)
+            "batt_discharge_delivered_kwh": batt_discharge_delivered,
+            "grid_kwh": grid_kwh,
+            "pv_curtailed_kwh": pv_curtailed_kwh,
+        }
+
+    def _battery_cycle_stats(self):
+        cap = self._battery_capacity_kwh_auto()
+        _, _, _, cycle_life, _ = self._battery_params()
+        if cap <= 0:
+            return 0.0, 0.0, 0.0
+        # Equivalent full cycles consumed so far
+        efc = self._battery_cum_throughput_kwh / (2.0 * cap)
+        remaining = max(0.0, cycle_life - efc)
+        health = max(0.0, min(1.0, remaining / cycle_life))
+        return efc, remaining, health
+
 
     def reset_epoch(self):
         self._it_energy_kwh_epoch = 0.0
@@ -1366,9 +1536,33 @@ class Datacenter:
         facility_kwh = pue * total_it_kwh
         cooling_kwh = max(0.0, facility_kwh - total_it_kwh)
 
-        cost = self._energy_cost_per_kwh(current_hour) * facility_kwh
-        # If your carbon_intensity is g/kWh, convert to kg; if already kg/kWh, remove /1000.
-        carbon_kg = (self.carbon_intensity * facility_kwh) / 1000.0
+        pv_kwh = self._pv_kwh_for_hour(current_hour)
+
+        # Battery dispatch (PV-first charging, then discharge to meet demand)
+        dispatch = self._battery_dispatch(demand_kwh=facility_kwh, pv_kwh=pv_kwh)
+        grid_kwh = dispatch["grid_kwh"]
+        pv_curtailed_kwh = dispatch["pv_curtailed_kwh"]
+        pv_to_load_kwh = dispatch["pv_to_load_kwh"]
+        pv_to_batt_input_kwh = dispatch["pv_to_batt_input_kwh"]
+        batt_charge_input_kwh = dispatch["batt_charge_input_kwh"]
+        batt_discharge_delivered_kwh = dispatch["batt_discharge_delivered_kwh"]
+
+        # Cost: bill only on grid imports
+        price = self._energy_cost_per_kwh(current_hour)
+        cost = price * grid_kwh
+
+        # Carbon:
+        #  - Operational grid carbon on grid imports (assumes g/kWh → kg)
+        grid_carbon_kg = (self.carbon_intensity * grid_kwh) / 1000.0
+
+        #  - Embodied amortization per-kWh throughput on both charge input and discharge output
+        embodied_rate_kg_per_kWh = self._battery_embodied_per_kwh_throughput()
+        batt_throughput_kWh_epoch = pv_to_batt_input_kwh + batt_discharge_delivered_kwh
+        battery_embodied_kg = embodied_rate_kg_per_kWh * batt_throughput_kWh_epoch
+
+        carbon_kg = grid_carbon_kg + battery_embodied_kg
+
+        # Water is driven by facility energy (IT + cooling), not the grid mix
         water_l = water_int * facility_kwh
 
         num_processors = len(processor_stats_all)
@@ -1399,6 +1593,19 @@ class Datacenter:
             "capacity_seconds": total_capacity_seconds,
             "pue": pue,
             "setpoint_c": float(self.cooling_setpoint_c),
+            "grid_energy_kWh": grid_kwh,
+            "pv_energy_kWh": pv_kwh,
+            "pv_to_load_kWh": pv_to_load_kwh,
+            "pv_to_batt_input_kWh": pv_to_batt_input_kwh,
+            "batt_charge_input_kWh": batt_charge_input_kwh,
+            "batt_discharge_delivered_kWh": batt_discharge_delivered_kwh,
+            "pv_curtailed_kWh": pv_curtailed_kwh,
+            "battery_soc_kWh": self._battery_soc_kwh,
+            "battery_capacity_kWh": self._battery_capacity_kwh_auto(),
+            "battery_efc_used": self._battery_cycle_stats()[0],
+            "battery_efc_remaining": self._battery_cycle_stats()[1],
+            "battery_health_frac": self._battery_cycle_stats()[2],
+            "battery_embodied_kg": battery_embodied_kg,
         }
 
 import heapq
@@ -1475,9 +1682,9 @@ class Geo_Network:
 
     @classmethod
     def load_network(cls,
-                     latency_file='/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Geo_Latencies.csv',
-                     dc_file='/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Datacenter_specs.csv',
-                     node_file='/mnt/c/Users/epiclab/Desktop/HPDC-LLM-v4/HPDC-LLM-v3/ipdps/sim_specs/Node_Specs.csv'):
+                     latency_file='/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/Geo_Latencies.csv',
+                     dc_file='/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/Datacenter_specs.csv',
+                     node_file='/mnt/c/Users/hmoor/Documents/LLMScheduling/ipdps/sim_specs/Node_Specs.csv'):
 
         if cls._cached_instance is not None:
             return cls._cached_instance
@@ -1614,7 +1821,6 @@ class Geo_Network:
         # stash for the next epoch
         if leftovers:
             self.leftover_request_arr.extend(leftovers)
-            print(f"[LEFTOVER] queued {len(leftovers)} request(s) for next epoch @ t=0")
 
         # (optional) timing
         # print(f"[Timer] total apply_schedule time (parallel): {time.time() - t1:.2f}s")
