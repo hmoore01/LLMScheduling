@@ -12,25 +12,16 @@ import csv
 from sklearn.cluster import KMeans
 import pandas as pd
 import hashlib
+from typing import Dict, Any, List, Optional, Callable, Union, Literal
 
-def write_epoch_stats(framework, epoch_idx, stats, tag="balanced"):
-    if not os.path.exists('LLM_Results/Epoch_Stats'):
-        os.makedirs('LLM_Results/Epoch_Stats')
-
-    filename = f'LLM_Results/Epoch_Stats/{framework}_{tag}_epoch_stats.csv'
-    write_header = not os.path.exists(filename)
-
-    with open(filename, 'a', newline='') as csvfile:
-        writer = csv.writer(csvfile)
-        if write_header:
-            writer.writerow(["Epoch", "TTFT", "Carbon", "Water, Energy"])
-        writer.writerow([
-            epoch_idx,
-            stats["avg_ttft"],
-            stats["carbon_emissions"],
-            stats["water_usage"],
-            stats["energy_cost"]
-        ])
+def write_epoch_stats(tag: str, epoch_index: int, stats_dict: dict, tag2: Optional[str] = None) -> None:
+    outdir = "LLM_Results"
+    os.makedirs(outdir, exist_ok=True)
+    fname = f"{outdir}/{tag}{('_' + tag2) if tag2 else ''}_epoch_{epoch_index}.txt"
+    with open(fname, "w") as f:
+        f.write(f"Epoch {epoch_index}\n")
+        for k, v in stats_dict.items():
+            f.write(f"{k}: {v}\n")
 
 
 def summarize_epoch_rate(epoch_data):
@@ -69,10 +60,6 @@ def apply_rate_error(summary, epoch_idx, error_rate):
     summary["llama70b_rate"] = summary["llama70b_total"] / 900
 
     return summary
-
-
-# ---- epoch_constraints.py (or top of the MARL file) ----
-from typing import Dict, Any, List, Optional, Callable, Union, Literal
 
 Number = Union[int, float]
 MergePolicy = Literal["min", "max", "sum", "override"]
@@ -317,411 +304,131 @@ def rollout_once_collect_leftovers(env_config, model_dir, profile_name):
 
 
 if __name__ == "__main__":
+    import argparse, os
+    import pandas as pd
+    import numpy as np
+
+    # ---------- CLI ----------
     parser = argparse.ArgumentParser()
-    parser.add_argument('-l', '--laxity', type=int, help='deadline laxity', default=10)
-    parser.add_argument('-s', '--slo', type=float, help='SLO constraint', default=0.25)
-    parser.add_argument('-e', '--epoch', type=int, help='number of epochs', default=96)
-    parser.add_argument('-t', '--time', type=int, help='decision time', default=110)
-    parser.add_argument('-n', '--node', type=int, help='number of nodes', default=8)
-    parser.add_argument('-d', '--duration', type=int, help='duration time', default=22)
-    parser.add_argument('-r', '--request', type=int, help='number of requests', default=1)
-    parser.add_argument('-f', '--framework', type=str, help='framework', default='Helix', choices=[
-                        'SLO', 'Load', 'Ideal', 'Back', 'Hybrid', 'Score', 'Binary',
-                        'Mscore', 'DSLO', 'Qtrain', 'Qtest', 'Search', 'MARL', 'Helix',
-                        'Train_RL', 'SARL_Eval', 'Splitwise', 'Swarm', 'PerLLM', 'NSGA2'])
+    parser.add_argument('-l', '--laxity', type=int, default=10)
+    parser.add_argument('-s', '--slo', type=float, default=0.25)
+    parser.add_argument('-e', '--epoch', type=int, default=96)
+    parser.add_argument('-t', '--time', type=int, default=110)
+    parser.add_argument('-n', '--node', type=int, default=8)
+    parser.add_argument('-d', '--duration', type=int, default=22)
+    parser.add_argument('-r', '--request', type=int, default=1)
+    parser.add_argument('-f', '--framework', type=str, default='Helix',
+                        choices=['Helix','NSGA2','PerLLM','Splitwise','Hybrid','MARL'])
 
-    #LLM specific args
-    parser.add_argument('--freq-scale', type=float, default=0.5, help='Timeline compression factor')
-    parser.add_argument('--token-scale', type=float, default=50.0, help='Multiply token size')
-    parser.add_argument('--count-scale', type=float, default=30, help='Duplicate requests')
-    parser.add_argument('--error-rate', type=float, default=0.0, help='Error rate')
-
+    # Scaling
+    parser.add_argument('--freq-scale', type=float, default=0.5)
+    parser.add_argument('--token-scale', type=float, default=50.0)
+    parser.add_argument('--count-scale', type=int, default=30)
+    parser.add_argument('--error-rate', type=float, default=0.0)
     args = parser.parse_args()
 
-    # Load and process the trace file
+    # ---------- Simple helper ----------
+    def summarize_epoch_rate(df: pd.DataFrame):
+        """Summarize total tokens per source_dc_id & model_type."""
+        grp = df.groupby(["source_dc_id", "model_type"], as_index=False)["num_tokens"].sum()
+        grp.rename(columns={"num_tokens": "tokens"}, inplace=True)
+        return grp
+
+    # ---------- Load workload ----------
     trace = pd.read_csv("simulator_ready_trace.csv")
     grouped_trace = trace.groupby("epoch")
-    max_epoch = trace["epoch"].max()
+    max_epoch = int(trace["epoch"].max())
 
-    ddl_laxity = args.laxity
-    slo_constraint = args.slo
-    number_of_epoch = args.epoch
-    decision_time = args.time
-    number_of_node = args.node
-    time_of_duration = args.duration
-    time_of_request = args.request
     framework = args.framework
+    number_of_epoch = args.epoch
+    node_properties = []  # used for signature consistency
 
-    df = pd.read_csv("sim_specs/Node_Specs.csv")
-    node_properties = []
-    node_id_counter = 0
-    for dc_id in range(12):
-        nodes_per_type = 1000 // 6
-        for node_type in range(6):
-            for _ in range(nodes_per_type):
-                gpu_type = "A100" if "A100" in df.iloc[node_type]["Node_Type"] else "H100"
-                node_properties.append({
-                    "node_id": node_id_counter,
-                    "datacenter_id": dc_id,
-                    "node_type": node_type,
-                    "gpu_type": gpu_type
-                })
-                node_id_counter += 1
+    print(f"[INIT] Running {framework} for {number_of_epoch} epochs")
 
-
-    print(f"Initialized with {number_of_node} nodes, {time_of_duration} duration, "
-          f"{time_of_request} requests, framework: {framework}")
-
-    DEPLOY_PROFILE = "green_perf"
-
+    # ---------- Metrics ----------
+    cumulative_ttft = 0.0
     cumulative_carbon = 0.0
     cumulative_water = 0.0
-    cumulative_ttft = 0.0
-    cumulative_energy_costs = 0.0
-    total_invocations = 0
+    cumulative_energy = 0.0
     epoch_counter = 0
-    ttft_carbon = 0.0
-    ttft_water = 0.0
-    ttft_ttft = 0.0
-    ttft_energy = 0.0
-    carbon_carbon = 0.0
-    carbon_water = 0.0
-    carbon_ttft = 0.0
-    carbon_energy = 0.0
-    water_carbon = 0.0
-    water_ttft = 0.0
-    water_water = 0.0
-    water_energy = 0.0
-    energy_ttft = 0.0
-    energy_carbon = 0.0
-    energy_water = 0.0
-    energy_energy = 0.0
-    epoch_summaries = []
-    network_load_history = []
-    leftover_pool = []
-    if framework == "MARL":
-        import MultiAgentRL
 
-        agent_specs = build_agent_specs(num_datacenters=12)
-        all_agents = list(agent_specs.keys())
-        cumulative_sums = {
-            agent_id: {"carbon_emissions": 0, "water_usage": 0, "avg_ttft": 0, "energy_cost": 0}
-            for agent_id in all_agents
-        }
+    # ---------- Framework Import ----------
+    def get_framework(framework):
+        fw = framework.lower()
+        if fw == 'helix':
+            from Helix import Helix; return Helix
+        elif fw == 'nsga2':
+            from NSGA2 import NSGA2; return NSGA2
+        elif fw == 'perllm':
+            from PerLLM import PerLLM; return PerLLM
+        elif fw == 'splitwise':
+            from Splitwise import Splitwise; return Splitwise
+        elif fw == 'hybrid':
+            from Hybrid_Scheduler_LLM import Hybrid_Scheduler_LLM; return Hybrid_Scheduler_LLM
+        elif fw == 'marl':
+            import MultiAgentRL; return MultiAgentRL
+        else:
+            raise ValueError(f"Framework '{framework}' not found")
 
-    for epoch_idx in range(0, number_of_epoch):
+    FW = get_framework(framework)
+
+    # ---------- Epoch loop ----------
+    for epoch_idx in range(number_of_epoch):
         if epoch_idx not in grouped_trace.groups:
             continue
+        epoch_data = grouped_trace.get_group(epoch_idx).copy()
 
-        epoch_data = grouped_trace.get_group(epoch_idx)
-
-        # Frequency scaling
+        # --- Scaling ---
         epoch_data["time_index"] = (epoch_data["time_index"] * args.freq_scale).clip(upper=899).astype(int)
-
-        # Token count scaling
         epoch_data["num_tokens"] = (epoch_data["num_tokens"] * args.token_scale).astype(int)
+        if args.count_scale > 1:
+            epoch_data = pd.concat([epoch_data] * args.count_scale, ignore_index=True)
 
-        # Count duplication scaling
-        if args.count_scale != 1.0:
-            multiplier = int(args.count_scale)
-            copies = [epoch_data.copy() for _ in range(multiplier - 1)]
-            epoch_data = pd.concat([epoch_data] + copies, ignore_index=True)
-
-        llama_7b = (epoch_data["model_type"] == "Llama7b").sum()
-        llama_70b = (epoch_data["model_type"] == "Llama70b").sum()
-
+        # --- Summary ---
         epoch_summary = summarize_epoch_rate(epoch_data)
-        epoch_summary = apply_rate_error(epoch_summary, epoch_idx, args.error_rate)
-        epoch_summaries.append(epoch_summary)
-        epoch_summary_df = pd.DataFrame(epoch_summaries)
-        epoch_summary_df.to_csv("epoch_summary.csv",index=False)
-        print(epoch_summary)
-
-        print(f"\n--- Epoch {epoch_idx} ---")
-        print(f"Llama_8B: {llama_7b}, Llama_70B: {llama_70b}")
         epoch_counter += 1
+        print(f"\n--- Epoch {epoch_idx} ({framework}) ---")
+        print(epoch_summary.head())
 
-        if framework == 'Train_RL':
-            import MultiAgentRL
-            import multiprocessing as mp
-
-            if mp.get_start_method(allow_none=True) != "spawn":
-                mp.set_start_method("spawn", force=True)
-
-            agent_specs = build_agent_specs(num_datacenters=12)
-            base_env_config = {
-                "epoch_df": epoch_data,
-                "epoch_summary": epoch_summary,
-                "epoch_idx": epoch_idx,
-                "node_properties": node_properties,
-                "num_datacenters": 12,
-                "max_steps": 50,
-                "agent_specs": agent_specs,
-            }
-
-            MultiAgentRL.train_all_schemes(
-                epoch_data, epoch_summary, epoch_idx, node_properties,
-                agent_specs=agent_specs, num_datacenters=12,
-                total_timesteps=10_000
-            )
-
-            leftovers = rollout_once_collect_leftovers(
-                env_config=base_env_config,
-                model_dir="trained_models/sb3_agents",
-                profile_name=DEPLOY_PROFILE
-            )
-            if leftovers:
-                print(f"[Epoch {epoch_idx}] Carrying over {len(leftovers)} leftover requests to next epoch.")
-                # They already have time_index set to 0 inside the simulator; keep that.
-                leftover_pool.extend(leftovers)
-
-        if framework =="MARL":
-            import MultiAgentRL
-            from MultiAgentRL import ResourceEnv  # to get the agent list
-
-            # === Run multi-agent inference ===
-            metrics = MultiAgentRL.run_multiagent(epoch_data, epoch_summary, epoch_idx, node_properties)
-
-            # === Process results per agent ===
-            for agent_id in all_agents:
-                stats = metrics.get(agent_id,
-                                    {"carbon_emissions": 0, "water_usage": 0, "avg_ttft": 0, "energy_cost": 0})
-                cumulative_sums[agent_id]["carbon_emissions"] += stats["carbon_emissions"]
-                cumulative_sums[agent_id]["water_usage"] += stats["water_usage"]
-                cumulative_sums[agent_id]["avg_ttft"] += stats["avg_ttft"]
-                cumulative_sums[agent_id]["energy_cost"] += stats["energy_cost"]
-
-                if "network_load" in stats:
-                    net_load = stats["network_load"].copy()
-                    net_load["epoch"] = epoch_idx
-                    network_load_history.append(net_load)
-
-                # Optionally write individual epoch CSVs (if needed for debugging)
-                write_epoch_stats("RL", epoch_idx, stats, tag=agent_id.replace("_agent", ""))
-
-
-
-        if framework == 'Helix':
-            from Helix import Helix
-            stats, results, leftover_requests = Helix.milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary)
-            cumulative_carbon += stats["carbon_emissions"]
-            cumulative_water += stats["water_usage"]
-            cumulative_ttft += stats["avg_ttft"]
-            cumulative_energy_costs += stats["energy_cost"]
-            total_invocations += len(results)
-
-            write_epoch_stats("Helix", epoch_idx, stats)
-
-            if "network_load" in stats:
-                net_load = stats["network_load"].copy()
-                net_load["epoch"] = epoch_idx
-                network_load_history.append(net_load)
-
-
-        elif framework == 'NSGA2':
-            from NSGA2 import NSGA2
-
-            stats, results, leftover_requests = NSGA2.milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary)
-
-            cumulative_carbon += stats["carbon_emissions"]
-            cumulative_water += stats["water_usage"]
-            cumulative_ttft += stats["avg_ttft"]
-            cumulative_energy_costs += stats["energy_cost"]
-            total_invocations += len(epoch_data)
-
-            if "network_load" in stats:
-                net_load = stats["network_load"].copy()
-                net_load["epoch"] = epoch_idx
-                network_load_history.append(net_load)
-
-            write_epoch_stats("NSGA2", epoch_idx, stats)
-
-        elif framework == 'PerLLM':
-            from PerLLM import PerLLM
-
-            stats, results, leftover_requests = PerLLM.milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary)
-
-            cumulative_carbon += stats["carbon_emissions"]
-            cumulative_water += stats["water_usage"]
-            cumulative_ttft += stats["avg_ttft"]
-            cumulative_energy_costs += stats["energy_cost"]
-            total_invocations += len(epoch_data)
-
-            if "network_load" in stats:
-                net_load = stats["network_load"].copy()
-                net_load["epoch"] = epoch_idx
-                network_load_history.append(net_load)
-
-            write_epoch_stats("PerLLM", epoch_idx, stats)
-
-
-        elif framework == 'Splitwise':
-            from Splitwise import Splitwise
-
-            stats, results, leftover_requests = Splitwise.milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary)
-            print(f"Carbon Emissions:")
-            print(stats["carbon_emissions"])
-            cumulative_carbon += stats["carbon_emissions"]
-            cumulative_water += stats["water_usage"]
-            cumulative_ttft += stats["avg_ttft"]
-            cumulative_energy_costs += stats["energy_cost"]
-            total_invocations += len(results)
-
-            if "network_load" in stats:
-                net_load = stats["network_load"].copy()
-                net_load["epoch"] = epoch_idx
-                network_load_history.append(net_load)
-
-            write_epoch_stats("Splitwise", epoch_idx, stats)
-
-        elif framework == 'Hybrid':
-            import Hybrid_Scheduler_LLM
-
-            pareto_population, pareto_objectives = Hybrid_Scheduler_LLM.hybrid_scheduler(
-                epoch_data, epoch_idx, node_properties
-            )
-
-
-            def dict_to_vector(obj):
-                return [
-                    obj["avg_ttft"],
-                    obj["carbon_emissions"],
-                    obj["water_usage"],
-                    obj["energy_cost"]
-                ]
-
-
-            best_ttft_idx = min(range(len(pareto_objectives)), key=lambda i: pareto_objectives[i]["avg_ttft"])
-            best_carbon_idx = min(range(len(pareto_objectives)), key=lambda i: pareto_objectives[i]["carbon_emissions"])
-            best_water_idx = min(range(len(pareto_objectives)), key=lambda i: pareto_objectives[i]["water_usage"])
-            best_energy_idx =min(range(len(pareto_objectives)), key=lambda i: pareto_objectives[i]["energy_cost"])
-
-            weights = [0.25, 0.25, 0.25, 0.25]
-
-
-            def weighted_score(obj):
-                v = dict_to_vector(obj)
-                return v[0] * weights[0] + v[1] * weights[1] + v[2] * weights[2] + v[3] * weights[3]
-
-
-            best_balanced_idx = min(range(len(pareto_objectives)), key=lambda i: weighted_score(pareto_objectives[i]))
-
-            balanced_stats = pareto_objectives[best_balanced_idx]
-            ttft_stats = pareto_objectives[best_ttft_idx]
-            carbon_stats = pareto_objectives[best_carbon_idx]
-            water_stats = pareto_objectives[best_water_idx]
-            energy_stats = pareto_objectives[best_energy_idx]
-
-            # Accumulate Balanced Plan Stats
-            cumulative_carbon += balanced_stats["carbon_emissions"]
-            cumulative_water += balanced_stats["water_usage"]
-            cumulative_ttft += balanced_stats["avg_ttft"]
-            cumulative_energy_costs += balanced_stats["energy_cost"]
-
-            # Accumulate TTFT-Optimized Plan Stats
-            ttft_carbon += ttft_stats["carbon_emissions"]
-            ttft_water += ttft_stats["water_usage"]
-            ttft_ttft += ttft_stats["avg_ttft"]
-            ttft_energy += ttft_stats["energy_cost"]
-
-            # Accumulate Carbon-Optimized Plan Stats
-            carbon_carbon += carbon_stats["carbon_emissions"]
-            carbon_water += carbon_stats["water_usage"]
-            carbon_ttft += carbon_stats["avg_ttft"]
-            carbon_energy += carbon_stats["energy_cost"]
-
-            # Accumulate Water-Optimized Plan Stats
-            water_carbon += water_stats["carbon_emissions"]
-            water_water += water_stats["water_usage"]
-            water_ttft += water_stats["avg_ttft"]
-            water_energy += water_stats["energy_cost"]
-
-            energy_carbon += energy_stats["carbon_emissions"]
-            energy_water += energy_stats["water_usage"]
-            energy_ttft += energy_stats["avg_ttft"]
-            energy_energy += energy_stats["energy_cost"]
-
-            write_epoch_stats("Hybrid", epoch_idx, balanced_stats, tag="balanced")
-            write_epoch_stats("Hybrid", epoch_idx, ttft_stats, tag="ttft")
-            write_epoch_stats("Hybrid", epoch_idx, carbon_stats, tag="carbon")
-            write_epoch_stats("Hybrid", epoch_idx, water_stats, tag="water")
-            write_epoch_stats("Hybrid", epoch_idx, energy_stats, tag="energy")
-
-    # Final results
-    # ave_violation_rate = np.mean(objective_arr[:, 0])
-    # cumulative_carbon = np.sum(objective_arr[:, 1])
-    # cumulative_water = np.sum(objective_arr[:, 2]) / 100
-    print("\n=== Final Report ===")
-    print(f"Average Time to first Token (s): {cumulative_ttft / epoch_counter}")
-    print(f"Carbon (g): {cumulative_carbon}")
-    print(f"Water (L): {cumulative_water}")
-    if not os.path.exists('LLM_Results'):
-        os.makedirs('LLM_Results')
-
-    output_path = f'LLM_Results/{framework}_l{ddl_laxity}_n{number_of_node}_d{time_of_duration}_r{time_of_request}_e{number_of_epoch}.txt'
-
-    with open(output_path, 'w') as f:
-        # Write overall summary
-        f.write("=== Overall Aggregate Results ===\n")
-        f.write(
-            f"Number of 15 minute epochs: {epoch_counter}\n"
-            f"Average Time to First Token (s): {cumulative_ttft / epoch_counter:.4f}\n"
-            f"Cumulative Carbon Emissions (g): {cumulative_carbon:.2f}\n"
-            f"Cumulative Water Usage (L): {cumulative_water:.2f}\n"
-            f"Cumulative Energy Costs ($): {cumulative_energy_costs:.2f}\n\n"
+        # --- Call framework ---
+        stats, results, leftovers = FW.milp_optimizer(
+            epoch_data=epoch_data,
+            epoch_idx=epoch_idx,
+            node_properties=node_properties,
+            epoch_summary=epoch_summary
         )
 
-        # If Hybrid or MARL, include all agent breakdowns
-        if framework in ('Hybrid', 'MARL'):
-            f.write("=== Per-Agent Cumulative Results ===\n")
-            hybrid_outputs = {
-                "sustainable_ttft": (ttft_ttft, ttft_carbon, ttft_water, ttft_energy),
-                "sustainable_carbon": (carbon_ttft, carbon_carbon, carbon_water, carbon_energy),
-                "sustainable_water": (water_ttft, water_carbon, water_water, water_energy),
-                "sustainable_energy": (energy_ttft, energy_carbon, energy_water, energy_energy)
-            }
+        # --- Aggregate results ---
+        cumulative_ttft += float(stats.get("avg_ttft", stats.get("avg_ttft_sec", 0.0)))
+        cumulative_carbon += float(stats.get("carbon_emissions", 0.0)) * 1000.0  # kg→g
+        cumulative_water += float(stats.get("water_usage", 0.0)) * 1000.0         # m³→L
+        cumulative_energy += float(stats.get("energy_cost", 0.0))
 
-            for agent_name, (ttft, carbon, water, energy) in hybrid_outputs.items():
-                f.write(
-                    f"[{agent_name}]\n"
-                    f"  Average Time to First Token (s): {ttft / epoch_counter:.4f}\n"
-                    f"  Cumulative Carbon Emissions (g): {carbon:.2f}\n"
-                    f"  Cumulative Water Usage (L): {water:.2f}\n"
-                    f"  Cumulative Energy Costs ($): {energy:.2f}\n\n"
-                )
+        # --- Log epoch ---
+        os.makedirs("LLM_Results", exist_ok=True)
+        with open(f"LLM_Results/{framework}_epoch_{epoch_idx}.txt", "w") as f:
+            for k, v in stats.items():
+                f.write(f"{k}: {v}\n")
 
-            # Also loop through any additional agents captured automatically
-            for agent_id, totals in cumulative_sums.items():
-                f.write(
-                    f"[{agent_id}]\n"
-                    f"  Average Time to First Token (s): {totals['avg_ttft'] / epoch_counter:.4f}\n"
-                    f"  Cumulative Carbon Emissions (g): {totals['carbon_emissions']:.2f}\n"
-                    f"  Cumulative Water Usage (L): {totals['water_usage']:.2f}\n"
-                    f"  Cumulative Energy Costs ($): {totals['energy_cost']:.2f}\n\n"
-                )
+    # ---------- Final report ----------
+    print("\n=== Final Report ===")
+    print(f"Average TTFT (s): {cumulative_ttft / max(1, epoch_counter):.6f}")
+    print(f"Carbon (g): {cumulative_carbon:.3f}")
+    print(f"Water (L): {cumulative_water:.3f}")
+    print(f"Energy ($): {cumulative_energy:.3f}")
+
+    out = f"LLM_Results/{framework}_final.txt"
+    with open(out, "w") as f:
+        f.write("=== Final Results ===\n")
+        f.write(f"Epochs: {epoch_counter}\n")
+        f.write(f"Average TTFT (s): {cumulative_ttft / max(1, epoch_counter):.6f}\n")
+        f.write(f"Total Carbon (g): {cumulative_carbon:.3f}\n")
+        f.write(f"Total Water (L): {cumulative_water:.3f}\n")
+        f.write(f"Total Energy ($): {cumulative_energy:.3f}\n")
+
+    print(f"[DONE] Results written to {out}")
 
 
-        if network_load_history:
-            f.write("=== Coarse Network Load by Epoch ===\n")
-            f.write(f"{'Epoch':<6} {'Avg Load':>10} {'Active (s)':>14} {'Capacity (s)':>16}\n")
-            f.write("-" * 50 + "\n")
-            for entry in network_load_history:
-                f.write(f"{entry['epoch']:<6} {entry['avg_load_ratio'] * 100:>9.2f}% "
-                        f"{entry['total_active_seconds']:>14} {entry['total_capacity_seconds']:>16}\n")
-            f.write("\n")
 
-            f.write("=== Detailed Datacenter Load by Epoch ===\n")
-            for entry in network_load_history:
-                epoch = entry["epoch"]
-                per_dc = entry.get("per_datacenter", [])
-                f.write(f"Epoch {epoch}:\n")
-                f.write(f"{'DC ID':<8} {'Location':<15} {'Load %':>8} {'Active (s)':>12} {'Capacity (s)':>14}\n")
-                f.write("-" * 60 + "\n")
-                for dc in per_dc:
-                    f.write(f"{dc['datacenter_id']:<8} {dc['location']:<15} "
-                            f"{dc['load_ratio'] * 100:>7.2f}% "
-                            f"{dc['active_seconds']:>12} "
-                            f"{dc['capacity_seconds']:>14}\n")
-                f.write("\n")
 
 
