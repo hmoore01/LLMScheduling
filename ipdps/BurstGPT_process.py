@@ -1,76 +1,121 @@
 #!/usr/bin/env python3
+"""
+BurstGPT_process.py — request-based only (even DC distribution)
+
+Converts a raw trace CSV into a per-request CSV the simulator can consume.
+All requests are forced to arrive at the start of their epoch (arrival_ms = 0).
+
+If the raw trace does not include a source DC column, source_dc_id is assigned
+evenly in round-robin order across [0..num_dcs-1].
+
+Output columns:
+  - epoch (int)
+  - source_dc_id (int)
+  - model_type (str)
+  - arrival_ms (int)  # always 0
+  - num_tokens (float)
+
+CLI:
+  python BurstGPT_process.py \
+    --input RAW.csv \
+    --output per_request.csv \
+    --epoch-length 900 \
+    --num-dcs 12
+"""
+
+from __future__ import annotations
 import argparse
-import hashlib
-import math
 import sys
-from typing import Dict, Optional
+import os
+from typing import Optional
 
 import pandas as pd
+import numpy as np
 
-# -----------------------------
-# Defaults (can be overridden by CLI)
-# -----------------------------
-DEFAULT_EPOCH_LENGTH = 900
-DEFAULT_NUM_DCS = 12
+
+# --------- Defaults ---------
 DEFAULT_INPUT = "BurstGPT_without_fails_2.csv"
-DEFAULT_OUTPUT = "simulator_ready_trace.csv"
-DEFAULT_DEBUG_DETAILED = "simulator_ready_detailed.csv"
+DEFAULT_OUTPUT = "simulator_per_request.csv"
+DEFAULT_EPOCH_LENGTH = 900          # seconds
+DEFAULT_NUM_DCS = 12
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def _norm(s: str) -> str:
-    return "".join(ch for ch in str(s).lower() if ch not in " _\t")
 
-def _pick_col(df: pd.DataFrame, *cands: str) -> Optional[str]:
-    cols = { _norm(c): c for c in df.columns }
-    for c in cands:
-        if _norm(c) in cols:
-            return cols[_norm(c)]
+# --------- Helpers ---------
+def _pick_col(df: pd.DataFrame, *candidates: str) -> Optional[str]:
+    """Return the first matching column name from candidates, else None."""
+    cols = set(df.columns)
+    for c in candidates:
+        if c in cols:
+            return c
     return None
 
-def _timestamp_to_seconds(ts: pd.Series) -> pd.Series:
-    """Heuristic: if the median timestamp is > 1e10, assume ms and convert to s."""
-    med = float(ts.median())
-    if med > 1e10:  # ~Sat Nov 20 2286 if seconds; so this flags ms
-        return ts.astype(float) / 1000.0
-    return ts.astype(float)
 
-def _stable_dc_from_keys(row: pd.Series, num_dcs: int) -> int:
-    """Consistent DC assignment using any stable keys if present; else row index."""
-    for k in ["request_id", "id", "user", "uid", "session", "trace_id"]:
-        if k in {c.lower(): c for c in row.index} and pd.notna(row[k]):
-            h = hashlib.blake2b(str(row[k]).encode("utf-8"), digest_size=4).hexdigest()
-            return int(h, 16) % num_dcs
-    # fallback: round-robin by positional index if available
-    # (the caller can pass the dataframe index as a column if desired)
-    return int(row.get("_row_idx", 0)) % num_dcs
+def _timestamp_to_seconds(series: pd.Series) -> pd.Series:
+    """Convert a timestamp column to seconds (float).
 
-def _map_model_to_llama(model_str: str) -> str:
-    s = str(model_str).lower()
-    # Anything clearly "big" → Llama70b
-    if "gpt-4" in s or "gpt4" in s or "70b" in s or "70 b" in s or "llama-3.1-70b" in s:
+    Accepts:
+      - numeric seconds already (returned as-is)
+      - ISO8601/string timestamps (parsed via pandas.to_datetime, converted to epoch seconds)
+    """
+    # If it's numeric-ish, try returning float directly
+    try:
+        return series.astype(float)
+    except Exception:
+        pass
+
+    # Otherwise, parse as datetime and convert to seconds (UTC-naive)
+    ts = pd.to_datetime(series, utc=True, errors="coerce")
+    if ts.isna().all():
+        raise ValueError("All timestamps failed to parse.")
+    return ts.view("int64") / 1e9  # ns -> s
+
+
+def _map_model_to_llama(m: str) -> str:
+    """Normalize model names to simulator's Llama variants.
+
+    ChatGPT → Llama7b (light)
+    GPT-4 → Llama70b (heavy)
+    All other strings fall back to their closest Llama mapping.
+    """
+    if not isinstance(m, str):
+        return str(m)
+
+    s = m.strip().lower()
+
+    # Explicit OpenAI model names
+    if "chatgpt" in s or "gpt-3.5" in s or "gpt3.5" in s:
+        return "Llama7b"
+    if "gpt-4" in s or "gpt4" in s:
         return "Llama70b"
-    # Otherwise treat as 7b-class
-    return "Llama7b"
 
-# -----------------------------
-# Core processing
-# -----------------------------
-def process_trace_for_simulator(
+    # Generic Llama mappings
+    if "70" in s or "70b" in s:
+        return "Llama70b"
+    if "7" in s and "70" not in s:
+        return "Llama7b"
+    if "llama-2-7b" in s or "llama2-7b" in s:
+        return "Llama7b"
+    if "llama-2-70b" in s or "llama2-70b" in s:
+        return "Llama70b"
+
+    return m.strip()
+
+
+# --------- Core processing (request-based only) ---------
+def process_trace_per_request(
     trace: pd.DataFrame,
     epoch_length: int,
     num_dcs: int,
     prefer_ms: bool = False,
 ) -> pd.DataFrame:
     """
-    Convert a raw request trace to simulator rate-flow format.
+    Convert raw trace to per-request format for the simulator.
+    All requests arrive at the beginning of their epoch (arrival_ms = 0).
 
-    Returns aggregated DataFrame with columns:
-      ['epoch', 'src_dc', 'model_type', 'total_tokens']
+    Output columns:
+      ['epoch', 'source_dc_id', 'model_type', 'arrival_ms', 'num_tokens']
     """
-
-    # ---- Identify columns (case- and underscore-insensitive) ----
+    # ---- Required-ish columns (with flexible names) ----
     model_col = _pick_col(trace, "Model", "model", "Model_Name", "model_name", "model_type")
     if model_col is None:
         raise KeyError(f"Could not find model column in {list(trace.columns)}")
@@ -79,93 +124,66 @@ def process_trace_for_simulator(
     if ts_col is None:
         raise KeyError(f"Could not find timestamp column in {list(trace.columns)}")
 
-    # Tokens: prefer a total, else sum prompt+output or input+output
     total_tok_col = _pick_col(trace, "Total tokens", "total_tokens", "tokens", "toks", "num_tokens")
-    if total_tok_col is None:
-        p_col = _pick_col(trace, "Prompt tokens", "prompt_tokens", "input_tokens", "in_tokens", "prompt")
-        o_col = _pick_col(trace, "Output tokens", "output_tokens", "gen_tokens", "out_tokens", "completion")
-        if p_col is None and o_col is None:
-            raise KeyError(
-                "Could not find tokens column(s). "
-                "Expected 'Total tokens' or 'Prompt/Output tokens' in the input CSV."
-            )
+    p_col = _pick_col(trace, "Prompt tokens", "prompt_tokens", "input_tokens", "in_tokens", "prompt")
+    o_col = _pick_col(trace, "Output tokens", "output_tokens", "gen_tokens", "out_tokens", "completion")
 
-    src_dc_col = _pick_col(trace, "Source_DC", "source_dc_id", "src_dc", "Src_DC")
-
-    # ---- Normalize timestamps ----
-    t = trace[ts_col].astype(float)
+    # ---- Timestamps -> seconds ----
+    t = trace[ts_col]
+    t = _timestamp_to_seconds(t)
     if prefer_ms:
         t = t / 1000.0
-    else:
-        t = _timestamp_to_seconds(t)
 
-    # ---- Normalize tokens ----
+    # ---- Tokens per request ----
     if total_tok_col is not None:
-        toks = trace[total_tok_col].astype(float)
+        toks = pd.to_numeric(trace[total_tok_col], errors="coerce").fillna(0.0)
     else:
-        # safe get; missing side becomes 0
-        p_col = _pick_col(trace, "Prompt tokens", "prompt_tokens", "input_tokens", "in_tokens", "prompt")
-        o_col = _pick_col(trace, "Output tokens", "output_tokens", "gen_tokens", "out_tokens", "completion")
-        p = trace[p_col].astype(float) if p_col else 0.0
-        o = trace[o_col].astype(float) if o_col else 0.0
+        p = pd.to_numeric(trace[p_col], errors="coerce").fillna(0.0) if p_col else 0.0
+        o = pd.to_numeric(trace[o_col], errors="coerce").fillna(0.0) if o_col else 0.0
         toks = p + o
 
-    # ---- Compute epoch and time_index ----
-    min_time = float(t.min())
+    # ---- Epoch index (relative to min timestamp) ----
+    min_time = float(np.nanmin(t.values))
     epoch = ((t - min_time) // epoch_length).astype(int)
-    time_index = ((t - min_time) % epoch_length).astype(float)
 
-    # ---- Model mapping ----
+    # ---- Model ----
     model_type = trace[model_col].astype(str).map(_map_model_to_llama)
 
-    # ---- Source DC mapping ----
+    # ---- Source DC: use existing column if present, else even round-robin ----
+    src_dc_col = _pick_col(trace, "Source_DC", "source_dc_id", "src_dc", "Src_DC")
     if src_dc_col is not None:
-        src_dc = trace[src_dc_col].astype(int).mod(num_dcs)
+        src_dc = pd.to_numeric(trace[src_dc_col], errors="coerce").fillna(0).astype(int) % num_dcs
     else:
-        # Stable but data-driven: try hashing a stable id if present; else round-robin
-        tmp = trace.copy()
-        tmp["_row_idx"] = range(len(tmp))
-        src_dc = tmp.apply(lambda r: _stable_dc_from_keys(r, num_dcs), axis=1).astype(int)
+        # Even distribution by row order: 0,1,2,...,num_dcs-1, 0,1,2,... (round-robin)
+        n = len(trace)
+        src_dc = (np.arange(n, dtype=np.int64) % int(num_dcs)).astype(int)
 
-    # ---- Build detailed frame (optional to save for debugging) ----
-    detailed = pd.DataFrame({
-        "epoch": epoch,
-        "model_type": model_type,
-        "num_tokens": toks.astype(float),
-        "time_index": time_index,
-        "src_dc": src_dc,
-        "batch_size": 1,  # downstream doesn’t need this in rate-flow; keep for audit
-    })
+    # ---- Build per-request output (arrival_ms forced to 0) ----
+    out = pd.DataFrame({
+        "epoch": epoch.astype(int),
+        "source_dc_id": src_dc.astype(int),
+        "model_type": model_type.astype(str),
+        "arrival_ms": 0,                                # all requests arrive at epoch start
+        "num_tokens": pd.to_numeric(toks, errors="coerce").fillna(0.0).astype(float),
+    }).sort_values(["epoch", "source_dc_id"]).reset_index(drop=True)
 
-    # ---- Aggregate to rate-flow format ----
-    agg = (detailed
-           .groupby(["epoch", "src_dc", "model_type"], as_index=False)["num_tokens"]
-           .sum()
-           .rename(columns={"num_tokens": "total_tokens"}))
+    return out
 
-    # Ensure proper dtypes
-    agg["epoch"] = agg["epoch"].astype(int)
-    agg["src_dc"] = agg["src_dc"].astype(int)
-    agg["model_type"] = agg["model_type"].astype(str)
-    agg["total_tokens"] = agg["total_tokens"].astype(float)
 
-    return agg, detailed
-
-# -----------------------------
-# CLI
-# -----------------------------
+# --------- CLI ---------
 def main():
-    ap = argparse.ArgumentParser(description="Convert raw trace to simulator rate-flow format.")
+    ap = argparse.ArgumentParser(description="Convert raw trace to per-request CSV for the simulator.")
     ap.add_argument("--input", default=DEFAULT_INPUT, help="Input CSV (raw trace)")
-    ap.add_argument("--output", default=DEFAULT_OUTPUT, help="Output CSV (aggregated rate-flow)")
-    ap.add_argument("--debug-detailed", default=DEFAULT_DEBUG_DETAILED,
-                    help="Optional detailed per-request CSV for auditing")
+    ap.add_argument("--output", default=DEFAULT_OUTPUT, help="Output CSV (per-request)")
     ap.add_argument("--epoch-length", type=int, default=DEFAULT_EPOCH_LENGTH, help="Epoch length in seconds")
     ap.add_argument("--num-dcs", type=int, default=DEFAULT_NUM_DCS, help="Number of datacenters")
     ap.add_argument("--timestamps-in-ms", action="store_true",
-                    help="Treat input timestamps as milliseconds explicitly")
-    ap.add_argument("--no-debug", action="store_true", help="Skip writing detailed debug CSV")
+                    help="Treat input timestamps as milliseconds explicitly (divide by 1000)")
     args = ap.parse_args()
+
+    if not os.path.exists(args.input):
+        print(f"ERROR: input file not found: {args.input}", file=sys.stderr)
+        sys.exit(1)
 
     print(f"[load] {args.input}")
     try:
@@ -174,28 +192,29 @@ def main():
         print(f"ERROR: failed to read input CSV: {e}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"[process] epoch_length={args.epoch_length}s, num_dcs={args.num_dcs}")
-    agg, detailed = process_trace_for_simulator(
+    print(f"[process] request-based | epoch_length={args.epoch_length}s | num_dcs={args.num_dcs}")
+    per_req = process_trace_per_request(
         trace=trace,
         epoch_length=args.epoch_length,
         num_dcs=args.num_dcs,
         prefer_ms=args.timestamps_in_ms,
     )
 
-    print(f"[save] aggregated → {args.output}  (rows={len(agg)})")
-    agg.to_csv(args.output, index=False)
+    print(f"[save] {args.output}  (rows={len(per_req)})")
+    try:
+        per_req.to_csv(args.output, index=False)
+    except Exception as e:
+        print(f"ERROR: failed to write output: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    if not args.no_debug:
-        print(f"[save] detailed   → {args.debug_detailed}  (rows={len(detailed)})")
-        detailed.to_csv(args.debug_detailed, index=False)
-
-    # quick sanity print
-    print("\n[preview] first 10 aggregated rows:")
+    print("\n[preview] first 10 rows:")
     with pd.option_context("display.max_rows", 10, "display.max_columns", None, "display.width", 120):
-        print(agg.head(10))
+        print(per_req.head(10))
+
 
 if __name__ == "__main__":
     main()
+
 
 
 

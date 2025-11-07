@@ -84,7 +84,7 @@ def choose_target_from_fractions(frac_map: Dict[int, float]) -> int:
 
 def per_row_schedule_map(sim: LLM_Simulator, ep_rows: pd.DataFrame, planner) -> Dict[int, int]:
     """
-    Use a schedule builder that returns (src, model) -> {dc: frac}.
+    Use a schedule builder that returns (src, model)  -> {dc: frac}.
     Convert to a row-index -> target_dc map compatible with simulator's schedule 'map'.
     """
     plan_frac = planner(sim, ep_rows)  # Dict[(src, model)] -> {dc: frac}

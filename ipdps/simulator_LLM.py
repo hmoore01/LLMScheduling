@@ -296,6 +296,7 @@ if __name__ == "__main__":
     import argparse, os
     import pandas as pd
     import numpy as np
+    from typing import List
 
     # ---------- CLI ----------
     parser = argparse.ArgumentParser()
@@ -310,53 +311,110 @@ if __name__ == "__main__":
                         choices=['Helix','NSGA2','PerLLM','Splitwise','Hybrid','MARL'])
 
     # Scaling
-    parser.add_argument('--freq-scale', type=float, default=0.5)
-    parser.add_argument('--token-scale', type=float, default=50.0)
-    parser.add_argument('--count-scale', type=int, default=30)
+    parser.add_argument('--freq-scale', type=float, default=1.0)
+    parser.add_argument('--token-scale', type=float, default=10.0)
+    parser.add_argument('--count-scale', type=int, default=2)
     parser.add_argument('--error-rate', type=float, default=0.0)
+
+    # Optional: override # of DCs used for default distribution when src DC is missing
+    parser.add_argument('--num-dcs', type=int, default=12)
     args = parser.parse_args()
 
-    # ---------- Simple helper ----------
+    # ---------- Helpers ----------
+    def _map_model_to_llama(m: str) -> str:
+        s = str(m).strip().lower()
+        if ("chatgpt" in s) or ("gpt-3.5" in s) or ("gpt3.5" in s):
+            return "Llama7b"
+        if ("gpt-4" in s) or ("gpt4" in s):
+            return "Llama70b"
+        if "70" in s or "70b" in s or "llama-2-70b" in s or "llama2-70b" in s:
+            return "Llama70b"
+        if "7" in s or "7b" in s or "llama-2-7b" in s or "llama2-7b" in s:
+            return "Llama7b"
+        # fallback: pass-through
+        return str(m)
+
+    def _even_src_dc(df: pd.DataFrame, num_dcs: int) -> pd.Series:
+        """Round-robin assign source DC if missing; per-epoch so distribution is even each epoch."""
+        if "source_dc_id" in df.columns:
+            return pd.to_numeric(df["source_dc_id"], errors="coerce").fillna(0).astype(int)
+        # build per-epoch RR
+        out = np.zeros(len(df), dtype=int)
+        if "epoch" not in df.columns:
+            # single-epoch fallback
+            out = np.arange(len(df)) % max(1, num_dcs)
+            return pd.Series(out, index=df.index, dtype=int)
+        for ep, idx in df.groupby("epoch").indices.items():
+            # indices arrives as numpy array of row positions
+            n = len(idx)
+            out[idx] = np.arange(n) % max(1, num_dcs)
+        return pd.Series(out, index=df.index, dtype=int)
+
+    def _ensure_num_tokens(df: pd.DataFrame, default_tokens: int = 400) -> pd.Series:
+        if "num_tokens" in df.columns:
+            return pd.to_numeric(df["num_tokens"], errors="coerce").fillna(0).astype(int)
+        if "total_tokens" in df.columns:
+            return pd.to_numeric(df["total_tokens"], errors="coerce").fillna(0).astype(int)
+        if "tokens" in df.columns:
+            return pd.to_numeric(df["tokens"], errors="coerce").fillna(0).astype(int)
+        if {"prompt_tokens", "gen_tokens"}.issubset(df.columns):
+            vals = pd.to_numeric(df["prompt_tokens"], errors="coerce").fillna(0) + \
+                   pd.to_numeric(df["gen_tokens"], errors="coerce").fillna(0)
+            return vals.astype(int)
+        if "prompt_tokens" in df.columns:
+            return pd.to_numeric(df["prompt_tokens"], errors="coerce").fillna(0).astype(int)
+        return pd.Series(default_tokens, index=df.index, dtype=int)
+
     def summarize_epoch_rate(df: pd.DataFrame):
-        """Summarize total tokens per source_dc_id & model_type."""
+        """Simple summary printout for visibility (not used by simulator)."""
         grp = df.groupby(["source_dc_id", "model_type"], as_index=False)["num_tokens"].sum()
         grp.rename(columns={"num_tokens": "tokens"}, inplace=True)
         return grp
 
     # ---------- Load workload ----------
-    import os
-    import pandas as pd
-
     workload_path = "simulator_ready_trace.csv"
     if not os.path.exists(workload_path):
         raise FileNotFoundError(f"Could not find workload CSV: {workload_path}")
-
-    # Load and normalize the aggregated workload
     trace = pd.read_csv(workload_path)
 
-    # Rename columns so Helix and Rate_Flow_Sim see consistent names
+    # Ensure epoch present and int
+    if "epoch" not in trace.columns:
+        # treat everything as epoch 0 if missing
+        trace["epoch"] = 0
+    trace["epoch"] = pd.to_numeric(trace["epoch"], errors="coerce").fillna(0).astype(int)
+
+    # Source DC: even distribution if missing
     if "src_dc" in trace.columns and "source_dc_id" not in trace.columns:
         trace = trace.rename(columns={"src_dc": "source_dc_id"})
-    if "total_tokens" in trace.columns and "num_tokens" not in trace.columns:
-        trace["num_tokens"] = trace["total_tokens"]
+    trace["source_dc_id"] = _even_src_dc(trace, args.num_dcs)
+
+    # Model mapping (ChatGPT/GPT-4 → Llama7b/Llama70b)
+    if "model_type" not in trace.columns:
+        trace["model_type"] = "Llama7b"
+    trace["model_type"] = trace["model_type"].astype(str).map(_map_model_to_llama)
+
+    # Tokens
+    trace["num_tokens"] = _ensure_num_tokens(trace, default_tokens=400)
+
+    # All requests arrive at epoch start (the Helix path also enforces this; harmless to set here)
+    trace["arrival_ms"] = 0
+
+    # Compatibility: create a time_index column for legacy code paths (not used in request-mode)
     if "time_index" not in trace.columns:
         trace["time_index"] = 0
 
     # Enforce types
-    trace["epoch"] = pd.to_numeric(trace["epoch"], errors="coerce").fillna(0).astype(int)
     trace["source_dc_id"] = pd.to_numeric(trace["source_dc_id"], errors="coerce").fillna(0).astype(int)
     trace["num_tokens"] = pd.to_numeric(trace["num_tokens"], errors="coerce").fillna(0).astype(int)
-    trace["model_type"] = trace["model_type"].astype(str)
 
-    # Group by epoch so the loop below works
+    # Group by epoch
     grouped_trace = trace.groupby("epoch")
     max_epoch = int(trace["epoch"].max())
-
-    print(f"[INIT] Loaded workload with {len(trace)} entries across {max_epoch} epochs")
+    print(f"[INIT] Loaded workload with {len(trace)} entries across {max_epoch+1} epochs")
 
     framework = args.framework
     number_of_epoch = args.epoch
-    node_properties = []  # used for signature consistency
+    node_properties: List[dict] = []  # leave empty; Helix tolerates this
 
     print(f"[INIT] Running {framework} for {number_of_epoch} epochs")
 
@@ -365,6 +423,7 @@ if __name__ == "__main__":
     cumulative_carbon = 0.0
     cumulative_water = 0.0
     cumulative_energy = 0.0
+    cumulative_total_energy = 0.0
     epoch_counter = 0
 
     # ---------- Framework Import ----------
@@ -391,33 +450,44 @@ if __name__ == "__main__":
     for epoch_idx in range(number_of_epoch):
         if epoch_idx not in grouped_trace.groups:
             continue
+
+        # Make a copy and apply scaling
         epoch_data = grouped_trace.get_group(epoch_idx).copy()
 
-        # --- Scaling ---
+        # NOTE: request-mode ignores runtime position; the column is kept for legacy
         epoch_data["time_index"] = (epoch_data["time_index"] * args.freq_scale).clip(upper=899).astype(int)
-        epoch_data["num_tokens"] = (epoch_data["num_tokens"] * args.token_scale).astype(int)
+
+        # Scale tokens
+        if args.token_scale != 1.0:
+            epoch_data["num_tokens"] = (epoch_data["num_tokens"] * args.token_scale).round().astype(int)
+
+        # Replicate rows (count-scale)
         if args.count_scale > 1:
             epoch_data = pd.concat([epoch_data] * args.count_scale, ignore_index=True)
 
-        # --- Summary ---
+        # All requests arrive at t=0
+        epoch_data["arrival_ms"] = 0
+
+        # Summary (for logging only)
         epoch_summary = summarize_epoch_rate(epoch_data)
         epoch_counter += 1
         print(f"\n--- Epoch {epoch_idx} ({framework}) ---")
         print(epoch_summary.head())
 
-        # --- Call framework ---
+        # --- Call framework (per-request) ---
         stats, results, leftovers = FW.milp_optimizer(
             epoch_data=epoch_data,
             epoch_idx=epoch_idx,
             node_properties=node_properties,
-            epoch_summary=epoch_summary
+            epoch_summary={"node_types": [0,1,2,3,4,5]}  # lightweight hints; safe default
         )
 
         # --- Aggregate results ---
         cumulative_ttft += float(stats.get("avg_ttft", stats.get("avg_ttft_sec", 0.0)))
-        cumulative_carbon += float(stats.get("carbon_emissions", 0.0)) * 1000.0  # kg→g
+        cumulative_carbon += float(stats.get("carbon_emissions", 0.0))  # kg→g
         cumulative_water += float(stats.get("water_usage", 0.0)) * 1000.0         # m³→L
         cumulative_energy += float(stats.get("energy_cost", 0.0))
+        cumulative_total_energy += float(stats.get('total_energy', 0.0))
 
         # --- Log epoch ---
         os.makedirs("LLM_Results", exist_ok=True)
@@ -431,6 +501,7 @@ if __name__ == "__main__":
     print(f"Carbon (g): {cumulative_carbon:.3f}")
     print(f"Water (L): {cumulative_water:.3f}")
     print(f"Energy ($): {cumulative_energy:.3f}")
+    print(f"Total Energy (kWh): {cumulative_total_energy:.3f}")
 
     out = f"LLM_Results/{framework}_final.txt"
     with open(out, "w") as f:
@@ -440,8 +511,10 @@ if __name__ == "__main__":
         f.write(f"Total Carbon (g): {cumulative_carbon:.3f}\n")
         f.write(f"Total Water (L): {cumulative_water:.3f}\n")
         f.write(f"Total Energy ($): {cumulative_energy:.3f}\n")
+        f.write(f"Total Energy (kWh): {cumulative_energy:.3f}\n")
 
     print(f"[DONE] Results written to {out}")
+
 
 
 

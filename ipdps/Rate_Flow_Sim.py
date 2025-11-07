@@ -36,15 +36,44 @@ import collections
 import os
 
 # ---- Rate-Flow defaults (solar) ----
-DEFAULT_SOLAR_KW_CAPACITY = 1000.0  # same for all DCs
-# simple bell-shaped 24h profile; values are fractions of capacity
-DEFAULT_SOLAR_PROFILE_24H = [
-    0.00, 0.00, 0.00, 0.00, 0.00,  # 0–4
-    0.05, 0.20, 0.50, 0.75, 0.90,  # 5–9
-    1.00, 0.95, 0.90, 0.80, 0.60,  # 10–14
-    0.40, 0.20, 0.05,               # 15–17
-    0.00, 0.00, 0.00, 0.00, 0.00, 0.00  # 18–23
-]
+# ===========================================================
+# === Simulation Constants (hardcoded, no CSV dependency) ===
+# ===========================================================
+
+CONSTANTS = {
+    # --- Temperature / cooling ---
+    "TEMP_REF_C": 20.0,          # reference temperature baseline (°C)
+    "TEMP_SETPOINT_C": 29.0,     # supply temperature setpoint (°C)
+    "IT_POWER_TEMP_ALPHA": 0.0,  # IT power flat vs. temperature
+    "EXEC_MS_TEMP_ALPHA": 0.0,   # no perf degradation (can set +0.005 per °C if needed)
+    "COP_TEMP_ALPHA_PER_C": 0.04,  # +4% COP per °C above ref
+    "PUE_TEMP_ALPHA_PER_C": -0.01, # -0.01 PUE per °C above ref
+
+    # --- Cooling defaults ---
+    "DEFAULT_COP": 3.0,          # mechanical cooling COP baseline
+    "DEFAULT_PUE": 1.18,         # for liquid/oil systems
+    "OTHER_IT_OVERHEAD_FRAC": 0.13,  # non-CPU IT overhead fraction
+
+    # --- Solar / battery defaults ---
+    "SOLAR_KW_CAPACITY": 0.0,   # typical DC-scale PV array
+    "SOLAR_PROFILE_24H": [0.0, 0.0, 0.0, 0.0, 0.05, 0.15, 0.35, 0.55,
+                          0.75, 0.9, 1.0, 0.9, 0.75, 0.55, 0.35, 0.15,
+                          0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],  # normalized day curve
+
+    # --- Battery defaults ---
+    "BATTERY_CAP_KWH": 0.0,
+    "BATTERY_SOC_INIT": 0.0,
+    "BATTERY_MAX_CHARGE_KW": 0.0,
+    "BATTERY_MAX_DISCHARGE_KW": 0.0,
+    "BATTERY_ROUNDTRIP_EFF": 0.92,
+    "BATTERY_EMBODIED_CO2_PER_KWH": 0.05,  # kg CO2 per kWh throughput
+
+    # --- ToU default ---
+    "TOU_PRICE_24H": [0.12, 0.12, 0.12, 0.12, 0.14, 0.15, 0.18, 0.20,
+                      0.22, 0.25, 0.25, 0.23, 0.22, 0.20, 0.18, 0.16,
+                      0.14, 0.13, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12],
+}
+
 
 RFS_DEBUG = os.environ.get("RFS_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
 
@@ -97,49 +126,165 @@ def _finalize_perf_entry(ms_per_token=None, ms_per_request=None, avg_tokens_per_
     return out
 
 
+@dataclass
+class Battery:
+    cap_kwh: float = 0.0
+    soc_kwh: float = 0.0
+    max_charge_kw: float = 0.0
+    max_discharge_kw: float = 0.0
+    roundtrip_eff: float = 0.92
+    embodied_co2_per_kwh_throughput: float = 0.0  # kgCO2 per kWh throughput
+
+    # per-epoch accounting
+    charged_kwh: float = 0.0
+    discharged_kwh: float = 0.0
+
+    def reset_epoch(self):
+        self.charged_kwh = 0.0
+        self.discharged_kwh = 0.0
+
+    def can_use(self) -> bool:
+        return (
+            self.cap_kwh > 0.0
+            and self.max_charge_kw > 0.0
+            and self.max_discharge_kw > 0.0
+            and self.roundtrip_eff > 0.0
+        )
+
+    def charge(self, want_kwh: float, hours: float) -> float:
+        """Return stored kWh added to SOC (post-efficiency). Throughput counted at input."""
+        if not self.can_use() or want_kwh <= 0.0:
+            return 0.0
+        hours = max(hours, 1e-9)
+        limit_kwh = self.max_charge_kw * hours
+        headroom_in_kwh = max(0.0, self.cap_kwh - self.soc_kwh) / self.roundtrip_eff
+        in_kwh = min(want_kwh, limit_kwh, headroom_in_kwh)
+        stored = in_kwh * self.roundtrip_eff
+        if stored <= 0.0:
+            return 0.0
+        self.soc_kwh += stored
+        self.charged_kwh += in_kwh
+        return stored
+
+    def discharge(self, want_kwh: float, hours: float) -> float:
+        """Return delivered kWh to load; throughput counted at output."""
+        if not self.can_use() or want_kwh <= 0.0:
+            return 0.0
+        hours = max(hours, 1e-9)
+        limit_kwh = self.max_discharge_kw * hours
+        deliverable = min(want_kwh, limit_kwh, self.soc_kwh)
+        if deliverable <= 0.0:
+            return 0.0
+        self.soc_kwh -= deliverable
+        self.discharged_kwh += deliverable
+        return deliverable
+
+    def embodied_carbon_kg(self) -> float:
+        throughput = self.charged_kwh + self.discharged_kwh
+        return throughput * max(0.0, self.embodied_co2_per_kwh_throughput)
+
+
 
 @dataclass
 class ProcNode:
-    """
-    Combined Node + Processor:
-      - Holds HW traits (accel_type, gpu_config), power (tdp_kw/idle_kw),
-        and per-model perf (ms_per_request, ms_per_token).
-      - Tracks availability (available_at_ms) for queueing.
-    """
-    __slots__ = (
-        "node_id", "type_id", "accel_type", "gpu_config",
-        "tdp_kw", "idle_kw", "model_perf", "available_at_ms"
-    )
-
     def __init__(
         self,
         node_id: int,
-        type_id: Optional[int],
-        accel_type: str,
-        gpu_config: str,
-        tdp_kw: float,
-        idle_kw: float,
-        model_perf: Dict[str, Dict[str, float]],
+        model_perf: dict,
+        *,
+        # old/builder-style args:
+        type_id: int | None = None,
+        accel_type: str | None = None,
+        gpu_config: str | None = None,
+        tdp_kw: float | None = None,
+        idle_kw: float | None = None,
+        # optional modern args:
+        tdp_w: float | None = None,
+        idle_w: float | None = None,
+        base_idle_frac: float | None = None,
     ):
         self.node_id = int(node_id)
-        self.type_id = int(type_id) if type_id is not None else None
-        self.accel_type = str(accel_type)
-        self.gpu_config = str(gpu_config)
-        self.tdp_kw = float(tdp_kw)
-        self.idle_kw = float(idle_kw)
-        self.model_perf = model_perf or {}
-        self.available_at_ms: float = 0.0
+        self.type_id = type_id
+        self.accel_type = accel_type
+        self.gpu_config = gpu_config
 
-    # --- simple helpers ---
-    def estimate_exec_ms(self, model: str, rec: Optional[Dict[str, Any]] = None) -> float:
-        """
-        Estimate execution time. If you later pass tokens in `rec`, you can
-        use ms_per_token here; for now we use ms_per_request from CSVs.
-        """
-        perf = self.model_perf.get(model) or self.model_perf.get(model.capitalize())
-        if perf and "ms_per_request" in perf:
-            return float(perf["ms_per_request"])
-        return 1000.0  # fallback (shouldn’t hit with proper CSVs)
+        # Normalize power inputs
+        # Prefer explicit Watts if given; else convert from kW.
+        tdp_w_norm = float(tdp_w) if tdp_w is not None else (
+            float(tdp_kw) * 1000.0 if tdp_kw is not None else 0.0
+        )
+        idle_w_norm = float(idle_w) if idle_w is not None else (
+            float(idle_kw) * 1000.0 if idle_kw is not None else None
+        )
+
+        self.tdp_w = tdp_w_norm
+        # Derive idle fraction if not explicitly provided
+        if base_idle_frac is not None:
+            self.base_idle_frac = float(base_idle_frac)
+        elif idle_w_norm is not None and self.tdp_w > 0.0:
+            self.base_idle_frac = max(0.0, min(1.0, idle_w_norm / self.tdp_w))
+        else:
+            # safe default
+            self.base_idle_frac = 0.13
+
+        self.model_perf = dict(model_perf)  # {"Llama7b": {...}, "Llama70b": {...}}
+        self.state = "IDLE"                 # "ON" | "IDLE" | "OFF"
+        self.available_at_ms = 0.0
+        self.dc_ref = None
+        self.busy_ms_epoch = 0.0
+
+    def attach_dc(self, dc):
+        self.dc_ref = dc
+
+    # --- IT power fraction by state (IT side only) ---
+    def it_frac_for_state(self) -> float:
+        s = self.state
+        if s == "OFF":
+            return 0.0
+        if s == "IDLE":
+            return self.base_idle_frac
+        return 1.0  # ON
+
+    # --- temperature multipliers coming from DC constants ---
+    def _it_power_temp_mult(self) -> float:
+        dc = self.dc_ref
+        if not dc:
+            return 1.0
+        dT = float(dc.temp_c_setpoint) - dc.temp_ref_c
+        return max(0.0, 1.0 + dc.it_power_temp_alpha * dT)  # usually 0.0 unless you enable it
+
+    def _exec_ms_temp_mult(self) -> float:
+        dc = self.dc_ref
+        if not dc:
+            return 1.0
+        dT = float(dc.temp_c_setpoint) - dc.temp_ref_c
+        return max(0.0, 1.0 + dc.exec_ms_temp_alpha * dT)   # usually 0.0 unless you enable it
+
+    # --- performance model ---
+    def estimate_exec_ms(self, tokens, model: str, kwargs) -> float:
+        rec = self.model_perf.get(model, {})
+        base_ms = float(rec.get("ms_per_request") or 0.0)
+        base_ms  = base_ms * tokens
+        if base_ms <= 0.0:
+            ms_per_tok = float(rec.get("ms_per_token") or 0.0)
+            toks = float(kwargs.get("tokens") or kwargs.get("avg_tokens") or 0.0)
+            base_ms = ms_per_tok * toks
+        return base_ms * self._exec_ms_temp_mult()
+
+    # --- IT energy for execution window (kWh) ---
+    def it_energy_kwh_for_exec(self, exec_ms: float) -> float:
+        if self.state == "OFF" or self.tdp_w <= 0.0:
+            return 0.0
+
+        self.state = "ON"
+        it_frac = self.it_frac_for_state()
+        power_w = self.tdp_w * it_frac * self._it_power_temp_mult()# W
+        hours = max(0.0, float(exec_ms)) / 3_600_000.0
+        self.busy_ms_epoch += float(exec_ms)
+        self.state = "IDLE"
+        return power_w * hours / 1000
+
+
 
 
 
@@ -150,312 +295,469 @@ class ProcNode:
 @dataclass
 class Datacenter:
     """
-    Holds a flat list of ProcNode 'units' and dispatches workload to the least-busy eligible unit.
+    Cooling modes:
+      - "MECH_COP"          : cooling energy via COP (with temp-sensitive COP)
+      - "LIQUID_WATER_PUE"  : facility overhead via PUE (temp-sensitive PUE)
+      - "LIQUID_OIL_PUE"    : same PUE path (you can set different DEFAULT_PUE if desired)
 
-    Public API (unchanged to callers):
-      add_node(node: ProcNode)
-      apply_power_plan(plan_slice)
-      schedule_request(model, arrival, net_latency_ms, source_dc, target_dc, **kw) -> dict
-      report_global_stats() -> dict
-      report_utilization()  -> float in [0,1]
-      reset_epoch()
+    New features:
+      - Temperature setpoint affects COP/PUE (NOT IT power by default)
+      - Solar PV + Battery with embodied carbon per kWh throughput
+      - ToU pricing for grid energy cost
+      - Per-epoch energy/carbon/cost accounting
+      - Per-epoch busy time and a utilization() helper
+
+    Compatible with:
+      - add_node(...), apply_power_plan(...)
+      - settle_and_score(node, exec_ms, start_ms)  -> dict
+      - reset_epoch(), finalize_epoch()
     """
 
     def __init__(
-        self,
-        dc_id: int,
-        carbon_intensity_g_per_kwh: float,
-        time_of_use_24h: Optional[List[float]] = None,
-        cop_profile_24h: Optional[List[float]] = None,
-        blowdown_ratio: float = 0.0,
-        water_cycling_density: float = 0.0,
-        potable_energy_intensity: float = 0.0,
-        wastewater_energy_intensity: float = 0.0,
-        water_static: float = 0.0,
-        epoch_length: int = 900,
-        debug: bool = False,
+            self,
+            dc_id: int,
+            carbon_intensity_g_per_kwh: float,
+            time_of_use_24h: list[float] | None = None,
+            cop_profile_24h: list[float] | None = None,
+            blowdown_ratio: float | None = None,
+            water_cycling_density_m3_per_kwh_heat: float | None = None,
+            potable_EI_kWh_per_m3: float | None = None,
+            wastewater_EI_kWh_per_m3: float | None = None,
+            water_static_m3_per_kwh_heat: float | None = None,
+            cooling_mode: str = "MECH_COP",  # "MECH_COP", "LIQUID_WATER_PUE", "LIQUID_OIL_PUE"
+            epoch_length: int | None = None,
+            debug: bool = False,
     ):
-        self.dc_id = int(dc_id)
-        self.debug = debug
-
+        self.id = int(dc_id)
         self.carbon_intensity_g_per_kwh = float(carbon_intensity_g_per_kwh)
-        self.time_of_use_24h = time_of_use_24h or None
-        self.cop_profile_24h = cop_profile_24h or None
-        self.blowdown_ratio = float(blowdown_ratio)
+        self.cooling_mode = str(cooling_mode)
+        self.debug = bool(debug)
 
-        self.water_cycling_density = float(water_cycling_density)
-        self.potable_energy_intensity = float(potable_energy_intensity)
-        self.wastewater_energy_intensity = float(wastewater_energy_intensity)
-        self.water_static = float(water_static)
+        # --- constants wiring (no CSV dependency) ---
+        self.temp_c_setpoint = CONSTANTS["TEMP_SETPOINT_C"]
+        self.temp_ref_c = CONSTANTS["TEMP_REF_C"]
+        self.it_power_temp_alpha = CONSTANTS["IT_POWER_TEMP_ALPHA"]
+        self.exec_ms_temp_alpha = CONSTANTS["EXEC_MS_TEMP_ALPHA"]
+        self.cop_temp_alpha_per_C = CONSTANTS["COP_TEMP_ALPHA_PER_C"]
+        self.pue_temp_alpha_per_C = CONSTANTS["PUE_TEMP_ALPHA_PER_C"]
 
-        self.epoch_length_s = int(epoch_length)
-        self.epoch_length_ms = float(self.epoch_length_s * 1000)
+        self.cop_default = CONSTANTS["DEFAULT_COP"]
+        self.cop_profile_24h = list(cop_profile_24h) if cop_profile_24h else None
+        self.pue_value = CONSTANTS["DEFAULT_PUE"]
+        self.other_it_overhead_frac = CONSTANTS["OTHER_IT_OVERHEAD_FRAC"]
 
-        # Flat list of ProcNode execution units
-        self.units: List[ProcNode] = []
+        # --- Water/cooling parameters from CSV (stored for use elsewhere) ---
+        # These are retained so your existing water accounting/printing paths keep working.
+        self.blowdown_ratio = float(blowdown_ratio) if blowdown_ratio is not None else 0.30
+        self.water_cycling_density = (
+            float(water_cycling_density_m3_per_kwh_heat) if water_cycling_density_m3_per_kwh_heat is not None else 0.10
+        )
+        self.potable_energy_intensity = (
+            float(potable_EI_kWh_per_m3) if potable_EI_kWh_per_m3 is not None else 0.005
+        )
+        self.wastewater_energy_intensity = (
+            float(wastewater_EI_kWh_per_m3) if wastewater_EI_kWh_per_m3 is not None else 0.010
+        )
+        self.water_static = (
+            float(water_static_m3_per_kwh_heat) if water_static_m3_per_kwh_heat is not None else 5.0
+        )
 
-        # Eligibility controls
-        self._enabled_node_ids: Optional[set[int]] = None
-        self._enabled_type_ids: Optional[set[int]] = None
+        self.solar_kw_capacity = CONSTANTS["SOLAR_KW_CAPACITY"]
+        self.solar_profile_24h = list(CONSTANTS["SOLAR_PROFILE_24H"])
 
-        # Per-epoch aggregates
-        self._busy_ms: float = 0.0
-        self._energy_kwh: float = 0.0
-        self._carbon_g: float = 0.0
-        self._water_m3: float = 0.0
-        self._ttft_sum_s: float = 0.0
-        self._ttft_count: int = 0
-        self.energy_cost_agg: float = 0.0
+        self.battery = Battery(
+            cap_kwh=CONSTANTS["BATTERY_CAP_KWH"],
+            soc_kwh=CONSTANTS["BATTERY_SOC_INIT"],
+            max_charge_kw=CONSTANTS["BATTERY_MAX_CHARGE_KW"],
+            max_discharge_kw=CONSTANTS["BATTERY_MAX_DISCHARGE_KW"],
+            roundtrip_eff=CONSTANTS["BATTERY_ROUNDTRIP_EFF"],
+            embodied_co2_per_kwh_throughput=CONSTANTS["BATTERY_EMBODIED_CO2_PER_KWH"],
+        )
+
+        self.tou_price = list(time_of_use_24h) if time_of_use_24h else None
+
+        # inventory
+        self.units: list[ProcNode] = []
+
+        # epoch counters (reset each epoch)
+        self._busy_ms = 0.0
+        self.energy_grid_kwh = 0.0
+        self.energy_solar_kwh = 0.0
+        self.energy_batt_discharge_kwh = 0.0
+        self.energy_batt_charge_kwh = 0.0
+        self.embodied_battery_co2_kg = 0.0
+        self.energy_other_kwh = 0.0
+        self.energy_cooling_kwh = 0.0
+        self.energy_it_kwh = 0.0
+        self.cost_usd = 0.0
+
+        # ---- Water accounting (epoch) ----
+        self.water_evap_m3 = 0.0
+        self.water_blowdown_m3 = 0.0
+        self.water_static_m3 = 0.0
+        self.water_makeup_m3 = 0.0
+        self.water_energy_potable_kwh = 0.0
+        self.water_energy_wastewater_kwh = 0.0
+        self.water_energy_total_kwh = 0.0
+        self.water_carbon_g = 0.0
+
+        self._epoch_len_s = float(epoch_length)
+        self.last_used_unit = 0
 
     # ---------- inventory ----------
-    def add_node(self, node: ProcNode) -> None:
-        self.units.append(node)
+    def add_node(self, unit: ProcNode):
+        unit.attach_dc(self)
+        self.units.append(unit)
 
     # ---------- power plan ----------
-    def apply_power_plan(self, plan_slice: Optional[Dict[str, Any]]) -> None:
-        if not isinstance(plan_slice, dict) or not plan_slice:
-            self._enabled_node_ids = None
-            self._enabled_type_ids = None
+    def apply_power_plan(self, plan_slice: dict | None):
+        if not plan_slice:
             return
-
-        en_nodes = plan_slice.get("enable_nodes")
-        en_types = plan_slice.get("enable_types")
-        off_nodes = plan_slice.get("off_nodes")
-        off_types = plan_slice.get("off_types")
-
-        if en_nodes is not None:
-            self._enabled_node_ids = set(int(x) for x in en_nodes)
-        else:
-            self._enabled_node_ids = set(u.node_id for u in self.units)
-            if off_nodes:
-                self._enabled_node_ids -= set(int(x) for x in off_nodes)
-
-        if en_types is not None:
-            self._enabled_type_ids = set(int(x) for x in en_types)
-        else:
-            inv_types = {u.type_id for u in self.units if u.type_id is not None}
-            self._enabled_type_ids = None
-            if off_types:
-                self._enabled_type_ids = set(inv_types)
-                self._enabled_type_ids -= set(int(x) for x in off_types)
-
-        if self.debug:
-            nn = "ALL" if self._enabled_node_ids is None else len(self._enabled_node_ids)
-            tt = "ALL" if self._enabled_type_ids is None else len(self._enabled_type_ids)
-            print(f"[DC {self.dc_id}] apply_power_plan -> enabled_nodes={nn} enabled_types={tt}")
-
-    # ---------- scheduling ----------
-    def _eligible_unit_iter(self):
-        for u in self.units:
-            if self._enabled_node_ids is not None and u.node_id not in self._enabled_node_ids:
-                continue
-            if self._enabled_type_ids is not None and (u.type_id is not None) and (u.type_id not in self._enabled_type_ids):
-                continue
-            yield u
-
-    def _pick_least_busy_unit(self, arrival_ms: float) -> Optional[ProcNode]:
-        best = None
-        best_avail = math.inf
-        for u in self._eligible_unit_iter():
-            if u.available_at_ms < best_avail:
-                best_avail = u.available_at_ms
-                best = u
-        return best
-
-    def _energy_for_exec_kwh(self, u: ProcNode, exec_ms: float) -> float:
-        return float(u.tdp_kw) * (float(exec_ms) / 3_600_000.0)
-
-    def _carbon_for_energy_g(self, energy_kwh: float) -> float:
-        return (self.carbon_intensity_g_per_kwh * energy_kwh)
-
-    def _water_for_energy_m3(self, energy_kwh: float) -> float:
-        return (self.water_static * energy_kwh) if self.water_static > 0.0 else 0.0
-
-    def _cop_for_ms(self, t_ms: float) -> float:
-        """
-        Return COP for a given millisecond timestamp.
-        - If a 24-value hourly profile is present, use hour-of-day.
-        - Else, fall back to a default (3.0 if unset).
-        """
-        # Fallback COP if no profile/invalid entries
-        cop_default = getattr(self, "cop_default", 3.0)
-        try:
-            prof = self.cop_profile_24h
-            if prof and len(prof) == 24:
-                # Derive hour-of-day (0..23) from milliseconds into a notional day.
-                # If you track absolute epoch start time elsewhere, you can pass it
-                # through and add here; this uses local time-of-day from t_ms alone.
-                sec = (float(t_ms) / 1000.0) % 86400.0
-                h = int(sec // 3600)  # 0..23
-                cop = float(prof[h])
-                # Guard against zeros/negatives in input
-                return cop if cop > 0.0 else cop_default
-        except Exception:
-            pass
-        return cop_default
-
-    def _time_for_ms(self, t_ms: float) -> float:
-        """
-        Return COP for a given millisecond timestamp.
-        - If a 24-value hourly profile is present, use hour-of-day.
-        - Else, fall back to a default (3.0 if unset).
-        """
-        # Fallback COP if no profile/invalid entries
-        time_default = getattr(self, "time_default", 0.15)
-        try:
-            prof = self.time_of_use_24h
-            if prof and len(prof) == 24:
-                # Derive hour-of-day (0..23) from milliseconds into a notional day.
-                # If you track absolute epoch start time elsewhere, you can pass it
-                # through and add here; this uses local time-of-day from t_ms alone.
-                sec = (float(t_ms) / 1000.0) % 86400.0
-                h = int(sec // 3600)  # 0..23
-                time = float(prof[h])
-                # Guard against zeros/negatives in input
-                return time if time > 0.0 else time_default
-        except Exception:
-            pass
-        return time_default
+        mode_all = plan_slice.get("all")
+        if mode_all in ("ON", "IDLE", "OFF"):
+            for u in self.units:
+                u.state = mode_all
+        unit_modes = plan_slice.get("unit") or {}
+        if unit_modes:
+            id_map = {u.node_id: u for u in self.units}
+            for node_id, state in unit_modes.items():
+                uid = int(node_id)
+                if uid in id_map and state in ("ON", "IDLE", "OFF"):
+                    id_map[uid].state = state
 
     def schedule_request(
-        self,
-        model: str,
-        arrival: int,
-        net_latency_ms: float,
-        source_dc: int,
-        target_dc: int,
-        **kwargs,
-    ) -> Dict[str, Any]:
-        arrival_ms = float(arrival)
-        u = self._pick_least_busy_unit(arrival_ms)
-        if u is None:
-            # No enabled capacity
+            self,
+            *,
+            model: str,
+            arrival: int | float,
+            net_latency_ms: float = 0.0,
+            source_dc: int | None = None,
+            target_dc: int | None = None,
+            tokens: int | None = None,
+            **kwargs,
+    ) -> dict:
+        """
+        Minimal queue-free scheduling: pick any non-OFF unit, estimate exec_ms,
+        and account energy/carbon/cost/water. Returns fields used by Geo_Network.
+        """
+        # choose a unit (prefer ON > IDLE > OFF)
+        available_units = [u for u in self.units if u.state in ("ON", "IDLE")]
+
+        if not available_units:
+            raise RuntimeError("No units available for scheduling request.")
+
+        # Round-robin selection
+        self.last_used_unit = (self.last_used_unit + 1) % len(available_units)
+        unit = available_units[self.last_used_unit]
+
+        # If nothing usable, return network latency only (debug-safe)
+        if unit is None:
             return {
-                "ttft_s": float(net_latency_ms) / 1000.0,
-                "start_ms": arrival_ms,
-                "finish_ms": arrival_ms,
-                "queue_delay_ms": 0.0,
+                "dc_id": int(self.id),
+                "start_ms": float(arrival),
+                "end_ms": float(arrival),
                 "exec_ms": 0.0,
+                "ttft_s": float(net_latency_ms) / 1000.0,
                 "energy_kwh": 0.0,
                 "carbon_g": 0.0,
+                "cost_usd": 0.0,
                 "water_m3": 0.0,
-                "node_id": None,
             }
 
-        start_ms = max(arrival_ms, u.available_at_ms)
-        queue_ms = max(0.0, start_ms - arrival_ms)
-        exec_ms = u.estimate_exec_ms(model, kwargs)
-        finish_ms = start_ms + exec_ms
+        # Estimate execution time from node perf (tokens optional)
+        exec_ms = float(unit.estimate_exec_ms(tokens, model, kwargs or {}))
+        start_ms = float(arrival)
+        end_ms = start_ms + exec_ms
 
-        # Update unit state + busy
-        u.available_at_ms = finish_ms
-        self._busy_ms += exec_ms
+        # Energy/carbon/cost/water accounting
+        score = self.settle_and_score(unit, exec_ms, start_ms)
 
-        # Accounting
-        energy_kwh = self._energy_for_exec_kwh(u, exec_ms)
-        carbon_g  = self._carbon_for_energy_g(energy_kwh)
-        # --- IT (compute) energy from exec time (kWh) ---
-        it_energy_kwh = self._energy_for_exec_kwh(u, exec_ms)
+        # Simple ttft_s: network + service (no queue)
+        ttft_s = float(net_latency_ms) / 1000.0 + (exec_ms / 1000.0 if exec_ms > 0 else 0.0)
 
-        # ------------------------------------------------------------------
-        # COP-AWARE COOLING, HEAT REJECTION & WATER
-        # ------------------------------------------------------------------
-        # Cooling electrical energy (kWh) needed to remove the IT heat:
-        #   cooling_elec_kwh = it_energy_kwh / COP
-        cop = self._cop_for_ms(start_ms)
-        tou = self._time_for_ms(start_ms)
-        cooling_elec_kwh = it_energy_kwh / max(cop, 0.1)  # safety floor
+        return {
+            "dc_id": int(self.id),
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "exec_ms": exec_ms,
+            "ttft_s": ttft_s,
+            "energy_kwh": float(score.get("energy_kwh", 0.0)),
+            "carbon_g": float(score.get("carbon_g", 0.0)),
+            "cost_usd": float(score.get("cost_usd", 0.0)),
+            "water_m3": float(score.get("water_m3", 0.0)),
+        }
 
-        # Total heat rejected to atmosphere (kWh thermal) ≈ all electric energy ends as heat:
-        #   heat_rejected_kwh = it_energy_kwh + cooling_elec_kwh
-        heat_rejected_kwh = it_energy_kwh + cooling_elec_kwh
+    # ---------- time helpers ----------
+    def _hour_of_day(self, ms: float) -> int:
+        sec = (float(ms) / 1000.0) % 86400.0
+        return int(sec // 3600)
 
-        # Water modeling (per kWh of HEAT rejected):
-        # - water_static: baseline m^3/kWh_heat (site fixed losses, drift, etc.)
-        # - water_cycling_density: m^3/kWh_heat (evaporation in towers)
-        static_m3 = heat_rejected_kwh * max(0.0, self.water_static)
-        evap_m3 = heat_rejected_kwh * max(0.0, self.water_cycling_density)
+    def _tou_price(self, ms: float) -> float:
+        if not self.tou_price:
+            return 0.0
+        h = self._hour_of_day(ms)
+        return float(self.tou_price[h % len(self.tou_price)])
 
-        # Blowdown via cycles-of-concentration (CoC): blowdown = evap / (CoC - 1)
-        if self.blowdown_ratio and self.blowdown_ratio > 1.0:
-            blowdown_m3 = evap_m3 / (self.blowdown_ratio - 1.0)
+    # ---------- cooling helpers (temp-aware) ----------
+    def _cop_for_ms(self, ms: float) -> float:
+        # Start from hourly COP profile if provided; else baseline constant.
+        if self.cop_profile_24h and len(self.cop_profile_24h) >= 24:
+            base = float(self.cop_profile_24h[self._hour_of_day(ms) % 24])
         else:
-            blowdown_m3 = 0.0
+            base = self.cop_default
 
-        # Total make-up water drawn from supply:
-        makeup_m3 = static_m3 + evap_m3 + blowdown_m3
+        # Apply temperature sensitivity (positive alpha increases COP with higher setpoint)
+        dT = float(self.temp_c_setpoint) - self.temp_ref_c
+        cop = base * max(0.0, 1.0 + self.cop_temp_alpha_per_C * dT)
+        return max(1.0, cop)
 
-        # Water-related electricity (kWh):
-        #  - potable/make-up water delivery & treatment
-        #  - wastewater treatment for blowdown
-        water_energy_kwh = (
-                makeup_m3 * max(0.0, self.potable_energy_intensity) +
-                blowdown_m3 * max(0.0, self.wastewater_energy_intensity)
-        )
-        ttft_s     = (float(net_latency_ms) + queue_ms + exec_ms) / 1000.0
+    def _pue_for_ms(self, ms: float) -> float:
+        base = self.pue_value
+        dT = float(self.temp_c_setpoint) - self.temp_ref_c
+        pue = base + self.pue_temp_alpha_per_C * dT
+        return max(1.0, pue)
 
-        energy_costs = energy_kwh * tou
+    def _solar_kw_at_ms(self, ms: float) -> float:
+        if self.solar_kw_capacity <= 0.0 or not self.solar_profile_24h:
+            return 0.0
+        h = self._hour_of_day(ms)
+        frac = float(self.solar_profile_24h[h % len(self.solar_profile_24h)])
+        return max(0.0, self.solar_kw_capacity * frac)
 
-        # Aggregates
-        self._ttft_sum_s += ttft_s
-        self._ttft_count += 1
-        self._energy_kwh += energy_kwh
-        self._carbon_g  += carbon_g
-        self._water_m3   += makeup_m3
-        self.energy_cost_agg += energy_costs
+    # ---------- per-exec energy ----------
+    def _energy_for_exec_kwh(self, u: ProcNode, exec_ms: float, start_ms: float) -> float:
+        """
+        Total DC energy for this execution BEFORE PV/battery offset:
+          IT + 'other IT' overhead + cooling (via COP or PUE).
+        """
+        it_kwh = u.it_energy_kwh_for_exec(exec_ms)
+        other_kwh = it_kwh * max(0.0, self.other_it_overhead_frac)
+
+        if self.cooling_mode == "MECH_COP":
+            cop = max(0.1, self._cop_for_ms(start_ms))
+            cooling_kwh = it_kwh / cop
+            infra_kwh = it_kwh + other_kwh + cooling_kwh
+        else:
+            # Liquid cooling via PUE: facility energy = IT * (PUE - 1)
+            pue = max(1.0, self._pue_for_ms(start_ms))
+            non_it_facility_kwh = it_kwh * (pue - 1.0)
+            # Treat "other_kwh" as part of non-IT facility; remainder is cooling
+            cooling_kwh = max(0.0, non_it_facility_kwh - other_kwh)
+            infra_kwh = it_kwh + other_kwh + cooling_kwh
+
+        # accumulate components (for diagnostics)
+        self.energy_it_kwh += it_kwh
+        self.energy_other_kwh += other_kwh
+        self.energy_cooling_kwh += cooling_kwh
+
+        # utilization (busy time)
+        self._busy_ms += max(0.0, float(exec_ms))
+
+        return infra_kwh
+
+    def _apply_solar_battery_offset(self, gross_kwh: float, start_ms: float, end_ms: float) -> float:
+        """
+        Priority: PV -> load, then battery discharge. Charge battery with PV surplus.
+        Returns kWh that must be drawn from the grid.
+        """
+        hours = max(1e-9, (end_ms - start_ms) / 3_600_000.0)
+        pv_kw = self._solar_kw_at_ms(start_ms)
+        pv_kwh = pv_kw * hours
+
+        # PV to load
+        pv_to_load = min(pv_kwh, gross_kwh)
+        self.energy_solar_kwh += pv_to_load
+        remaining = gross_kwh - pv_to_load
+
+        # Battery discharge to cover remaining
+        batt_deliver = self.battery.discharge(remaining, hours) if self.battery else 0.0
+        remaining -= batt_deliver
+        self.energy_batt_discharge_kwh += batt_deliver
+
+        # PV surplus -> battery charge
+        surplus = max(0.0, pv_kwh - pv_to_load)
+        if surplus > 0.0 and self.battery:
+            stored = self.battery.charge(surplus, hours)
+            if stored > 0.0:
+                self.energy_batt_charge_kwh += stored
+
+        return max(0.0, remaining)  # grid draw
 
 
-        if self.debug:
-            print(f"[DC {self.dc_id}] model={model} arr={arrival_ms:.0f}ms net={net_latency_ms:.0f}ms "
-                  f"queue={queue_ms:.0f}ms exec={exec_ms:.0f}ms node={u.node_id} TTFT={ttft_s:.3f}s")
+    def _account_water_from_it(self, it_kwh: float, start_ms: float, cop: float) -> float:
+        """
+        Returns makeup water (m^3) for this execution and updates epoch-level water counters.
+        Assumptions (same as before):
+          - Heat rejection = IT + Cooling; Cooling = IT/COP (mechanical only)
+          - static water use: water_static_m3_per_kwh_heat * heat_rej_kwh
+          - evaporative:     water_cycling_density_m3_per_kwh_heat * heat_rej_kwh
+          - blowdown rule (ModelSet #80): total draw = evap / blowdown_ratio; blowdown = draw - evap
+          - potable energy intensity applies to (evap + static); wastewater EI to blowdown
+          - added water energy produces additional carbon (tracked separately as water_carbon_g),
+            but DOES NOT alter your existing E/EC/cost paths.
+        """
+        # heat rejected for mechanical AC
+        heat_rej_kwh = it_kwh + (it_kwh / max(1e-9, cop))
 
+        static_m3 = float(self.water_static) * heat_rej_kwh
+        evap_m3 = float(self.water_cycling_density) * heat_rej_kwh
+
+        # blowdown
+        ratio = max(1e-9, float(self.blowdown_ratio))  # avoid div-by-zero
+        total_draw_m3 = evap_m3 / ratio
+        blowdown_m3 = max(0.0, total_draw_m3 - evap_m3)
+
+        makeup_m3 = static_m3 + total_draw_m3
+
+        # energy for water processing
+        potable_kwh = float(self.potable_energy_intensity) * (evap_m3 + static_m3)
+        wastewater_kwh = float(self.wastewater_energy_intensity) * blowdown_m3
+        total_water_kwh = potable_kwh + wastewater_kwh
+
+        # carbon from water processing energy (separate; not mixed into main carbon_g)
+        water_co2_g = total_water_kwh * float(self.carbon_intensity_g_per_kwh)
+
+        # accumulate epoch counters
+        self.water_static_m3 += static_m3
+        self.water_evap_m3 += evap_m3
+        self.water_blowdown_m3 += blowdown_m3
+        self.water_makeup_m3 += makeup_m3
+        self.water_energy_potable_kwh += potable_kwh
+        self.water_energy_wastewater_kwh += wastewater_kwh
+        self.water_energy_total_kwh += total_water_kwh
+        self.water_carbon_g += water_co2_g
+
+        return makeup_m3
+
+    def account_energy_carbon_cost(self, u: ProcNode, exec_ms: float, start_ms: float) -> tuple[
+        float, float, float, float]:
+        """
+        Returns (energy_kwh_total, carbon_g, cost_usd, water_m3) for this execution.
+        NOTE: water processing carbon is tracked separately in self.water_carbon_g and
+              NOT added into carbon_g so as not to change your existing reporting.
+        """
+        gross_kwh = self._energy_for_exec_kwh(u, exec_ms, start_ms)
+        end_ms = start_ms + exec_ms
+
+        grid_kwh = self._apply_solar_battery_offset(gross_kwh, start_ms, end_ms)
+        self.energy_grid_kwh += grid_kwh
+
+        # --- Water processing (mechanical cooling only) ---
+        water_m3 = 0.0
+        if self.cooling_mode == "MECH_COP":
+            cop = max(0.1, self._cop_for_ms(start_ms))
+            # use IT energy of this exec; we just stored it in self.energy_it_kwh,
+            # but we need the delta for this execution:
+            it_kwh_this = u.it_energy_kwh_for_exec(exec_ms)
+            water_m3 = self._account_water_from_it(it_kwh_this, start_ms, cop)
+
+
+        carbon_g = self.energy_grid_kwh * self.carbon_intensity_g_per_kwh + self.embodied_battery_co2_kg
+        cost_usd = self._tou_price(start_ms) * self.energy_grid_kwh if self.tou_price else 0.0
+        return gross_kwh, carbon_g, cost_usd, water_m3
+
+    def settle_and_score(self, u: ProcNode, exec_ms: float, start_ms: float) -> dict:
+        gross_kwh, carbon_g, cost_usd, water_m3 = self.account_energy_carbon_cost(u, exec_ms, start_ms)
+        self.cost_usd += cost_usd
         return {
-            "ttft_s": float(ttft_s),
-            "start_ms": float(start_ms),
-            "finish_ms": float(finish_ms),
-            "queue_delay_ms": float(queue_ms),
-            "exec_ms": float(exec_ms),
-            "energy_kwh": float(energy_kwh),
-            "carbon_g": float(carbon_g),
-            "water_m3": float(makeup_m3),
-            "it_energy_kwh": float(it_energy_kwh),
-            "cooling_elec_kwh": float(cooling_elec_kwh),
-            "water_energy_kwh": float(water_energy_kwh),
-            "static_m3": float(static_m3),
-            "evap_m3": float(evap_m3),
-            "blowdown_m3": float(blowdown_m3),
-            "node_id": int(u.node_id),
-            "energy_costs": float(energy_costs),
+            "energy_kwh": gross_kwh,
+            "carbon_g": carbon_g,
+            "cost_usd": self.cost_usd,
+            "water_m3": water_m3,
         }
 
-    # ---------- reporting ----------
-    def report_global_stats(self) -> Dict[str, Any]:
-        avg_ttft = (self._ttft_sum_s / self._ttft_count) if self._ttft_count > 0 else 0.0
-        return {
-            "avg_ttft": float(avg_ttft),
-            "energy_cost": float(self.energy_cost_agg),
-            "carbon_emissions": float(self._carbon_g),
-            "water_usage": float(self._water_m3),
-            "total_energy": float(self._energy_kwh),
-        }
+    # ---------- epoch lifecycle ----------
+    def reset_epoch(self):
+        self._busy_ms = 0.0
+        self.energy_grid_kwh = 0.0
+        self.energy_solar_kwh = 0.0
+        self.energy_batt_discharge_kwh = 0.0
+        self.energy_batt_charge_kwh = 0.0
+        self.embodied_battery_co2_kg = 0.0
+        self.energy_other_kwh = 0.0
+        self.energy_cooling_kwh = 0.0
+        self.energy_it_kwh = 0.0
+        self.cost_usd = 0.0
+        # water
+        self.water_evap_m3 = 0.0
+        self.water_blowdown_m3 = 0.0
+        self.water_static_m3 = 0.0
+        self.water_makeup_m3 = 0.0
+        self.water_energy_potable_kwh = 0.0
+        self.water_energy_wastewater_kwh = 0.0
+        self.water_energy_total_kwh = 0.0
+        self.water_carbon_g = 0.0
+        for u in self.units:
+            try:
+                u.busy_ms_epoch = 0.0
+            except AttributeError:
+                pass
+        if self.battery:
+            self.battery.reset_epoch()
+
+    def finalize_epoch(self):
+        # NEW: accrue idle power for all non-OFF units
+        epoch_ms = max(0.0, float(self._epoch_len_s) * 1000.0)
+        idle_it_kwh = 0.0
+        for u in self.units:
+            # If the unit is truly OFF and never did work, skip
+            if getattr(u, "state", "IDLE") == "OFF" and getattr(u, "busy_ms_epoch", 0.0) <= 0.0:
+                continue
+
+            busy = min(epoch_ms, max(0.0, getattr(u, "busy_ms_epoch", 0.0)))
+            idle_ms = max(0.0, epoch_ms - busy)
+            if idle_ms <= 0.0 or u.tdp_w <= 0.0:
+                continue
+
+            # IT idle power in Watts: TDP * idle_frac * temp_mult
+            it_idle_w = u.tdp_w * u.base_idle_frac * u._it_power_temp_mult()
+            idle_it_kwh += (it_idle_w / 1000.0) * (idle_ms / 3_600_000.0)
+
+        if idle_it_kwh > 0.0:
+            other_kwh = idle_it_kwh * max(0.0, self.other_it_overhead_frac)
+
+            if self.cooling_mode == "MECH_COP":
+                cop = max(0.1, self._cop_for_ms(0.0))
+                cooling_kwh = idle_it_kwh / cop
+            else:
+                pue = max(1.0, self._pue_for_ms(0.0))
+                non_it_facility_kwh = idle_it_kwh * (pue - 1.0)
+                cooling_kwh = max(0.0, non_it_facility_kwh - other_kwh)
+
+            gross_idle_kwh = idle_it_kwh + other_kwh + cooling_kwh
+
+            # Accumulate components for diagnostics (same fields used elsewhere)
+            self.energy_it_kwh += idle_it_kwh
+            self.energy_other_kwh += other_kwh
+            self.energy_cooling_kwh += cooling_kwh
+
+            # Route through PV/Battery -> grid, then cost at t=0 ToU (epoch-average would also be OK)
+            start_ms, end_ms = 0.0, epoch_ms
+            grid_kwh = self._apply_solar_battery_offset(gross_idle_kwh, start_ms, end_ms)
+            self.energy_grid_kwh += grid_kwh
+
+        # Existing: accrue battery embodied CO2 (kg) based on throughput this epoch
+        if self.battery:
+            self.embodied_battery_co2_kg = self.battery.embodied_carbon_kg()
+
+    # ---------- optional: utilization helper ----------
+    def utilization(self, epoch_len_s: float) -> float:
+        """
+        Returns DC utilization in [0,1] as (busy_ms) / (units * epoch_ms).
+        Busy time is incremented per execution in _energy_for_exec_kwh().
+        """
+        if not self.units:
+            return 0.0
+        epoch_ms = max(1e-9, float(epoch_len_s) * 1000.0)
+        cap_ms = epoch_ms * len(self.units)
+        print(epoch_len_s)
+        print(cap_ms)
+        print(self._busy_ms)
+        return max(0.0, min(1.0, self._busy_ms / cap_ms))
 
     def report_utilization(self) -> float:
-        if not self.units or self.epoch_length_ms <= 0.0:
-            return 0.0
-        cap_ms = len(self.units) * self.epoch_length_ms
-        u = self._busy_ms / cap_ms
-        return max(0.0, min(1.0, float(u)))
+        return self.utilization(self._epoch_len_s)
 
-    def reset_epoch(self) -> None:
-        self._busy_ms = 0.0
-        self._energy_kwh = 0.0
-        self._carbon_g = 0.0
-        self._water_m3 = 0.0
-        self._ttft_sum_s = 0.0
-        self._ttft_count = 0
-        self.energy_cost_agg = 0.0
-        for unit in self.units:
-            unit.available_at_ms = 0.0
 
 
 
@@ -624,6 +926,9 @@ class Geo_Network:
             tgt_dc = choose_target_dc(row_idx, model, src_dc)
             net_ms = self._ring_path_latency_ms(src_dc, tgt_dc)
 
+            tokens = int(getattr(row, "tokens", getattr(row, "tokens", 0)))
+            print(tokens)
+
             dc = self.datacenters.get(tgt_dc)
             result: Dict[str, Any] = {
                 "epoch": int(epoch_idx),
@@ -633,6 +938,7 @@ class Geo_Network:
                 "model": model,
                 "arrival_ms": float(arrival_ms),
                 "net_latency_ms": float(net_ms),
+                "tokens": tokens,
             }
 
             # Delegate to DC if it supports detailed scheduling
@@ -644,6 +950,7 @@ class Geo_Network:
                         net_latency_ms=net_ms,
                         source_dc=src_dc,
                         target_dc=tgt_dc,
+                        tokens=tokens,
                         # You may add tokens/size if present in the row, e.g.:
                         # prefill_tokens=getattr(row, "prefill_tokens", None),
                         # gen_tokens=getattr(row, "gen_tokens", None),
@@ -666,6 +973,59 @@ class Geo_Network:
                 })
 
             details.append(result)
+
+        for dc in self.datacenters.values():
+            # 1) Snapshot pre-finalize totals
+            pre_grid_kwh = float(getattr(dc, "energy_grid_kwh", 0.0))
+            pre_cost_usd = float(getattr(dc, "cost_usd", 0.0))
+            pre_emb_kg = float(getattr(dc, "embodied_battery_co2_kg", 0.0))
+
+            # 2) Finalize once per epoch (adds idle IT/other/cooling and battery embodied CO2)
+            if hasattr(dc, "finalize_epoch"):
+                dc.finalize_epoch()
+
+            # 3) Compute deltas added by finalize
+            post_grid_kwh = float(getattr(dc, "energy_grid_kwh", 0.0))
+            post_emb_kg = float(getattr(dc, "embodied_battery_co2_kg", 0.0))
+
+            dE_kwh = max(0.0, post_grid_kwh - pre_grid_kwh)
+            dEmb_kg = max(0.0, post_emb_kg - pre_emb_kg)
+
+            if dE_kwh <= 0.0 and dEmb_kg <= 0.0:
+                # Nothing added by finalize for this DC; skip the synthetic record
+                continue
+
+            # 4) Price finalize energy at t=0 (matches finalize_epoch’s ToU choice)
+            tou_price = 0.0
+            if getattr(dc, "tou_price", None) is not None and hasattr(dc, "_tou_price"):
+                try:
+                    tou_price = float(dc._tou_price(0.0))
+                except Exception:
+                    tou_price = 0.0
+
+            dCost_usd = dE_kwh * tou_price
+
+            # 5) Carbon from energy + battery embodied CO₂
+            ci_g_per_kwh = float(getattr(dc, "carbon_intensity_g_per_kwh", 0.0))
+            dCarbon_g = dE_kwh * ci_g_per_kwh + (dEmb_kg * 1000.0)
+
+            # 6) Commit the finalize cost into the DC’s running cost total
+            if hasattr(dc, "cost_usd"):
+                dc.cost_usd = float(getattr(dc, "cost_usd", 0.0)) + dCost_usd
+
+            # 7) Append a synthetic detail row so aggregations include finalize additions
+            details.append({
+                "dc_id": int(getattr(dc, "id", -1)),
+                "start_ms": 0.0,
+                "end_ms": 0.0,
+                "exec_ms": 0.0,
+                "ttft_s": 0.0,
+                "energy_kwh": dE_kwh,
+                "carbon_g": dCarbon_g,
+                "cost_usd": dCost_usd,
+                "water_m3": 0.0,  # finalize currently doesn’t add water
+                "tag": "epoch_finalize_idle",  # helpful for debugging/plots
+            })
 
         # Store last epoch snapshot for reporting
         self._last_epoch_results = details
@@ -716,7 +1076,7 @@ class Geo_Network:
             try: water_m3 += float(r.get("water_m3", r.get("water_usage", 0.0)))
             except Exception: pass
 
-            try: energy_cost += float(r.get("energy_costs", r.get("energy_cost", 0.0)))
+            try: energy_cost += float(r.get("cost_usd", r.get("energy_cost", 0.0)))
             except Exception: pass
 
         avg_ttft = (ttft_sum / max(1, ttft_cnt)) if ttft_cnt > 0 else 0.0
@@ -904,10 +1264,11 @@ class LLM_Simulator:
                 time_of_use_24h=params["time_of_use_24h"],
                 cop_profile_24h=params["cop_profile_24h"],
                 blowdown_ratio=params["blowdown_ratio"],
-                water_cycling_density=params["water_cycling_density_m3_per_kwh_heat"],
-                potable_energy_intensity=params["potable_EI_kWh_per_m3"],
-                wastewater_energy_intensity=params["wastewater_EI_kWh_per_m3"],
-                water_static=params["water_static_m3_per_kwh_heat"],
+                water_cycling_density_m3_per_kwh_heat=params["water_cycling_density_m3_per_kwh_heat"],
+                potable_EI_kWh_per_m3=params["potable_EI_kWh_per_m3"],
+                wastewater_EI_kWh_per_m3=params["wastewater_EI_kWh_per_m3"],
+                water_static_m3_per_kwh_heat=params["water_static_m3_per_kwh_heat"],
+                cooling_mode=params.get("cooling_mode", "MECH_COP"),
                 # epoch length from simulator (optional, pass through if desired):
                 epoch_length=self.epoch_length,
             )
@@ -949,37 +1310,32 @@ class LLM_Simulator:
     # ---------------------------------------------------------------------
     # Rate_Flow_Sim.py  (inside LLM_Simulator)
 
-    def _debug_dump_cooling_params(self) -> None:
-        """
-        Prints one line per DC with the fields that drive water & cooling.
-        Requires self.debug = True to print (but we’ll also print if values look zero).
-        """
-        print("\n=== Cooling/Water params by DC ===")
-        hdr = ("DC  CI(g/kWh)  water_static(m3/kWh_heat)  water_cycling_density(m3/kWh_heat)  "
-               "blowdown_ratio  potable_EI(kWh/m3)  wastewater_EI(kWh/m3)  COP_profile[0..3]/default")
-        print(hdr)
-        zeroish = False
-        for dc_id in sorted(self.datacenters):
-            dc = self.datacenters[dc_id]
-            prof = getattr(dc, "cop_profile_24h", None)
-            prof_head = None
-            if prof and len(prof) == 24:
-                prof_head = ",".join(f"{float(x):.2f}" for x in prof[:4])
-            cop_def = getattr(dc, "cop_default", 3.0)
-            line = (f"{dc_id:2d}  {dc.carbon_intensity_g_per_kwh:8.1f}  "
-                    f"{dc.water_static:10.6f}  {dc.water_cycling_density:10.6f}  "
-                    f"{dc.blowdown_ratio:6.2f}        {dc.potable_energy_intensity:6.4f}            "
-                    f"{dc.wastewater_energy_intensity:6.4f}        "
-                    f"{(prof_head if prof_head else '—') or '—'} / {cop_def:.2f}")
+    def _debug_dump_cooling_params(self):
+        print("\n\n=== Cooling/Water params by DC ===")
+        print("DC  CI(g/kWh)  water_static(m3/kWh_heat)  water_cycling_density(m3/kWh_heat)  blowdown_ratio  "
+              "potable_EI(kWh/m3)  wastewater_EI(kWh/m3)  COP_profile[0..3]/default")
+
+        for dc_id, dc in self.datacenters.items():
+            # Pull values with safe fallbacks and ensure they are floats (not lists)
+            ci = float(getattr(dc, "carbon_intensity_g_per_kwh", 0.0))
+            ws = float(getattr(dc, "water_static", 0.0))
+            wcd = float(getattr(dc, "water_cycling_density", 0.0))
+            br = float(getattr(dc, "blowdown_ratio", 0.0))
+            pei = float(getattr(dc, "potable_energy_intensity", 0.0))
+            wei = float(getattr(dc, "wastewater_energy_intensity", 0.0))
+
+            # COP display: sample first 4 hours if profile exists; else show default
+            cop_prof = getattr(dc, "cop_profile_24h", None)
+            if cop_prof and len(cop_prof) >= 1:
+                sample = cop_prof[:4] if len(cop_prof) >= 4 else cop_prof
+                cop_str = ",".join(f"{float(x):.2f}" for x in sample)
+            else:
+                cop_default = float(getattr(dc, "cop_default", 0.0))
+                cop_str = f"{cop_default:.2f}"
+
+            line = (f"{dc_id:2d}  {ci:8.1f}    {ws:10.6f}                 {wcd:10.6f}               {br:5.2f}        "
+                    f"{pei:6.4f}                {wei:6.4f}        {cop_str}")
             print(line)
-
-            if (dc.water_static == 0.0 and dc.water_cycling_density == 0.0 and
-                    dc.potable_energy_intensity == 0.0 and dc.wastewater_energy_intensity == 0.0):
-                zeroish = True
-
-        if zeroish:
-            print("[DIAG] Many DC water parameters are zero. If this is unexpected, "
-                  "verify Datacenter_specs.csv headers & units match the loader mapping.")
 
     def _sanity_probe_water_1kwh(self) -> None:
         """
