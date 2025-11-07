@@ -50,7 +50,7 @@ RFS_DEBUG = os.environ.get("RFS_DEBUG", "").strip().lower() not in ("", "0", "fa
 
 def _dprint(*args, force=False):
     if RFS_DEBUG or force:
-        print(*args)
+        passthrough = args
 
 def _norm_model_name(name: str) -> str:
     s = str(name).strip().lower().replace("-", "").replace("_", "")
@@ -99,79 +99,48 @@ def _finalize_perf_entry(ms_per_token=None, ms_per_request=None, avg_tokens_per_
 
 
 @dataclass
-class Processor:
-    proc_id: int
-    node_id: int
-    epoch_length: int
-    power_state: str = "on"  # "on", "idle", or "off"
-    tdp_kw: float = 0.0       # active power (kW)
-    idle_kw: float = 0.0      # idle power (kW)
-    # Model performance table per processor configuration.
-    # Example entry:
-    #   model_perf["Llama7b"] = {
-    #       "ms_per_token": 1.2
-    #       # OR
-    #       "ms_per_request": 1187.0, "avg_tokens_per_request": 512
-    #   }
-    model_perf: Dict[str, Dict[str, float]] = field(default_factory=dict)
+class ProcNode:
+    """
+    Combined Node + Processor:
+      - Holds HW traits (accel_type, gpu_config), power (tdp_kw/idle_kw),
+        and per-model perf (ms_per_request, ms_per_token).
+      - Tracks availability (available_at_ms) for queueing.
+    """
+    __slots__ = (
+        "node_id", "type_id", "accel_type", "gpu_config",
+        "tdp_kw", "idle_kw", "model_perf", "available_at_ms"
+    )
 
-    # Optional: per-processor coefficient for TTFT surrogate (seconds)
-    ttft_alpha_sec: Optional[float] = None
+    def __init__(
+        self,
+        node_id: int,
+        type_id: Optional[int],
+        accel_type: str,
+        gpu_config: str,
+        tdp_kw: float,
+        idle_kw: float,
+        model_perf: Dict[str, Dict[str, float]],
+    ):
+        self.node_id = int(node_id)
+        self.type_id = int(type_id) if type_id is not None else None
+        self.accel_type = str(accel_type)
+        self.gpu_config = str(gpu_config)
+        self.tdp_kw = float(tdp_kw)
+        self.idle_kw = float(idle_kw)
+        self.model_perf = model_perf or {}
+        self.available_at_ms: float = 0.0
 
-    # ------------- power helpers -------------
-    def is_active(self) -> bool:
-        return self.power_state.lower() == "on"
-
-    def is_off(self) -> bool:
-        return self.power_state.lower() == "off"
-
-    def active_kW(self) -> float:
-        return float(self.tdp_kw)
-
-    def idle_kW(self) -> float:
-        return float(self.idle_kw)
-
-    # ------------- throughput -------------
-    def estimate_tokens_per_sec(self, model_type: str) -> float:
-        key = _norm_model_name(model_type)
-        cfg = (self.model_perf or {}).get(key) or (self.model_perf or {}).get(str(model_type))
-        if not cfg:
-            _dprint(
-                f"[CAP] No perf entry for model='{model_type}' (norm='{key}') on proc {self.node_id}:{self.proc_id}")
-            return 0.0
-
-        mspt = cfg.get("ms_per_token")
-        if mspt is not None and mspt > 0:
-            return 1000.0 / float(mspt)
-
-        mspre = cfg.get("ms_per_request")
-        avgtok = cfg.get("avg_tokens_per_request") or _DEFAULT_AVG_TOKENS.get(key)
-        if mspre is not None and avgtok and avgtok > 0:
-            sec = max(1e-6, float(mspre) / 1000.0)
-            return float(avgtok) / sec
-
-        exec_ms = cfg.get("exec_ms")
-        default_tokens = cfg.get("default_tokens")
-        if exec_ms is not None and default_tokens and default_tokens > 0:
-            sec = max(1e-6, float(exec_ms) / 1000.0)
-            return float(default_tokens) / sec
-
-        _dprint(
-            f"[CAP] Perf entry lacks usable fields for model='{model_type}' (norm='{key}') on proc {self.node_id}:{self.proc_id} -> 0 TPS")
-        return 0.0
-
-    def estimate_duty_cycle(self, dc_utilization: float) -> float:
-        """Map DC utilization to processor duty. Simple passthrough/clip.
-        If you don’t have per-proc routing, use DC-level utilization.
+    # --- simple helpers ---
+    def estimate_exec_ms(self, model: str, rec: Optional[Dict[str, Any]] = None) -> float:
         """
-        return max(0.0, min(1.0, float(dc_utilization)))
+        Estimate execution time. If you later pass tokens in `rec`, you can
+        use ms_per_token here; for now we use ms_per_request from CSVs.
+        """
+        perf = self.model_perf.get(model) or self.model_perf.get(model.capitalize())
+        if perf and "ms_per_request" in perf:
+            return float(perf["ms_per_request"])
+        return 1000.0  # fallback (shouldn’t hit with proper CSVs)
 
-
-@dataclass
-class Node:
-    node_id: int
-    type_id: int
-    processors: List[Processor] = field(default_factory=list)
 
 
 # -----------------------------
@@ -180,282 +149,314 @@ class Node:
 
 @dataclass
 class Datacenter:
+    """
+    Holds a flat list of ProcNode 'units' and dispatches workload to the least-busy eligible unit.
+
+    Public API (unchanged to callers):
+      add_node(node: ProcNode)
+      apply_power_plan(plan_slice)
+      schedule_request(model, arrival, net_latency_ms, source_dc, target_dc, **kw) -> dict
+      report_global_stats() -> dict
+      report_utilization()  -> float in [0,1]
+      reset_epoch()
+    """
+
     def __init__(
         self,
         dc_id: int,
-        nodes: list,
-        *,
-        # Cooling & other hardware
-        cop: float = 3.0,
-        other_hw_overhead: float = 0.13,
-        cooling_overhead_multiplier: float = 3.0,
-        # Environmental intensities
-        carbon_intensity_kg_per_kwh: float = 0.4,
-        water_evap_m3_per_kwh: float = 0.0004,
-        blowdown_ratio: float = 0.25,
-        # Solar model
-        solar_kw_capacity: float = 0.0,
-        solar_profile_24h: list | None = None,
-        # Battery model
-        battery_kwh_capacity: float = 0.0,
-        battery_max_kw_charge: float = 0.0,
-        battery_max_kw_discharge: float = 0.0,
-        battery_roundtrip_eff: float = 0.92,
-        battery_embodied_kgco2e: float = 0.0,
-        battery_cycle_life: float = 2500.0,
-        # TTFT shaping
-        ttft_alpha_sec: float = 0.20,
-        ttft_beta_ms_per_token: float = 0.0,
+        carbon_intensity_g_per_kwh: float,
+        time_of_use_24h: Optional[List[float]] = None,
+        cop_profile_24h: Optional[List[float]] = None,
+        blowdown_ratio: float = 0.0,
+        water_cycling_density: float = 0.0,
+        potable_energy_intensity: float = 0.0,
+        wastewater_energy_intensity: float = 0.0,
+        water_static: float = 0.0,
+        epoch_length: int = 900,
+        debug: bool = False,
     ):
         self.dc_id = int(dc_id)
-        self.nodes = nodes or []
+        self.debug = debug
 
-        # Cooling / other HW
-        self.cop = float(cop)
-        self.other_hw_overhead = float(other_hw_overhead)
-        self.cooling_overhead_multiplier = float(cooling_overhead_multiplier)
-
-        # Environmental
-        self.carbon_intensity_kg_per_kwh = float(carbon_intensity_kg_per_kwh)
-        self.water_evap_m3_per_kwh = float(water_evap_m3_per_kwh)
+        self.carbon_intensity_g_per_kwh = float(carbon_intensity_g_per_kwh)
+        self.time_of_use_24h = time_of_use_24h or None
+        self.cop_profile_24h = cop_profile_24h or None
         self.blowdown_ratio = float(blowdown_ratio)
 
-        # Solar
-        self.solar_kw_capacity = float(solar_kw_capacity)
-        self.solar_profile_24h = list(solar_profile_24h) if solar_profile_24h else None
+        self.water_cycling_density = float(water_cycling_density)
+        self.potable_energy_intensity = float(potable_energy_intensity)
+        self.wastewater_energy_intensity = float(wastewater_energy_intensity)
+        self.water_static = float(water_static)
 
-        # Battery
-        self.battery_kwh_capacity = float(battery_kwh_capacity)
-        self.battery_max_kw_charge = float(battery_max_kw_charge)
-        self.battery_max_kw_discharge = float(battery_max_kw_discharge)
-        self.battery_roundtrip_eff = float(battery_roundtrip_eff)
-        self.battery_embodied_kgco2e = float(battery_embodied_kgco2e)
-        self.battery_cycle_life = float(battery_cycle_life)
+        self.epoch_length_s = int(epoch_length)
+        self.epoch_length_ms = float(self.epoch_length_s * 1000)
 
-        # Keep SoC both with and without underscore to satisfy old/new call-sites
-        start_soc = 0.5 * self.battery_kwh_capacity if self.battery_kwh_capacity > 0 else 0.0
-        self._battery_soc_kwh = start_soc
-        self.battery_soc_kwh = start_soc   # legacy alias
-        self._battery_cycles_used = 0.0
+        # Flat list of ProcNode execution units
+        self.units: List[ProcNode] = []
 
-        # TTFT parameters
-        self.ttft_alpha_sec = float(ttft_alpha_sec)
-        self.ttft_beta_ms_per_token = float(ttft_beta_ms_per_token)
+        # Eligibility controls
+        self._enabled_node_ids: Optional[set[int]] = None
+        self._enabled_type_ids: Optional[set[int]] = None
 
-    def __repr__(self) -> str:
-        return (f"Datacenter(dc_id={self.dc_id}, nodes={len(self.nodes)}, "
-                f"cop={self.cop}, carbon_intensity={self.carbon_intensity_kg_per_kwh}, "
-                f"solar_kw={self.solar_kw_capacity}, batt_kwh={self.battery_kwh_capacity}, "
-                f"ttft_alpha={self.ttft_alpha_sec}, ttft_beta_mspt={self.ttft_beta_ms_per_token})")
+        # Per-epoch aggregates
+        self._busy_ms: float = 0.0
+        self._energy_kwh: float = 0.0
+        self._carbon_g: float = 0.0
+        self._water_m3: float = 0.0
+        self._ttft_sum_s: float = 0.0
+        self._ttft_count: int = 0
+        self.energy_cost_agg: float = 0.0
 
+    # ---------- inventory ----------
+    def add_node(self, node: ProcNode) -> None:
+        self.units.append(node)
 
-    def apply_power_plan(self, plan: Dict):
-        """Apply power states. Plan may specify per-processor or per-node states.
-        Example plan formats:
-            {"processors": { (node_id, proc_id): "on"/"idle"/"off" }}
-            {"nodes": { node_id: "on"/"idle"/"off" }}
+    # ---------- power plan ----------
+    def apply_power_plan(self, plan_slice: Optional[Dict[str, Any]]) -> None:
+        if not isinstance(plan_slice, dict) or not plan_slice:
+            self._enabled_node_ids = None
+            self._enabled_type_ids = None
+            return
+
+        en_nodes = plan_slice.get("enable_nodes")
+        en_types = plan_slice.get("enable_types")
+        off_nodes = plan_slice.get("off_nodes")
+        off_types = plan_slice.get("off_types")
+
+        if en_nodes is not None:
+            self._enabled_node_ids = set(int(x) for x in en_nodes)
+        else:
+            self._enabled_node_ids = set(u.node_id for u in self.units)
+            if off_nodes:
+                self._enabled_node_ids -= set(int(x) for x in off_nodes)
+
+        if en_types is not None:
+            self._enabled_type_ids = set(int(x) for x in en_types)
+        else:
+            inv_types = {u.type_id for u in self.units if u.type_id is not None}
+            self._enabled_type_ids = None
+            if off_types:
+                self._enabled_type_ids = set(inv_types)
+                self._enabled_type_ids -= set(int(x) for x in off_types)
+
+        if self.debug:
+            nn = "ALL" if self._enabled_node_ids is None else len(self._enabled_node_ids)
+            tt = "ALL" if self._enabled_type_ids is None else len(self._enabled_type_ids)
+            print(f"[DC {self.dc_id}] apply_power_plan -> enabled_nodes={nn} enabled_types={tt}")
+
+    # ---------- scheduling ----------
+    def _eligible_unit_iter(self):
+        for u in self.units:
+            if self._enabled_node_ids is not None and u.node_id not in self._enabled_node_ids:
+                continue
+            if self._enabled_type_ids is not None and (u.type_id is not None) and (u.type_id not in self._enabled_type_ids):
+                continue
+            yield u
+
+    def _pick_least_busy_unit(self, arrival_ms: float) -> Optional[ProcNode]:
+        best = None
+        best_avail = math.inf
+        for u in self._eligible_unit_iter():
+            if u.available_at_ms < best_avail:
+                best_avail = u.available_at_ms
+                best = u
+        return best
+
+    def _energy_for_exec_kwh(self, u: ProcNode, exec_ms: float) -> float:
+        return float(u.tdp_kw) * (float(exec_ms) / 3_600_000.0)
+
+    def _carbon_for_energy_g(self, energy_kwh: float) -> float:
+        return (self.carbon_intensity_g_per_kwh * energy_kwh)
+
+    def _water_for_energy_m3(self, energy_kwh: float) -> float:
+        return (self.water_static * energy_kwh) if self.water_static > 0.0 else 0.0
+
+    def _cop_for_ms(self, t_ms: float) -> float:
         """
-        procs_set = plan.get("processors", {})
-        nodes_set = plan.get("nodes", {})
-        for node in self.nodes:
-            node_state = nodes_set.get(node.node_id)
-            for proc in node.processors:
-                state = procs_set.get((node.node_id, proc.proc_id), node_state)
-                if state:
-                    proc.power_state = str(state).lower()
-
-    # ---------- capacity aggregation ----------
-    def tokens_per_sec_by_model(self, model_type: str) -> float:
-        total = 0.0
-        for node in self.nodes:
-            for proc in node.processors:
-                if not proc.is_active():
-                    continue
-                total += proc.estimate_tokens_per_sec(model_type)
-        return total
-
-    def process_rate_epoch(self, assigned_tokens: Dict[str, float], epoch_length: int,
-                           avg_net_ms_by_model: Optional[Dict[str, float]] = None,
-                           warmup_sec_by_model: Optional[Dict[str, float]] = None,
-                           epoch_hour: Optional[int] = None) -> Dict:
-        """Drain assigned tokens for the epoch and compute energy/carbon/water & DERs.
-        Returns a metrics dict with per-model details and energy breakdown.
+        Return COP for a given millisecond timestamp.
+        - If a 24-value hourly profile is present, use hour-of-day.
+        - Else, fall back to a default (3.0 if unset).
         """
-        E = float(epoch_length)
-        hours = E / 3600.0
-        per_model = {}
+        # Fallback COP if no profile/invalid entries
+        cop_default = getattr(self, "cop_default", 3.0)
+        try:
+            prof = self.cop_profile_24h
+            if prof and len(prof) == 24:
+                # Derive hour-of-day (0..23) from milliseconds into a notional day.
+                # If you track absolute epoch start time elsewhere, you can pass it
+                # through and add here; this uses local time-of-day from t_ms alone.
+                sec = (float(t_ms) / 1000.0) % 86400.0
+                h = int(sec // 3600)  # 0..23
+                cop = float(prof[h])
+                # Guard against zeros/negatives in input
+                return cop if cop > 0.0 else cop_default
+        except Exception:
+            pass
+        return cop_default
 
-        # 1) capacity & drain
-        total_processed_tokens = 0.0
-        total_capacity_tokens = 0.0
-        for model, assigned in assigned_tokens.items():
-            tps = max(0.0, self.tokens_per_sec_by_model(model))
-            capacity = tps * E
-            processed = min(float(assigned), capacity)
-            leftover = max(0.0, float(assigned) - processed)
-            util = 0.0 if capacity <= 0 else (processed / capacity)
+    def _time_for_ms(self, t_ms: float) -> float:
+        """
+        Return COP for a given millisecond timestamp.
+        - If a 24-value hourly profile is present, use hour-of-day.
+        - Else, fall back to a default (3.0 if unset).
+        """
+        # Fallback COP if no profile/invalid entries
+        time_default = getattr(self, "time_default", 0.15)
+        try:
+            prof = self.time_of_use_24h
+            if prof and len(prof) == 24:
+                # Derive hour-of-day (0..23) from milliseconds into a notional day.
+                # If you track absolute epoch start time elsewhere, you can pass it
+                # through and add here; this uses local time-of-day from t_ms alone.
+                sec = (float(t_ms) / 1000.0) % 86400.0
+                h = int(sec // 3600)  # 0..23
+                time = float(prof[h])
+                # Guard against zeros/negatives in input
+                return time if time > 0.0 else time_default
+        except Exception:
+            pass
+        return time_default
 
-            total_processed_tokens += processed
-            total_capacity_tokens += max(0.0, capacity)
-
-            per_model[model] = {
-                "assigned_tokens": float(assigned),
-                "processed_tokens": processed,
-                "leftover_tokens": leftover,
-                "capacity_tokens": capacity,
-                "utilization": util,
-                "avg_net_ms": (avg_net_ms_by_model or {}).get(model, 0.0),
-                "avg_warmup_sec": (warmup_sec_by_model or {}).get(model, 0.0),
-                "ttft_alpha_sec": self.ttft_alpha_sec,
+    def schedule_request(
+        self,
+        model: str,
+        arrival: int,
+        net_latency_ms: float,
+        source_dc: int,
+        target_dc: int,
+        **kwargs,
+    ) -> Dict[str, Any]:
+        arrival_ms = float(arrival)
+        u = self._pick_least_busy_unit(arrival_ms)
+        if u is None:
+            # No enabled capacity
+            return {
+                "ttft_s": float(net_latency_ms) / 1000.0,
+                "start_ms": arrival_ms,
+                "finish_ms": arrival_ms,
+                "queue_delay_ms": 0.0,
+                "exec_ms": 0.0,
+                "energy_kwh": 0.0,
+                "carbon_g": 0.0,
+                "water_m3": 0.0,
+                "node_id": None,
             }
 
-        # 2) DC-level utilization for energy splitting
-        dc_util = 0.0 if total_capacity_tokens <= 1e-9 else (
-            total_processed_tokens / total_capacity_tokens
+        start_ms = max(arrival_ms, u.available_at_ms)
+        queue_ms = max(0.0, start_ms - arrival_ms)
+        exec_ms = u.estimate_exec_ms(model, kwargs)
+        finish_ms = start_ms + exec_ms
+
+        # Update unit state + busy
+        u.available_at_ms = finish_ms
+        self._busy_ms += exec_ms
+
+        # Accounting
+        energy_kwh = self._energy_for_exec_kwh(u, exec_ms)
+        carbon_g  = self._carbon_for_energy_g(energy_kwh)
+        # --- IT (compute) energy from exec time (kWh) ---
+        it_energy_kwh = self._energy_for_exec_kwh(u, exec_ms)
+
+        # ------------------------------------------------------------------
+        # COP-AWARE COOLING, HEAT REJECTION & WATER
+        # ------------------------------------------------------------------
+        # Cooling electrical energy (kWh) needed to remove the IT heat:
+        #   cooling_elec_kwh = it_energy_kwh / COP
+        cop = self._cop_for_ms(start_ms)
+        tou = self._time_for_ms(start_ms)
+        cooling_elec_kwh = it_energy_kwh / max(cop, 0.1)  # safety floor
+
+        # Total heat rejected to atmosphere (kWh thermal) ≈ all electric energy ends as heat:
+        #   heat_rejected_kwh = it_energy_kwh + cooling_elec_kwh
+        heat_rejected_kwh = it_energy_kwh + cooling_elec_kwh
+
+        # Water modeling (per kWh of HEAT rejected):
+        # - water_static: baseline m^3/kWh_heat (site fixed losses, drift, etc.)
+        # - water_cycling_density: m^3/kWh_heat (evaporation in towers)
+        static_m3 = heat_rejected_kwh * max(0.0, self.water_static)
+        evap_m3 = heat_rejected_kwh * max(0.0, self.water_cycling_density)
+
+        # Blowdown via cycles-of-concentration (CoC): blowdown = evap / (CoC - 1)
+        if self.blowdown_ratio and self.blowdown_ratio > 1.0:
+            blowdown_m3 = evap_m3 / (self.blowdown_ratio - 1.0)
+        else:
+            blowdown_m3 = 0.0
+
+        # Total make-up water drawn from supply:
+        makeup_m3 = static_m3 + evap_m3 + blowdown_m3
+
+        # Water-related electricity (kWh):
+        #  - potable/make-up water delivery & treatment
+        #  - wastewater treatment for blowdown
+        water_energy_kwh = (
+                makeup_m3 * max(0.0, self.potable_energy_intensity) +
+                blowdown_m3 * max(0.0, self.wastewater_energy_intensity)
         )
+        ttft_s     = (float(net_latency_ms) + queue_ms + exec_ms) / 1000.0
 
-        # 3) IT+facility energy (demand before DER offsets)
-        demand = self._it_and_facility_kwh(dc_util, epoch_length)
+        energy_costs = energy_kwh * tou
 
-        # 4) Solar production this epoch
-        solar_kwh = self._solar_generation_kwh(epoch_length, epoch_hour)
+        # Aggregates
+        self._ttft_sum_s += ttft_s
+        self._ttft_count += 1
+        self._energy_kwh += energy_kwh
+        self._carbon_g  += carbon_g
+        self._water_m3   += makeup_m3
+        self.energy_cost_agg += energy_costs
 
-        # 5) Battery dispatch (greedy: self-consume solar, store surplus, then discharge to shave grid)
-        batt = self._battery_dispatch_kwh(demand, solar_kwh, hours)
-        # batt dict contains: {"solar_used_kwh","solar_charged_kwh","batt_discharge_kwh",
-        #                      "batt_charge_from_solar_kwh","grid_import_kwh",
-        #                      "embodied_carbon_kg","soc_kwh_after"}
 
-        # 6) Water usage from total onsite energy demand (independent of source)
-        water_m3 = self._water_from_energy(demand)
-
-        # 7) Carbon: grid import * intensity + battery embodied amortization
-        carbon = batt["grid_import_kwh"] * float(self.carbon_intensity_kg_per_kwh) + batt["embodied_carbon_kg"]
+        if self.debug:
+            print(f"[DC {self.dc_id}] model={model} arr={arrival_ms:.0f}ms net={net_latency_ms:.0f}ms "
+                  f"queue={queue_ms:.0f}ms exec={exec_ms:.0f}ms node={u.node_id} TTFT={ttft_s:.3f}s")
 
         return {
-            "dc_id": self.dc_id,
-            "energy_kwh": demand,
-            "carbon_emissions": carbon,
-            "water_usage": water_m3,
-            "dc_utilization": dc_util,
-            "per_model": per_model,
-            # breakdown
-            "energy_breakdown": {
-                "demand_total_kwh": demand,
-                "solar_used_kwh": batt["solar_used_kwh"],
-                "solar_curtailed_kwh": max(0.0, solar_kwh - batt["solar_used_kwh"] - batt["batt_charge_from_solar_kwh"]),
-                "battery_discharge_kwh": batt["batt_discharge_kwh"],
-                "battery_charge_from_solar_kwh": batt["batt_charge_from_solar_kwh"],
-                "grid_import_kwh": batt["grid_import_kwh"],
-            },
+            "ttft_s": float(ttft_s),
+            "start_ms": float(start_ms),
+            "finish_ms": float(finish_ms),
+            "queue_delay_ms": float(queue_ms),
+            "exec_ms": float(exec_ms),
+            "energy_kwh": float(energy_kwh),
+            "carbon_g": float(carbon_g),
+            "water_m3": float(makeup_m3),
+            "it_energy_kwh": float(it_energy_kwh),
+            "cooling_elec_kwh": float(cooling_elec_kwh),
+            "water_energy_kwh": float(water_energy_kwh),
+            "static_m3": float(static_m3),
+            "evap_m3": float(evap_m3),
+            "blowdown_m3": float(blowdown_m3),
+            "node_id": int(u.node_id),
+            "energy_costs": float(energy_costs),
         }
 
-    # ---------- energy/carbon/water (demand before DERs) ----------
-    def _it_and_facility_kwh(self, dc_utilization: float, epoch_length: int) -> float:
-        hours = float(epoch_length) / 3600.0
-        active_proc_kwh = 0.0
-        idle_proc_kwh = 0.0
-        for node in self.nodes:
-            for proc in node.processors:
-                if proc.is_off():
-                    continue
-                duty = proc.estimate_duty_cycle(dc_utilization if proc.is_active() else 0.0)
-                active_proc_kwh += proc.active_kW() * duty * hours
-                idle_frac = 0.0 if proc.is_off() else (1.0 - duty)
-                idle_proc_kwh += proc.idle_kW() * idle_frac * hours
+    # ---------- reporting ----------
+    def report_global_stats(self) -> Dict[str, Any]:
+        avg_ttft = (self._ttft_sum_s / self._ttft_count) if self._ttft_count > 0 else 0.0
+        return {
+            "avg_ttft": float(avg_ttft),
+            "energy_cost": float(self.energy_cost_agg),
+            "carbon_emissions": float(self._carbon_g),
+            "water_usage": float(self._water_m3),
+            "total_energy": float(self._energy_kwh),
+        }
 
-        processor_kwh = active_proc_kwh + idle_proc_kwh
-        other_hw_kwh = self.other_hw_overhead * processor_kwh
-        # Cooling power: processor energy through A/C with COP plus overhead (your prior rule)
-        cooling_kwh = (processor_kwh / max(1e-6, self.cop)) * self.cooling_overhead_multiplier
-        total_kwh = processor_kwh + other_hw_kwh + cooling_kwh
-        return total_kwh
-
-    # ---------- Solar model ----------
-    def _solar_generation_kwh(self, epoch_length: int, epoch_hour: Optional[int]) -> float:
-        if self.solar_kw_capacity <= 1e-6:
+    def report_utilization(self) -> float:
+        if not self.units or self.epoch_length_ms <= 0.0:
             return 0.0
-        hours = float(epoch_length) / 3600.0
-        if self.solar_profile_24h and epoch_hour is not None:
-            cf = float(self.solar_profile_24h[int(epoch_hour) % 24])
-        else:
-            # simple bell-shaped default: 0 at night, peak at noon
-            cf = 0.0
-        return max(0.0, self.solar_kw_capacity * cf * hours)
+        cap_ms = len(self.units) * self.epoch_length_ms
+        u = self._busy_ms / cap_ms
+        return max(0.0, min(1.0, float(u)))
 
-    def _battery_dispatch_kwh(self, demand_kwh: float, solar_kwh: float, hours: float) -> dict:
-        """
-        Charge-then-discharge heuristic with complete accounting.
+    def reset_epoch(self) -> None:
+        self._busy_ms = 0.0
+        self._energy_kwh = 0.0
+        self._carbon_g = 0.0
+        self._water_m3 = 0.0
+        self._ttft_sum_s = 0.0
+        self._ttft_count = 0
+        self.energy_cost_agg = 0.0
+        for unit in self.units:
+            unit.available_at_ms = 0.0
 
-        Returns keys:
-          grid_import_kwh, solar_used_kwh,
-          battery_charge_kwh,            # legacy alias
-          batt_charge_from_solar_kwh,    # preferred
-          batt_charge_from_grid_kwh,     # 0.0 (we don't grid-charge here)
-          battery_discharge_kwh,         # preferred
-          batt_discharge_kwh,            # alias (caller compatibility)
-          embodied_carbon_kg
-        """
-        if not hasattr(self, "_battery_soc_kwh"):
-            self._battery_soc_kwh = float(getattr(self, "battery_soc_kwh", 0.0))
-        if not hasattr(self, "battery_soc_kwh"):
-            self.battery_soc_kwh = float(self._battery_soc_kwh)
-
-        solar_used = min(max(solar_kwh, 0.0), max(demand_kwh, 0.0))
-        demand_after_solar = max(0.0, demand_kwh - solar_used)
-        excess_solar = max(0.0, solar_kwh - solar_used)
-
-        charge_power_cap = max(0.0, float(self.battery_max_kw_charge)) * max(0.0, hours)
-        can_charge_kwh = min(charge_power_cap,
-                             max(0.0, float(self.battery_kwh_capacity) - float(self._battery_soc_kwh)))
-        charge_kwh = min(excess_solar, can_charge_kwh)
-
-        eff = float(getattr(self, "battery_roundtrip_eff", 1.0))
-        ceff = eff ** 0.5 if eff > 0 else 0.0
-        deff = ceff
-
-        stored_kwh = charge_kwh * ceff
-        self._battery_soc_kwh += stored_kwh
-        self.battery_soc_kwh = self._battery_soc_kwh
-
-        discharge_power_cap = max(0.0, float(self.battery_max_kw_discharge)) * max(0.0, hours)
-        can_discharge_kwh_out = min(discharge_power_cap, demand_after_solar)
-        soc_draw_kwh = min(self._battery_soc_kwh, (can_discharge_kwh_out / deff) if deff > 0 else 0.0)
-        discharge_kwh = soc_draw_kwh * deff
-
-        self._battery_soc_kwh -= soc_draw_kwh
-        if self._battery_soc_kwh < 0:
-            self._battery_soc_kwh = 0.0
-        self.battery_soc_kwh = self._battery_soc_kwh
-
-        grid_import = max(0.0, demand_after_solar - discharge_kwh)
-
-        batt_cap = float(getattr(self, "battery_kwh_capacity", 0.0))
-        batt_co2e = float(getattr(self, "battery_embodied_kgco2e", 0.0))
-        batt_cycles = float(getattr(self, "battery_cycle_life", 0.0))
-        if batt_cap > 0.0 and batt_co2e > 0.0 and batt_cycles > 0.0:
-            per_kwh_delivered_kg = batt_co2e / (batt_cycles * batt_cap)
-            embodied_carbon_kg = discharge_kwh * per_kwh_delivered_kg
-        else:
-            embodied_carbon_kg = 0.0
-
-        return {
-            "grid_import_kwh": grid_import,
-            "solar_used_kwh": solar_used,
-            "battery_charge_kwh": charge_kwh,  # alias
-            "batt_charge_from_solar_kwh": charge_kwh,  # preferred
-            "batt_charge_from_grid_kwh": 0.0,  # not used in this heuristic
-            "battery_discharge_kwh": discharge_kwh,  # preferred
-            "batt_discharge_kwh": discharge_kwh,  # alias for caller
-            "embodied_carbon_kg": embodied_carbon_kg,
-        }
-
-    # ---------- Water model ----------
-    def _water_from_energy(self, total_kwh: float) -> float:
-        evap_m3 = total_kwh * float(self.water_evap_m3_per_kwh)
-        blowdown_m3 = evap_m3 / max(1e-6, float(self.blowdown_ratio))
-        total_water_m3 = evap_m3 + blowdown_m3
-        return total_water_m3
 
 
 # -----------------------------
@@ -463,601 +464,1190 @@ class Datacenter:
 # -----------------------------
 # -----------------------------
 
-class GeoNetwork:
-    def __init__(self, datacenters: List[Datacenter],
-                 dc_latency_ms: Union[Iterable[Iterable[float]], Callable[[int, int], float]]):
-        self.datacenters: List[Datacenter] = datacenters
-        self.dc_by_id: Dict[int, Datacenter] = {dc.dc_id: dc for dc in datacenters}
-        self.dc_latency_ms = dc_latency_ms  # matrix or callable (src, tgt) -> ms
+@dataclass
+class _RingEdge:
+    u: int
+    v: int
+    w_ms: float  # latency u->v for one hop along the ring
 
-    # ---------------- TTFT helpers ----------------
-    def _lat_ms(self, src: int, tgt: int) -> float:
-        if callable(self.dc_latency_ms):
-            return float(self.dc_latency_ms(src, tgt))
-        return float(self.dc_latency_ms[src][tgt])
 
-    # --------------- scheduling (rate) ---------------
-    def apply_schedule_plan_rate(
+class Geo_Network:
+    """
+    Holds all Datacenters and the latency matrix, stores a ring topology,
+    and accounts for network latency when routing workload between DCs.
+
+    Topology: ring over DC ids [0..N-1].
+    Path cost: sum of per-hop latencies along the ring (min of CW/CCW).
+
+    Public API:
+      - apply_schedule_plan(epoch_idx, workload_df, schedule_plan, power_plan) -> List[dict]
+      - report_global_stats() -> dict
+      - report_dc_utilization() -> dict[int, float]  (if DCs expose utilization)
+    """
+
+    def __init__(self, datacenters: Dict[int, "Datacenter"], latency_matrix: List[List[float]], debug: bool = True):
+        self.debug = debug
+        self.datacenters: Dict[int, "Datacenter"] = dict(sorted(datacenters.items()))
+        self.lat = latency_matrix
+        self.dc_ids: List[int] = list(self.datacenters.keys())
+        self.num_dc = len(self.dc_ids)
+
+        # Build ring topology and precompute per-direction edge weights
+        self.ring_edges_cw: List[_RingEdge] = []
+        if self.num_dc > 0:
+            for i in range(self.num_dc):
+                u = self.dc_ids[i]
+                v = self.dc_ids[(i + 1) % self.num_dc]
+                # Edge weight uses latency_matrix[u][v] directly (ms)
+                w = float(self.lat[u][v])
+                self.ring_edges_cw.append(_RingEdge(u=u, v=v, w_ms=w))
+
+        if self.debug:
+            print("=== Geo_Network ===")
+            print(f"Datacenters : {self.num_dc} -> {self.dc_ids}")
+            if self.num_dc:
+                sample = ", ".join(f"{e.u}->{e.v}:{e.w_ms:.1f}ms" for e in self.ring_edges_cw[:min(6, len(self.ring_edges_cw))])
+                print(f"Ring edges  : {sample}{' ...' if len(self.ring_edges_cw)>6 else ''}")
+            print()
+
+        # scratch containers (reset per epoch)
+        self._last_epoch_results: List[Dict[str, Any]] = []
+        self._last_epoch_metrics: Dict[str, Any] = {}
+
+    # ------------------------------------------------------------------
+    # Core routing helper: ring-path latency between src and dst
+    # ------------------------------------------------------------------
+    def _ring_path_latency_ms(self, src_dc: int, dst_dc: int) -> float:
+        if src_dc == dst_dc or self.num_dc <= 1:
+            return 0.0
+
+        # Map dc_id -> position in ring order
+        pos = {dc_id: i for i, dc_id in enumerate(self.dc_ids)}
+        i_src = pos[src_dc]; i_dst = pos[dst_dc]
+
+        # Clockwise: sum edges from i_src -> i_dst moving +1 each step
+        cw_ms = 0.0
+        i = i_src
+        while i != i_dst:
+            u = self.dc_ids[i]
+            j = (i + 1) % self.num_dc
+            v = self.dc_ids[j]
+            cw_ms += float(self.lat[u][v])
+            i = j
+
+        # Counter-clockwise: sum edges going -1 each step
+        ccw_ms = 0.0
+        i = i_src
+        while i != i_dst:
+            j = (i - 1 + self.num_dc) % self.num_dc
+            u = self.dc_ids[j]
+            v = self.dc_ids[i]
+            ccw_ms += float(self.lat[u][v])
+            i = j
+
+        return min(cw_ms, ccw_ms)
+
+    # ------------------------------------------------------------------
+    # Optional hook: apply per-DC power plan if DC implements it
+    # power_plan can be any structure; we try to pass per-DC slices
+    # ------------------------------------------------------------------
+    def _apply_power_plan(self, power_plan: Dict[str, Any] | None):
+        if not power_plan:
+            return
+        for dc_id, dc in self.datacenters.items():
+            plan_slice = power_plan.get(dc_id) if isinstance(power_plan, dict) else None
+            if hasattr(dc, "apply_power_plan") and callable(getattr(dc, "apply_power_plan")):
+                try:
+                    dc.apply_power_plan(plan_slice)
+                except Exception:
+                    pass
+
+    # ------------------------------------------------------------------
+    # Public: apply schedule + power plans to a workload for one epoch
+    # Returns a list of per-request dicts (detailed results)
+    # ------------------------------------------------------------------
+    def apply_schedule_plan(
         self,
-        epoch_work_rows: Iterable[Tuple[int, str, float]],
-        schedule_plan: Dict[Tuple[int, str], Dict[int, float]],
-        power_plan: Dict[int, Dict],
-        epoch_length: int,
-        leftover_carry_in: Optional[Dict[Tuple[int, str, int], float]] = None,
-    ) -> Tuple[Dict, Dict[int, Dict], Dict[Tuple[int, str, int], float]]:
-        """Route aggregated epoch work and drain per-DC capacities.
-        - epoch_work_rows: iterable of (src_dc, model_type, total_tokens)
-        - schedule_plan: {(src_dc, model): {tgt_dc: frac_or_tokens}}
-        - power_plan: {dc_id: {...}}  (forwarded to Datacenter.apply_power_plan)
-        - leftover_carry_in: {(src, model, tgt): tokens}
-
-        Returns (global_stats, per_dc_metrics, leftover_carry_out)
+        epoch_idx: int,
+        workload_df,                         # pd.DataFrame
+        schedule_plan: Dict[str, Any],
+        power_plan: Dict[str, Any] | None,
+    ) -> List[Dict[str, Any]]:
         """
-        E = float(epoch_length)
+        Workload columns expected (rename below to your actual columns if different):
+          - 'source_dc' : int
+          - 'arrival_ms': int (or 'arrival' in ms)
+          - 'model'     : str ('Llama7b' or 'Llama70b')
+          - (optionally tokens, sizes, etc., which DCs may use)
 
-        # 1) Start with base work rows
-        work_rows: List[Tuple[int, str, float]] = []
-        for src, model, toks in epoch_work_rows:
-            work_rows.append((int(src), str(model), float(toks)))
-        # Carry-in workloads are already routed to a specific tgt; we will add them post-routing
+        schedule_plan formats supported (examples):
+          - {'default_target_dc': 0}  -> send all to DC 0
+          - {'route': {'Llama7b': 1, 'Llama70b': 3}}  -> per-model target
+          - {'map': {request_index: dc_id, ...}}  -> explicit mapping by row index
+        """
+        # apply power plan first (DC can pre-toggle capacity, etc.)
+        self._apply_power_plan(power_plan)
 
-        # 2) Build assigned tokens per (tgt, model) and track avg net latency per tgt+model
-        assigned: Dict[Tuple[int, str], float] = collections.defaultdict(float)
-        # For TTFT surrogate, compute average network latency for tokens arriving to (tgt, model)
-        net_ms_sum: Dict[Tuple[int, str], float] = collections.defaultdict(float)
+        details: List[Dict[str, Any]] = []
 
-        for (src, model, total_tokens) in work_rows:
-            plan = schedule_plan.get((src, model), {})
-            if not plan:
-                # default: stay local
-                tgt_tokens = {src: float(total_tokens)}
+        # Helpers to choose a target DC
+        def choose_target_dc(row_idx: int, model: str, src_dc: int) -> int:
+            # 1) explicit map by index
+            mp = schedule_plan.get("map") if isinstance(schedule_plan, dict) else None
+            if isinstance(mp, dict) and row_idx in mp:
+                return int(mp[row_idx])
+
+            # 2) per-model routing
+            rt = schedule_plan.get("route") if isinstance(schedule_plan, dict) else None
+            if isinstance(rt, dict) and model in rt:
+                return int(rt[model])
+
+            # 3) default DC
+            if "default_target_dc" in schedule_plan:
+                return int(schedule_plan["default_target_dc"])
+
+            # 4) fallback: local
+            return int(src_dc)
+
+        # Main loop
+        for row_idx, row in enumerate(workload_df.itertuples(index=False), start=0):
+            # NOTE: adapt these attribute names if your dataframe columns differ
+            # For example, if your columns are 'src_dc' and 'arrival', adjust accordingly.
+            try:
+                src_dc = int(getattr(row, "source_dc"))
+            except AttributeError:
+                src_dc = int(getattr(row, "src_dc"))
+
+            model = str(getattr(row, "model"))
+            arrival_ms = int(getattr(row, "arrival_ms", getattr(row, "arrival", 0)))
+
+            tgt_dc = choose_target_dc(row_idx, model, src_dc)
+            net_ms = self._ring_path_latency_ms(src_dc, tgt_dc)
+
+            dc = self.datacenters.get(tgt_dc)
+            result: Dict[str, Any] = {
+                "epoch": int(epoch_idx),
+                "request_idx": int(row_idx),
+                "source_dc": int(src_dc),
+                "target_dc": int(tgt_dc),
+                "model": model,
+                "arrival_ms": float(arrival_ms),
+                "net_latency_ms": float(net_ms),
+            }
+
+            # Delegate to DC if it supports detailed scheduling
+            if dc and hasattr(dc, "schedule_request") and callable(getattr(dc, "schedule_request")):
+                try:
+                    dc_ret = dc.schedule_request(
+                        model=model,
+                        arrival=arrival_ms,
+                        net_latency_ms=net_ms,
+                        source_dc=src_dc,
+                        target_dc=tgt_dc,
+                        # You may add tokens/size if present in the row, e.g.:
+                        # prefill_tokens=getattr(row, "prefill_tokens", None),
+                        # gen_tokens=getattr(row, "gen_tokens", None),
+                    )
+                    # Merge DC fields into our result (DC may include ttft_s, energy_kwh, carbon_g, water_m3, etc.)
+                    if isinstance(dc_ret, dict):
+                        result.update(dc_ret)
+                except Exception:
+                    # Keep minimal record if DC threw
+                    pass
             else:
-                # Determine if plan is absolute or fractional
-                has_abs = any(v > 1.0 for v in plan.values())
-                if has_abs:
-                    tgt_tokens = {int(t): float(v) for t, v in plan.items()}
-                    # If under-specified, keep remainder local
-                    remainder = float(total_tokens) - sum(tgt_tokens.values())
-                    if remainder > 1e-9:
-                        tgt_tokens[src] = tgt_tokens.get(src, 0.0) + remainder
-                else:
-                    denom = sum(float(f) for f in plan.values())
-                    if denom <= 1e-12:
-                        tgt_tokens = {src: float(total_tokens)}
-                    else:
-                        tgt_tokens = {int(t): float(total_tokens) * float(f) / denom for t, f in plan.items()}
+                # Minimal placeholder if DC lacks scheduling method
+                # TTFT := net latency only (for debugging); energy/carbon/water remain 0
+                result.update({
+                    "ttft_s": float(net_ms) / 1000.0,
+                    "energy_cost": 0.0,
+                    "energy_kwh": 0.0,
+                    "carbon_g": 0.0,
+                    "water_m3": 0.0,
+                })
 
-            for tgt, tok in tgt_tokens.items():
-                assigned[(tgt, model)] += tok
-                net_ms_sum[(tgt, model)] += tok * self._lat_ms(src, tgt)
+            details.append(result)
 
-        # 2b) Merge carry-in leftovers (already routed to a target)
-        if leftover_carry_in:
-            for (src, model, tgt), tok in leftover_carry_in.items():
-                assigned[(int(tgt), str(model))] += float(tok)
-                net_ms_sum[(int(tgt), str(model))] += float(tok) * self._lat_ms(int(src), int(tgt))
+        # Store last epoch snapshot for reporting
+        self._last_epoch_results = details
+        self._last_epoch_metrics = self._aggregate_epoch_metrics(details)
+        return details
 
-        # 3) Apply power plan
-        for dc_id, plan in power_plan.items():
-            dc = self.dc_by_id.get(int(dc_id))
-            if dc:
-                dc.apply_power_plan(plan)
+    # ------------------------------------------------------------------
+    # Summarize epoch-level metrics from details
+    # ------------------------------------------------------------------
+    def _aggregate_epoch_metrics(self, details: List[Dict[str, Any]]) -> Dict[str, Any]:
+        if not details:
+            return {
+                "avg_ttft": 0.0,
+                "energy_cost": 0.0,
+                "carbon_emissions": 0.0,
+                "water_usage": 0.0,
+                "total_energy": 0.0,
+            }
 
-        # 4) Partition per-DC assignments and compute per-model avg net latencies
-        per_dc_assign: Dict[int, Dict[str, float]] = collections.defaultdict(lambda: collections.defaultdict(float))
-        per_dc_avg_net_ms: Dict[int, Dict[str, float]] = collections.defaultdict(dict)
-        for (tgt, model), tokens in assigned.items():
-            per_dc_assign[int(tgt)][str(model)] += float(tokens)
-        for (tgt, model), tok in assigned.items():
-            avg_ms = 0.0 if tok <= 1e-12 else (net_ms_sum[(tgt, model)] / tok)
-            per_dc_avg_net_ms[int(tgt)][str(model)] = avg_ms
+        # Average TTFT
+        ttft_sum = 0.0
+        ttft_cnt = 0
+        energy_kwh = 0.0
+        carbon_g = 0.0
+        water_m3 = 0.0
+        energy_cost = 0.0
 
-        # 5) Drain at each DC
-        per_dc_metrics: Dict[int, Dict] = {}
-        total_energy = total_carbon = total_water = 0.0
-        weighted_ttft_sum = 0.0
-        total_processed_tokens = 0.0
-        leftover_carry_out: Dict[Tuple[int, str, int], float] = {}
+        for r in details:
+            # TTFT
+            v = r.get("ttft_s")
+            if v is None:
+                v = r.get("TTFT") or r.get("time_to_first_token_s")
+            try:
+                ttft_sum += float(v)
+                ttft_cnt += 1
+            except Exception:
+                pass
 
-        for dc in self.datacenters:
-            assigned_map = per_dc_assign.get(dc.dc_id, {})
-            avg_ms_map = per_dc_avg_net_ms.get(dc.dc_id, {})
-            result = dc.process_rate_epoch(assigned_map, epoch_length, avg_net_ms_by_model=avg_ms_map)
-            per_dc_metrics[dc.dc_id] = result
+            # Energy
+            try: energy_kwh += float(r.get("energy_kwh", 0.0))
+            except Exception: pass
 
-            total_energy += result["energy_kwh"]
-            total_carbon += result["carbon_emissions"]
-            total_water += result["water_usage"]
+            # Carbon
+            try: carbon_g += float(r.get("carbon_g", r.get("carbon_emissions", 0.0)))
+            except Exception: pass
 
-            # Compute TTFT surrogate and leftovers
-            for model, m in result["per_model"].items():
-                processed = float(m["processed_tokens"])
-                total_processed_tokens += processed
-                rho = max(0.0, min(0.999, float(m["utilization"])) )
-                alpha = float(m.get("ttft_alpha_sec") or (epoch_length / 2.0))
-                avg_net_ms = float(m.get("avg_net_ms", 0.0))
-                warm = float(m.get("avg_warmup_sec", 0.0))
-                avg_ttft = (avg_net_ms / 1000.0) + warm + (alpha * rho / max(1e-6, (1.0 - rho)))
-                weighted_ttft_sum += avg_ttft * processed
+            # Water
+            try: water_m3 += float(r.get("water_m3", r.get("water_usage", 0.0)))
+            except Exception: pass
 
-                leftover = float(m["leftover_tokens"])
-                if leftover > 1e-6:
-                    # Keep original src unknown here; record as (tgt->tgt) to preserve location
-                    leftover_carry_out[(dc.dc_id, str(model), dc.dc_id)] = leftover
+            try: energy_cost += float(r.get("energy_costs", r.get("energy_cost", 0.0)))
+            except Exception: pass
 
-        avg_ttft_sec = (weighted_ttft_sum / total_processed_tokens) if total_processed_tokens > 0 else 0.0
-        global_stats = {
-            "epoch_length": epoch_length,
-            "processed_tokens": total_processed_tokens,
-            "avg_ttft_sec": avg_ttft_sec,
-            "energy_kwh": total_energy,
-            "carbon_emissions": total_carbon,
-            "water_usage": total_water,
+        avg_ttft = (ttft_sum / max(1, ttft_cnt)) if ttft_cnt > 0 else 0.0
+
+        # If you track energy_cost elsewhere (e.g., within DCs), you can fold it in here.
+        # For now, compute cost from DCs if they expose report_global_stats().
+
+        return {
+            "avg_ttft": float(avg_ttft),
+            "energy_cost": float(energy_cost),
+            "carbon_emissions": float(carbon_g),
+            "water_usage": float(water_m3),
+            "total_energy": float(energy_kwh),
         }
-        return global_stats, per_dc_metrics, leftover_carry_out
+
+    # ------------------------------------------------------------------
+    # Public: epoch summary
+    # ------------------------------------------------------------------
+    def report_global_stats(self) -> Dict[str, Any]:
+        # Prefer DC rollups if available; otherwise return our own aggregation
+        total = dict(self._last_epoch_metrics)
+        return total
+
+    # ------------------------------------------------------------------
+    # Public: per-DC utilization (0..1), if DCs expose it; else we return {}
+    # LLM_Simulator will fall back to computing it from detailed results.
+    # ------------------------------------------------------------------
+    def report_dc_utilization(self) -> Dict[int, float]:
+        util = {}
+        for dc_id, dc in self.datacenters.items():
+            if hasattr(dc, "report_utilization") and callable(getattr(dc, "report_utilization")):
+                try:
+                    u = float(dc.report_utilization())
+                    # clamp to [0,1]
+                    util[dc_id] = max(0.0, min(1.0, u))
+                except Exception:
+                    pass
+        return util
+
 
 
 # -----------------------------
 # Public entry point + CSV builders
 # -----------------------------
 
-def LLM_Simulator(
-    epoch_idx: int,
-    epoch_work_df,                 # pandas-like with columns: src_dc, model_type, total_tokens
-    schedule_plan: Dict[Tuple[int, str], Dict[int, float]],
-    power_plan: Dict[int, Dict],
-    node_properties: Dict,
-    epoch_length: int,
-    dc_latency_ms,
-    datacenters: List[Datacenter],
-    mode: str = "rate",
-    leftover_carry_in: Optional[Dict[Tuple[int, str, int], float]] = None,
-    epoch_hour: Optional[int] = None,
-):
-    """Wrapper consistent with your previous simulator signature.
-    - mode="rate": uses rate-flow path.
-    - epoch_work_df: must support .itertuples() or .to_records(); we only read src_dc, model_type, total_tokens.
-    - datacenters: constructed externally (using node_properties & CSVs) and passed in.
-    - epoch_hour: optional (0..23) for solar profile lookup.
+# Assumes the helper functions and loaders we added earlier exist in this module:
+# - load_dc_specs(...)
+# - _load_node_type_templates(...)
+# - _gpu_table_by_key(...), _finalize_perf_from_gpu_row(...)
+# - _parse_type_counts(...), _parse_24h(...)
+# - build_world_from_csvs(...)  -> (dc_specs, node_recs, lat_mat, gpu_tables)
+#
+# And these classes already exist and keep their public behavior:
+# - Datacenter, Node, Processor, Geo_Network
+#   with methods used below:
+#     Datacenter.add_node(Node)
+#     Node.add_processor(Processor)
+#     Geo_Network.__init__(datacenters: Dict[int, Datacenter], latency_matrix: List[List[float]])
+#     Geo_Network.apply_schedule_plan(epoch_idx: int, workload_df: pd.DataFrame,
+#                                     schedule_plan: Dict[str, Any], power_plan: Dict[str, Any]) -> List[Dict]
+#     Geo_Network.report_global_stats() -> Dict[str, Any]
+
+# expects these helpers are available (exact-header versions):
+#   load_dc_specs_exact
+#   load_node_type_templates_exact
+#   build_gpu_tables_exact
+#   load_latency_matrix_exact
+#   load_epoch_length_exact
+#   build_world_from_csvs_exact
+
+class LLM_Simulator:
     """
-    if mode != "rate":
-        raise NotImplementedError("This module implements the rate-flow path only.")
+    Outside interaction point for the simulator.
 
-    # Extract rows efficiently (supports pandas or any iterable of dict-like)
-    rows: List[Tuple[int, str, float]] = []
-    if hasattr(epoch_work_df, "itertuples"):
-        for r in epoch_work_df.itertuples(index=False):
-            src = getattr(r, "src_dc")
-            model = getattr(r, "model_type")
-            toks = getattr(r, "total_tokens")
-            rows.append((int(src), str(model), float(toks)))
-    elif hasattr(epoch_work_df, "to_dict"):
-        for rec in epoch_work_df.to_dict("records"):
-            rows.append((int(rec["src_dc"]), str(rec["model_type"]), float(rec["total_tokens"])) )
-    else:
-        # Assume already an iterable of (src, model, tokens)
-        rows = [(int(a), str(b), float(c)) for (a, b, c) in epoch_work_df]
+    Loads all CSV specs (exact headers), builds:
+      - Datacenters (carbon/profile/water params),
+      - Nodes (with GPU-based perf/power),
+      - Processors,
+      - Geo network (latency matrix),
+    and exposes run_epoch(...) to apply schedule + power plans to a workload.
 
-    net = GeoNetwork(datacenters, dc_latency_ms)
-    stats, per_dc, leftovers = net.apply_schedule_plan_rate(
-        rows, schedule_plan, power_plan, epoch_length, leftover_carry_in=leftover_carry_in
-    )
-
-    # Inject epoch_hour into per-DC energy (recompute solar/battery with epoch hour if provided)
-    if epoch_hour is not None:
-        # Re-run only the energy partitioning to attach solar/battery breakdowns with hour
-        for dc_id, m in per_dc.items():
-            dc = net.dc_by_id[dc_id]
-            # Recompute with same utilization but proper hour
-            dc_util = float(m.get("dc_utilization", 0.0))
-            demand = dc._it_and_facility_kwh(dc_util, epoch_length)
-            solar_kwh = dc._solar_generation_kwh(epoch_length, epoch_hour)
-            batt = dc._battery_dispatch_kwh(demand, solar_kwh, float(epoch_length)/3600.0)
-            water_m3 = dc._water_from_energy(demand)
-            carbon = batt["grid_import_kwh"] * float(dc.carbon_intensity_kg_per_kwh) + batt["embodied_carbon_kg"]
-            m["energy_kwh"] = demand
-            m["carbon_emissions"] = carbon
-            m["water_usage"] = water_m3
-            m["energy_breakdown"] = {
-                "demand_total_kwh": demand,
-                "solar_used_kwh": batt["solar_used_kwh"],
-                "solar_curtailed_kwh": max(0.0, solar_kwh - batt["solar_used_kwh"] - batt["batt_charge_from_solar_kwh"]),
-                "battery_discharge_kwh": batt["batt_discharge_kwh"],
-                "battery_charge_from_solar_kwh": batt["batt_charge_from_solar_kwh"],
-                "grid_import_kwh": batt["grid_import_kwh"],
-            }
-        # Re-aggregate global stats
-        stats["energy_kwh"] = sum(m["energy_kwh"] for m in per_dc.values())
-        stats["carbon_emissions"] = sum(m["carbon_emissions"] for m in per_dc.values())
-        stats["water_usage"] = sum(m["water_usage"] for m in per_dc.values())
-
-    return stats, per_dc, leftovers
-
-
-# ---------- CSV Builders ----------
-# These helpers assume CSVs similar to your previous setup.
-# - node_specs_csv: maps node_id -> dc_id, type_id, and processor count/tdp/idle
-# - gpu_perf_csvs: dict of model perf tables per node type (e.g., A100/H100 variants)
-# - dc_specs_csv: per-DC infra (COP, carbon intensity, water params, solar/battery)
-
-import csv
-
-def load_gpu_perf_tables(gpu_perf_csvs: Dict[str, str], debug: bool = False) -> Dict[str, Dict[str, Dict[str, Dict[str, float]]]]:
+    run_epoch returns: (metrics, detailed_results, dc_usage)
+      - metrics: dict incl. avg_ttft, energy_cost, carbon_emissions, water_usage, total_energy
+      - detailed_results: list of per-request dicts
+      - dc_usage: { dc_id: {"utilization": float 0..1} }
     """
-    Returns:
-      tables[accel_type][config_name][model_name] -> perf dict
 
-    Supports:
-      • WIDE:   columns like 'Llama7b_Process', 'Llama70b_Process' (treated as ms_per_request)
-                plus optional 'prefill_token_size' + 'gen_token_size' to derive avg_tokens_per_request
-      • NARROW: config, Model_Name, (ms_per_token OR (ms_per_request + avg_tokens_per_request)), optional Tokens/sec
-    """
-    import csv
-    local_dprint = (lambda *a, **k: _dprint(*a, **k)) if (debug or RFS_DEBUG) else (lambda *a, **k: None)
+    def __init__(
+        self,
+        spec_dir: str = "sim_specs",
+        dc_specs_csv: Optional[str] = None,
+        node_specs_csv: Optional[str] = None,
+        latency_csv: Optional[str] = None,
+        a100_csv: Optional[str] = None,
+        h100_csv: Optional[str] = None,
+        epoch_length: Optional[int] = None,
+        debug: bool = True,          # default True to print verification
+    ) -> None:
+        self.debug = debug
+        self.spec_dir = spec_dir
 
-    tables: Dict[str, Dict[str, Dict[str, Dict[str, float]]]] = {}
+        # Resolve file paths (exact header CSVs)
+        self.dc_specs_csv   = dc_specs_csv   or os.path.join(spec_dir, "Datacenter_specs.csv")
+        self.node_specs_csv = node_specs_csv or os.path.join(spec_dir, "Node_Specs.csv")
+        self.latency_csv    = latency_csv    or os.path.join(spec_dir, "Geo_Latencies.csv")
+        self.a100_csv       = a100_csv       or os.path.join(spec_dir, "A100_GPU.csv")
+        self.h100_csv       = h100_csv       or os.path.join(spec_dir, "H100_GPU.csv")
 
-    for accel_type, path in gpu_perf_csvs.items():
-        per_accel: Dict[str, Dict[str, Dict[str, float]]] = {}
-        best_tps: Dict[str, float] = {}
+        # Epoch length (optional exact-header loader)
+        if epoch_length is not None:
+            self.epoch_length = int(epoch_length)
+        else:
+            gran_csv = os.path.join(spec_dir, "Workload_Granularity.csv")
+            try:
+                self.epoch_length = int(load_epoch_length_exact(gran_csv))
+            except Exception:
+                self.epoch_length = 900
 
-        local_dprint(f"\n[GPU-LOAD] Accel={accel_type} File='{path}'")
-        try:
-            with open(path, "r", newline="") as f:
-                reader = csv.DictReader(f)
-                headers = [h for h in (reader.fieldnames or [])]
-                local_dprint(f"[GPU-LOAD] Headers: {headers}")
+        if self.debug:
+            print("=== LLM_Simulator init ===")
+            print(f"spec_dir               : {self.spec_dir}")
+            print(f"Datacenter_specs.csv   : {self.dc_specs_csv}")
+            print(f"Node_Specs.csv         : {self.node_specs_csv}")
+            print(f"Geo_Latencies.csv      : {self.latency_csv}")
+            print(f"A100_GPU.csv           : {self.a100_csv}")
+            print(f"H100_GPU.csv           : {self.h100_csv}")
+            print(f"Epoch length (s)       : {self.epoch_length}")
 
-                def _norm(h: str) -> str:
-                    return h.lower().replace(" ", "").replace("_", "")
+        # === Load CSVs (exact headers) & Build world ===
+        # If you prefer a single call, you can use build_world_from_csvs_exact(...)
+        dc_specs   = load_dc_specs_exact(self.dc_specs_csv)
+        templates  = load_node_type_templates_exact(self.node_specs_csv)
+        gpu_tables = build_gpu_tables_exact(self.a100_csv, self.h100_csv)
+        lat_mat    = load_latency_matrix_exact(self.latency_csv)
 
-                norm_headers = {_norm(h): h for h in headers}
+        if self.debug:
+            # Datacenter overview
+            print(f"\n[VERIFY] DC specs loaded: {len(dc_specs)} datacenters")
+            for dc_id, p in list(dc_specs.items())[:5]:  # show a few
+                print(f"  DC {dc_id}: CI={p['carbon_intensity_g_per_kwh']:.2f} g/kWh "
+                      f"Nodes={p['Total_Nodes']} counts={p['node_type_counts_str'][:60]}{'...' if len(p['node_type_counts_str'])>60 else ''}")
 
-                # Optional config column
-                cfg_key = None
-                for kk in ("config", "gpuconfig", "gpu_cfg"):
-                    if kk in norm_headers:
-                        cfg_key = norm_headers[kk]
-                        break
-                if cfg_key:
-                    local_dprint(f"[GPU-LOAD] Using config column: '{cfg_key}'")
-                else:
-                    local_dprint("[GPU-LOAD] No config column; defaulting to cfg='default'")
+            # Node templates overview
+            print(f"[VERIFY] Node type templates: {len(templates)} types")
+            for tid, t in sorted(templates.items())[:6]:
+                print(f"  Type {tid}: accel={t['accel_type']} cfg={t['gpu_config']} procs={t['processor_count']} tdp_kw={t['tdp_kw']} idle_kw={t['idle_kw']}")
 
-                # Detect WIDE columns: *_Process names
-                wide_model_cols = []
-                for h in headers:
-                    hn = _norm(h)
-                    if "llama7bprocess" in hn or "llama70bprocess" in hn:
-                        wide_model_cols.append(h)
-                if wide_model_cols:
-                    local_dprint(f"[GPU-LOAD] Detected WIDE layout with model columns: {wide_model_cols}")
-                else:
-                    # also accept 'Llama7b'/'Llama70b' bare columns as ms_per_request
-                    for h in headers:
-                        hn = _norm(h)
-                        if hn in ("llama7b", "llama70b"):
-                            wide_model_cols.append(h)
-                    if wide_model_cols:
-                        local_dprint(f"[GPU-LOAD] Detected WIDE layout with model columns: {wide_model_cols}")
-                    else:
-                        local_dprint("[GPU-LOAD] Detected NARROW layout (model per row)")
 
-                # Possible aux columns for avg tokens
-                prefill_col = norm_headers.get("prefilltokensize")
-                gen_col     = norm_headers.get("gentokensize")
-                if prefill_col or gen_col:
-                    local_dprint(f"[GPU-LOAD] Will derive avg_tokens_per_request from columns: prefill='{prefill_col}', gen='{gen_col}'")
+            # GPU tables overview
+            a100_keys = list(gpu_tables['A100'].keys())
+            h100_keys = list(gpu_tables['H100'].keys())
+            print(f"[VERIFY] GPU table A100 keys: {a100_keys}")
+            print(f"[VERIFY] GPU table H100 keys: {h100_keys}")
 
-                row_idx = 0
-                for row in reader:
-                    row_idx += 1
-                    cfg = "default"
-                    if cfg_key:
-                        v = str(row.get(cfg_key, "")).strip()
-                        if v:
-                            cfg = v
+            # Latency matrix shape
+            n = len(lat_mat)
+            print(f"[VERIFY] Latency matrix size: {n}x{n}")
 
-                    if wide_model_cols:
-                        # WIDE layout: numeric model cols are ms_per_request
-                        # Avg tokens per request, if present
-                        avgt = None
-                        if prefill_col or gen_col:
-                            p = _safe_float(row.get(prefill_col)) if prefill_col else None
-                            g = _safe_float(row.get(gen_col)) if gen_col else None
-                            if (p or 0) > 0 or (g or 0) > 0:
-                                avgt = (p or 0.0) + (g or 0.0)
 
-                        for mh in wide_model_cols:
-                            val_raw = row.get(mh, "")
-                            mspre = _safe_float(val_raw)
-                            if mspre is None:
-                                continue
-                            model = _norm_model_name(mh)  # 'Llama7b' or 'Llama70b'
-                            perf = _finalize_perf_entry(
-                                ms_per_token=None,
-                                ms_per_request=mspre,
-                                avg_tokens_per_request=avgt,
-                                model_key=model,
-                            )
-                            per_accel.setdefault(cfg, {})
-                            existing = per_accel[cfg].setdefault(model, {})
-                            if "ms_per_token" in perf or "ms_per_token" not in existing:
-                                existing.update(perf)
-                                local_dprint(f"[GPU-LOAD][{accel_type}] row#{row_idx} cfg='{cfg}' model='{model}' "
-                                             f"mspre={mspre} avgt={avgt} -> stored")
-                        continue
 
-                    # NARROW layout
-                    low = {k.lower(): v for k, v in row.items()}
-                    def lk(*names, default=None):
-                        for name in names:
-                            if name in low and str(low[name]).strip() != "":
-                                return low[name]
-                        return default
-
-                    raw_model = lk("model_name", "model", "modeltype", "name")
-                    if not raw_model:
-                        local_dprint(f"[GPU-LOAD][{accel_type}] row#{row_idx}: no model column; skipping")
-                        continue
-                    model = _norm_model_name(raw_model)
-
-                    mspt   = lk("ms_per_token", "mspertoken")
-                    mspre  = lk("ms_per_request", "msperrequest", "exec_ms", "execms", "ms")
-                    avgtok = lk("avg_tokens_per_request", "avgtokensperrequest", "avg_tokens", "tokens_per_request")
-
-                    perf = _finalize_perf_entry(mspt, mspre, avgtok, model_key=model)
-                    if perf:
-                        per_accel.setdefault(cfg, {})
-                        existing = per_accel[cfg].setdefault(model, {})
-                        if "ms_per_token" in perf or "ms_per_token" not in existing:
-                            existing.update(perf)
-                            local_dprint(f"[GPU-LOAD][{accel_type}] row#{row_idx} cfg='{cfg}' model='{model}' "
-                                         f"mspt={perf.get('ms_per_token')} mspre={perf.get('ms_per_request')} "
-                                         f"avg={perf.get('avg_tokens_per_request')} -> stored")
-                    else:
-                        local_dprint(f"[GPU-LOAD][{accel_type}] row#{row_idx} cfg='{cfg}' model='{model}' -> no usable perf")
-
-                    # optional tokens/sec support
-                    tps = lk("output_tokens_per_second", "tokens_per_second", "toks_per_sec")
-                    if tps is not None:
-                        val = _safe_float(tps)
-                        if val:
-                            best_tps[model] = max(best_tps.get(model, 0.0), val)
-                            local_dprint(f"[GPU-LOAD][{accel_type}] row#{row_idx} model='{model}' tokens/sec={val}")
-
-        except FileNotFoundError:
-            local_dprint(f"[GPU-LOAD][{accel_type}] File not found: {path}; proceeding with empty table")
-            per_accel = {}
-
-        # finalize tokens/sec derivations
-        if best_tps:
-            local_dprint(f"[GPU-LOAD][{accel_type}] Finalizing {len(best_tps)} tokens/sec entries")
-        for cfg, by_model in per_accel.items():
-            for model, tps_val in list(best_tps.items()):
-                if tps_val and tps_val > 0:
-                    entry = by_model.setdefault(model, {})
-                    if "ms_per_token" not in entry or not entry["ms_per_token"]:
-                        entry["ms_per_token"] = 1000.0 / tps_val
-                        local_dprint(f"[GPU-LOAD][{accel_type}] cfg='{cfg}' model='{model}' "
-                                     f"derived ms_per_token from tps={tps_val:.3f} -> {entry['ms_per_token']:.6f} ms/token")
-
-        # summary
-        n_cfg = len(per_accel)
-        n_models = sum(len(m) for m in per_accel.values())
-        with_mspt = sum(
-            1 for cfg in per_accel.values() for perf in cfg.values()
-            if perf.get("ms_per_token", 0) > 0
+        # Expand nodes & perf/power using the exact-header world builder
+        dc_specs, node_recs, lat_mat, gpu_tables = build_world_from_csvs_exact(
+            self.dc_specs_csv, self.node_specs_csv, self.latency_csv, self.a100_csv, self.h100_csv
         )
-        local_dprint(f"[GPU-LOAD][{accel_type}] Summary: configs={n_cfg}, models={n_models}, with_ms_per_token={with_mspt}")
 
-        tables[accel_type] = per_accel
+        if self.debug:
+            # node and perf sanity
+            print(f"\n[VERIFY] Expanded node records: {len(node_recs)}")
+            if node_recs:
+                s = node_recs[0]
+                mp7 = s["model_perf"]["Llama7b"]
+                mp70 = s["model_perf"]["Llama70b"]
+                print("  example node:",
+                      f"dc={s['dc_id']} type={s['type_id']} accel={s['accel_type']} cfg={s['gpu_config']} "
+                      f"procs={s['processor_count']} tdp_kw={s['tdp_kw']:.3f} idle_kw={s['idle_kw']:.3f}")
+                print("  perf 7b : ms/request=", mp7["ms_per_request"], "  ms/token=", mp7["ms_per_token"])
+                print("  perf 70b: ms/request=", mp70["ms_per_request"], "  ms/token=", mp70["ms_per_token"])
 
-    return tables
+        # ===== Build objects =====
+        self.datacenters: Dict[int, Datacenter] = {}
+        for dc_id, params in dc_specs.items():
+            dc = Datacenter(
+                dc_id=dc_id,
+                carbon_intensity_g_per_kwh=params["carbon_intensity_g_per_kwh"],
+                time_of_use_24h=params["time_of_use_24h"],
+                cop_profile_24h=params["cop_profile_24h"],
+                blowdown_ratio=params["blowdown_ratio"],
+                water_cycling_density=params["water_cycling_density_m3_per_kwh_heat"],
+                potable_energy_intensity=params["potable_EI_kWh_per_m3"],
+                wastewater_energy_intensity=params["wastewater_EI_kWh_per_m3"],
+                water_static=params["water_static_m3_per_kwh_heat"],
+                # epoch length from simulator (optional, pass through if desired):
+                epoch_length=self.epoch_length,
+            )
+            self.datacenters[dc_id] = dc
 
+        total_nodes = 0
+        for rec in node_recs:
+            dc = self.datacenters[rec["dc_id"]]
+            unit = ProcNode(
+                node_id=rec["node_id"],
+                type_id=rec.get("type_id"),
+                accel_type=rec["accel_type"],
+                gpu_config=rec["gpu_config"],
+                tdp_kw=float(rec["tdp_kw"]),
+                idle_kw=float(rec["idle_kw"]),
+                model_perf=rec["model_perf"],  # {"Llama7b": {...}, "Llama70b": {...}}
+            )
+            dc.add_node(unit)
+            total_nodes += 1
 
+        if self.debug:
+            print(f"\n[VERIFY] Built world (combined Node+Processor):")
+            print(f"  Datacenters : {len(self.datacenters)}")
+            print(f"  Exec units  : {total_nodes}")
+            for dc_id, dc in sorted(self.datacenters.items()):
+                print(f"    DC {dc_id}: units={len(dc.units)}")
+        # Build the geo network
+        self.network = Geo_Network(self.datacenters, lat_mat)
 
-def build_datacenters_from_csv(
-    node_specs_csv: str,
-    gpu_perf_csvs: Dict[str, str],
-    dc_specs_csv: str,
-    epoch_length: int,
-    debug: bool = False,
-) -> List["Datacenter"]:
-    import csv
+        if self.debug:
+            print("[VERIFY] Geo_Network built and ready.\n")
 
-    # ---- Local debug printer ----
-    local_dprint = (lambda *a, **k: _dprint(*a, **k)) if (debug or RFS_DEBUG) else (lambda *a, **k: None)
+            self._debug_dump_cooling_params()
+            self._sanity_probe_water_1kwh()
 
-    # ---- Solar defaults (uniform across DCs, regardless of CSV) ----
-    # Use module-level constants if they exist; otherwise fall back to these.
-    solar_kw_default = globals().get("DEFAULT_SOLAR_KW_CAPACITY", 1000.0)
-    solar_prof_default = globals().get("DEFAULT_SOLAR_PROFILE_24H", [
-        0.00, 0.00, 0.00, 0.00, 0.00,
-        0.05, 0.20, 0.50, 0.75, 0.90,
-        1.00, 0.95, 0.90, 0.80, 0.60,
-        0.40, 0.20, 0.05,
-        0.00, 0.00, 0.00, 0.00, 0.00, 0.00
-    ])
+    # ---------------------------------------------------------------------
+    # Public entry-point: run ONE epoch with a schedule + power plan
+    # Returns: (metrics, detailed_results, dc_usage) where dc_usage has utilization in [0,1]
+    # ---------------------------------------------------------------------
+    # Rate_Flow_Sim.py  (inside LLM_Simulator)
 
-    # 1) Load DC infra/specs (we’ll still read values, but enforce our solar defaults)
-    dc_params: Dict[int, Dict] = {}
-    try:
-        with open(dc_specs_csv, "r", newline="") as f:
-            reader = csv.DictReader(f)
-            count = 0
-            for row in reader:
-                count += 1
-                did = int(row.get("DC_Num") or row.get("dc_id") or row.get("dc") or 0)
+    def _debug_dump_cooling_params(self) -> None:
+        """
+        Prints one line per DC with the fields that drive water & cooling.
+        Requires self.debug = True to print (but we’ll also print if values look zero).
+        """
+        print("\n=== Cooling/Water params by DC ===")
+        hdr = ("DC  CI(g/kWh)  water_static(m3/kWh_heat)  water_cycling_density(m3/kWh_heat)  "
+               "blowdown_ratio  potable_EI(kWh/m3)  wastewater_EI(kWh/m3)  COP_profile[0..3]/default")
+        print(hdr)
+        zeroish = False
+        for dc_id in sorted(self.datacenters):
+            dc = self.datacenters[dc_id]
+            prof = getattr(dc, "cop_profile_24h", None)
+            prof_head = None
+            if prof and len(prof) == 24:
+                prof_head = ",".join(f"{float(x):.2f}" for x in prof[:4])
+            cop_def = getattr(dc, "cop_default", 3.0)
+            line = (f"{dc_id:2d}  {dc.carbon_intensity_g_per_kwh:8.1f}  "
+                    f"{dc.water_static:10.6f}  {dc.water_cycling_density:10.6f}  "
+                    f"{dc.blowdown_ratio:6.2f}        {dc.potable_energy_intensity:6.4f}            "
+                    f"{dc.wastewater_energy_intensity:6.4f}        "
+                    f"{(prof_head if prof_head else '—') or '—'} / {cop_def:.2f}")
+            print(line)
 
-                # Optional CSV solar profile; we will override to defaults below anyway.
-                prof = str(row.get("solar_profile_24h", "")).strip()
-                solar_prof_csv = [float(x) for x in prof.split(";") if x.strip()] if prof else None
+            if (dc.water_static == 0.0 and dc.water_cycling_density == 0.0 and
+                    dc.potable_energy_intensity == 0.0 and dc.wastewater_energy_intensity == 0.0):
+                zeroish = True
 
-                dc_params[did] = {
-                    "cop": float(row.get("cop", 3.0)),
-                    "other_hw_overhead": float(row.get("other_hw_overhead", 0.13)),
-                    "cooling_overhead_multiplier": float(row.get("cooling_overhead_multiplier", 3.0)),
-                    "carbon_intensity_kg_per_kwh": float(row.get("carbon_intensity_kg_per_kwh", 0.4)),
-                    "water_evap_m3_per_kwh": float(row.get("water_evap_m3_per_kwh", 0.0004)),
-                    "blowdown_ratio": float(row.get("blowdown_ratio", 0.25)),
-                    # read but ignore for consistency; we’ll use uniform defaults for all DCs:
-                    "solar_kw_capacity": float(row.get("solar_kw_capacity", 0.0)),
-                    "solar_profile_24h": solar_prof_csv,
-                    "battery_kwh_capacity": float(row.get("battery_kwh_capacity", 0.0)),
-                    "battery_max_kw_charge": float(row.get("battery_max_kw_charge", 0.0)),
-                    "battery_max_kw_discharge": float(row.get("battery_max_kw_discharge", 0.0)),
-                    "battery_roundtrip_eff": float(row.get("battery_roundtrip_eff", 0.92)),
-                    "battery_embodied_kgco2e": float(row.get("battery_embodied_kgco2e", 0.0)),
-                    "battery_cycle_life": float(row.get("battery_cycle_life", 2500.0)),
-                    "ttft_alpha_sec": float(row.get("ttft_alpha_sec", 0.20)),
-                    "ttft_beta_ms_per_token": float(row.get("ttft_beta_ms_per_token", 0.0)),
-                }
-            local_dprint(f"[BUILD] Loaded {count} DC spec rows from '{dc_specs_csv}'")
-            if count and debug:
-                sample_k = next(iter(dc_params))
-                local_dprint(f"[BUILD] DC sample {sample_k}: {dc_params[sample_k]}")
-    except FileNotFoundError:
-        local_dprint(f"[BUILD] dc_specs file not found: '{dc_specs_csv}' (proceeding with defaults)")
+        if zeroish:
+            print("[DIAG] Many DC water parameters are zero. If this is unexpected, "
+                  "verify Datacenter_specs.csv headers & units match the loader mapping.")
 
-    # 2) GPU perf tables (includes per-config meta.tdp_kw if available)
-    perf_tables = load_gpu_perf_tables(gpu_perf_csvs, debug=debug)
+    def _sanity_probe_water_1kwh(self) -> None:
+        """
+        Quick synthetic probe: emulate 1 kWh IT at t=0 in each DC to see water result math.
+        Prints the expected makeup water if schedule_request math is used.
+        """
+        print("\n=== Sanity probe: 1.0 kWh IT → water (by DC) ===")
+        for dc_id in sorted(self.datacenters):
+            dc = self.datacenters[dc_id]
+            cop = dc._cop_for_ms(0.0)
+            cooling_elec = 1.0 / max(cop, 0.1)
+            heat_rej = 1.0 + cooling_elec  # kWh_heat
+            static_m3 = heat_rej * max(0.0, dc.water_static)
+            evap_m3 = heat_rej * max(0.0, dc.water_cycling_density)
+            if dc.blowdown_ratio and dc.blowdown_ratio > 1.0:
+                blowdown_m3 = evap_m3 / (dc.blowdown_ratio - 1.0)
+            else:
+                blowdown_m3 = 0.0
+            makeup_m3 = static_m3 + evap_m3 + blowdown_m3
+            print(f"DC {dc_id:2d}: COP={cop:.2f}  heat_rej={heat_rej:.3f} kWh  "
+                  f"static={static_m3:.6f} m³  evap={evap_m3:.6f} m³  blowdown={blowdown_m3:.6f} m³  "
+                  f"makeup={makeup_m3:.6f} m³")
 
-    # 3) Build DCs/Nodes/Processors
-    dcs: Dict[int, "Datacenter"] = {}
-    nodes_by_dc: Dict[int, Dict[int, "Node"]] = {}
+    def run_epoch(
+        self,
+        epoch_idx: int,
+        workload_df: pd.DataFrame,
+        schedule_plan: Dict[str, Any],
+        power_plan: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[int, Dict[str, float]]]:
+        # --- ensure deterministic runs (consecutive runs identical) ---
+        for dc in self.datacenters.values():
+            if hasattr(dc, "reset_epoch"):
+                dc.reset_epoch()
 
-    # Helper: get best available TDP kW from perf meta
-    def _perf_meta_tdp_kw(accel: str, cfg: str) -> Optional[float]:
-        cfg_map = perf_tables.get(accel, {})
-        # exact cfg first
-        exact = cfg_map.get(cfg, {})
-        if isinstance(exact, dict) and "_meta" in exact and "tdp_kw" in exact["_meta"]:
-            return exact["_meta"]["tdp_kw"]
-        # else take max across cfgs
-        best = None
-        for _cfg, per_model in cfg_map.items():
-            if isinstance(per_model, dict) and "_meta" in per_model and "tdp_kw" in per_model["_meta"]:
-                val = per_model["_meta"]["tdp_kw"]
-                best = max(best or 0.0, val)
-        return best
+        if self.debug:
+            print(f"=== run_epoch: epoch={epoch_idx} | workload={len(workload_df)} rows ===")
+        # Apply plans and get per-request results
+        detailed_results: List[Dict[str, Any]] = self.network.apply_schedule_plan(
+            epoch_idx=epoch_idx,
+            workload_df=workload_df,
+            schedule_plan=schedule_plan,
+            power_plan=power_plan,
+        )
 
-    with open(node_specs_csv, "r", newline="") as f:
-        reader = csv.DictReader(f)
-        row_idx = 0
-        for row in reader:
-            row_idx += 1
-            dc_id   = int(row.get("dc_id") or row.get("DC_Num") or row.get("dc") or 0)
-            node_id = int(row.get("node_id") or row.get("Node_ID") or row.get("node") or 0)
-            type_id = int(row.get("type_id") or row.get("Type_ID") or row.get("type") or 0)
+        # Aggregate epoch-level metrics
+        metrics: Dict[str, Any] = self.network.report_global_stats()
+        metrics.setdefault("avg_ttft", 0.0)
+        metrics.setdefault("energy_cost", 0.0)
+        metrics.setdefault("carbon_emissions", 0.0)
+        metrics.setdefault("water_usage", 0.0)
+        metrics.setdefault("total_energy", 0.0)
 
-            pcount  = int(row.get("processor_count") or row.get("Processor_Count") or 1)
+        # Per-DC utilization (0..1)
+        dc_usage = self._get_dc_utilization(detailed_results)
+        metrics["by_datacenter"] = dc_usage
 
-            # Prefer kW if present; else watts → kW conversion if value looks large
-            def _to_kw(v) -> float:
+        if self.debug:
+            used = ", ".join(f"dc{d}:{u['utilization']:.2f}" for d,u in sorted(dc_usage.items()))
+            print(f"[EPOCH {epoch_idx}] "
+                  f"TTFT={metrics['avg_ttft']:.6f}s  "
+                  f"C={metrics['carbon_emissions']:.6f}  "
+                  f"W={metrics['water_usage']:.6f}  "
+                  f"E={metrics['total_energy']:.6f}  "
+                  f"EC={metrics['energy_cost']:.6f}  "
+                  f"| Util: {used}")
+            print(f"[EPOCH {epoch_idx}] detailed results: {len(detailed_results)}\n")
+
+        return metrics, detailed_results, dc_usage
+
+    # ---------------------------------------------------------------------
+    # Utilization helpers (same as before)
+    # ---------------------------------------------------------------------
+    def _get_dc_utilization(self, detailed_results: List[Dict[str, Any]]) -> Dict[int, Dict[str, float]]:
+        if hasattr(self.network, "report_dc_utilization") and callable(getattr(self.network, "report_dc_utilization")):
+            try:
+                util = self.network.report_dc_utilization()
+                return self._normalize_util_map(util)
+            except Exception:
+                pass
+
+        per_dc = {}
+        hook_found = False
+        for dc_id, dc in self.datacenters.items():
+            if hasattr(dc, "report_utilization") and callable(getattr(dc, "report_utilization")):
                 try:
-                    x = float(v)
-                except (TypeError, ValueError):
-                    return 0.0
-                return (x / 1000.0) if x > 50.0 else x
+                    u = dc.report_utilization()
+                    per_dc[dc_id] = u
+                    hook_found = True
+                except Exception:
+                    continue
+        if hook_found:
+            return self._normalize_util_map(per_dc)
 
-            tdp_kw  = _to_kw(row.get("proc_tdp_kw") or row.get("TDP_kW") or row.get("tdp_kw") or row.get("TDP"))
-            idle_kw = _to_kw(row.get("proc_idle_kw") or row.get("Idle_kW") or row.get("idle_kw") or 0.0)
+        return self._aggregate_dc_utilization(detailed_results)
 
-            accel_type = str(row.get("accel_type") or row.get("GPU_Type") or row.get("gpu_type") or "A100").strip()
-            gpu_cfg    = str(row.get("gpu_config") or row.get("GPU_Config") or row.get("config") or "default").strip() or "default"
+    def _normalize_util_map(self, raw: Dict[Any, Any]) -> Dict[int, Dict[str, float]]:
+        out: Dict[int, Dict[str, float]] = {}
+        for k, v in (raw or {}).items():
+            try:
+                dc_id = int(k)
+            except Exception:
+                try:
+                    dc_id = int(float(k))
+                except Exception:
+                    continue
+            if isinstance(v, dict):
+                u = v.get("utilization", v.get("util", v.get("usage", 0.0)))
+            else:
+                u = v
+            try:
+                u = float(u)
+            except Exception:
+                u = 0.0
+            u = max(0.0, min(1.0, u))
+            out[dc_id] = {"utilization": u}
+        return out
 
-            # Create DC if needed (force same solar across all DCs)
-            if dc_id not in dcs:
-                dp = dc_params.get(dc_id, {})
-                # enforce uniform solar
-                dp_solar_kw   = float(solar_kw_default)
-                dp_solar_prof = list(solar_prof_default)
-                dcs[dc_id] = Datacenter(
-                    dc_id=dc_id,
-                    nodes=[],
-                    cop=dp.get("cop", 3.0),
-                    other_hw_overhead=dp.get("other_hw_overhead", 0.13),
-                    cooling_overhead_multiplier=dp.get("cooling_overhead_multiplier", 3.0),
-                    carbon_intensity_kg_per_kwh=dp.get("carbon_intensity_kg_per_kwh", 0.4),
-                    water_evap_m3_per_kwh=dp.get("water_evap_m3_per_kwh", 0.0004),
-                    blowdown_ratio=dp.get("blowdown_ratio", 0.25),
-                    solar_kw_capacity=dp_solar_kw,
-                    solar_profile_24h=dp_solar_prof,
-                    battery_kwh_capacity=dp.get("battery_kwh_capacity", 0.0),
-                    battery_max_kw_charge=dp.get("battery_max_kw_charge", 0.0),
-                    battery_max_kw_discharge=dp.get("battery_max_kw_discharge", 0.0),
-                    battery_roundtrip_eff=dp.get("battery_roundtrip_eff", 0.92),
-                    battery_embodied_kgco2e=dp.get("battery_embodied_kgco2e", 0.0),
-                    battery_cycle_life=dp.get("battery_cycle_life", 2500.0),
-                    ttft_alpha_sec=dp.get("ttft_alpha_sec", 0.20),
-                    ttft_beta_ms_per_token=dp.get("ttft_beta_ms_per_token", 0.0),
-                )
-                local_dprint(f"[BUILD] Created DC {dc_id} from specs (solar={dp_solar_kw} kW, profile=uniform)")
+    def _aggregate_dc_utilization(self, detailed_results: List[Dict[str, Any]]) -> Dict[int, Dict[str, float]]:
+        from collections import defaultdict
 
-            # Create Node if needed
-            if dc_id not in nodes_by_dc:
-                nodes_by_dc[dc_id] = {}
-            if node_id not in nodes_by_dc[dc_id]:
-                nodes_by_dc[dc_id][node_id] = Node(node_id=node_id, type_id=type_id, processors=[])
-                dcs[dc_id].nodes.append(nodes_by_dc[dc_id][node_id])
-                local_dprint(f"[BUILD] Added Node {node_id} to DC {dc_id} (type_id={type_id})")
+        # --- 1) Capacity (units per DC) ---
+        # Prefer exec_units (list), else processors/units fallbacks, else 0
+        procs_per_dc: Dict[int, int] = {}
+        for dc_id, dc in self.datacenters.items():
+            units = 0
+            # common names in your codebase
+            for attr in ("exec_units", "units", "processors"):
+                if hasattr(dc, attr) and getattr(dc, attr) is not None:
+                    try:
+                        units = len(getattr(dc, attr))  # if it's a list-like
+                    except TypeError:
+                        # if it's a scalar count
+                        try:
+                            units = int(getattr(dc, attr))
+                        except Exception:
+                            pass
+                    if units:
+                        break
+            # last resort: known scalar fields you sometimes keep
+            if not units:
+                for attr in ("processor_count", "unit_count", "num_executors"):
+                    if hasattr(dc, attr) and getattr(dc, attr) is not None:
+                        try:
+                            units = int(getattr(dc, attr))
+                            break
+                        except Exception:
+                            pass
+            procs_per_dc[int(dc_id)] = max(0, int(units))
 
-            # Select model perf for accel+cfg; if not found, merge all cfgs (skipping _meta)
-            config_map = perf_tables.get(accel_type, {})
-            model_perf = config_map.get(gpu_cfg)
-            merged_used = False
-            if model_perf is None:
-                merged_used = True
-                merged: Dict[str, Dict[str, float]] = {}
-                for _cfg, per_model in config_map.items():
-                    if not isinstance(per_model, dict):
+        epoch_ms = float(self.epoch_length) * 1000.0
+        cap_ms: Dict[int, float] = {dc: float(procs) * epoch_ms for dc, procs in procs_per_dc.items()}
+
+        # --- 2) Busy time (sum of exec ms per DC) ---
+        busy_ms: Dict[int, float] = defaultdict(float)
+
+        def _extract_dc_id(rec: Dict[str, Any]):
+            for k in ("dc_id", "target_dc", "assigned_dc", "dc", "datacenter"):
+                if k in rec and rec[k] is not None:
+                    try:
+                        return int(rec[k])
+                    except Exception:
+                        try:
+                            return int(float(rec[k]))
+                        except Exception:
+                            pass
+            return None
+
+        def _extract_busy_ms(rec: Dict[str, Any]) -> float:
+            # try explicit durations first
+            for k in ("exec_ms", "proc_ms", "service_ms", "gpu_time_ms", "process_ms"):
+                if k in rec and rec[k] is not None:
+                    try:
+                        return max(0.0, float(rec[k]))
+                    except Exception:
                         continue
-                    for m, perf in per_model.items():
-                        if m == "_meta":
-                            continue
-                        merged.setdefault(m, {})
-                        # prefer entries that already include ms_per_token
-                        if ("ms_per_token" in perf) or ("ms_per_token" not in merged[m]):
-                            merged[m].update(perf)
-                model_perf = merged
+            # fallback: end - start
+            s = rec.get("start_ms", rec.get("start_time_ms"))
+            e = rec.get("end_ms", rec.get("end_time_ms"))
+            if s is not None and e is not None:
+                try:
+                    return max(0.0, float(e) - float(s))
+                except Exception:
+                    pass
+            return 0.0
 
-            # Power fallbacks: use perf meta TDP if node row is zero/missing
-            meta_tdp = _perf_meta_tdp_kw(accel_type, gpu_cfg)
-            if (tdp_kw is None) or (tdp_kw <= 0.0):
-                if meta_tdp:
-                    tdp_kw = float(meta_tdp)
-                else:
-                    tdp_kw = 0.8  # conservative default kW if nothing available
-            if (idle_kw is None) or (idle_kw <= 0.0):
-                idle_kw = 0.1 * tdp_kw  # default idle = 10% of TDP
+        for rec in detailed_results:
+            dc_id = _extract_dc_id(rec)
+            if dc_id is None:
+                continue
+            busy_ms[dc_id] += _extract_busy_ms(rec)
 
-            local_dprint(
-                f"[BUILD] row#{row_idx} DC {dc_id} Node {node_id}: accel={accel_type} cfg='{gpu_cfg}' "
-                f"pcount={pcount} TDP={tdp_kw:.3f}kW idle={idle_kw:.3f}kW "
-                f"perf={'merged' if merged_used else 'exact'} models={len([k for k in (model_perf or {}) if k != '_meta'])}"
+        # --- 3) Utilization = busy / capacity ---
+        util: Dict[int, Dict[str, float]] = {}
+        for dc_id in procs_per_dc.keys():
+            cap = cap_ms.get(dc_id, 0.0)
+            if cap <= 0.0:
+                u = 0.0
+            else:
+                u = busy_ms.get(dc_id, 0.0) / cap
+            util[dc_id] = {"utilization": max(0.0, min(1.0, u))}
+
+        # ensure any DC that showed busy time but didn't appear in capacity map is present
+        for dc_id in busy_ms.keys():
+            util.setdefault(dc_id, {"utilization": 0.0})
+
+        return util
+
+    # ---------------------------------------------------------------------
+    # Helpers
+    # ---------------------------------------------------------------------
+    def _load_epoch_length_default(self) -> int:
+        """
+        Load Epoch_Length from Workload_Granularity.csv if present; else default 900.
+        """
+        path = os.path.join(self.spec_dir, "Workload_Granularity.csv")
+        try:
+            df = pd.read_csv(path)
+            val = int(df.iloc[0].get("Epoch_Length", 900))
+            return val if val > 0 else 900
+        except Exception:
+            return 900
+
+
+
+
+# =========================
+# EXACT-HEADER CSV HELPERS
+# =========================
+# Assumes your CSVs have the following exact columns:
+# Datacenter_specs.csv:
+#   ['DC_Num','DC_Name','Location','Carbon_Intensity','Water_Static','Total_Nodes',
+#    'Node_Types','Time_of_Use(24_Hours)','COP_Profile(24_Hours)',
+#    'Water_Cycling_Density','Solids_Ratio','Potable_Energy_Intensity','Wastewater_Energy_Intensity']
+#
+# A100_GPU.csv / H100_GPU.csv:
+#   ['num_GPUs','Mem_Size','Llama7b_Process','Llama70b_Process',
+#    'prefill_token_size','gen_token_size','batch_size','TDP']
+#
+# Geo_Latencies.csv:
+#   ['Datacenter_Dest','0','1','2','3','4','5','6','7','8','9','10','11']
+#
+# Workload_Granularity.csv: at least 'Epoch_Length'
+#
+# Node_Specs.csv:
+#   ['Node_Num','Node_Type','Inter_GPU_Bandwidth','Load_Bandwidth_PCIE','Load_Delay_NVLinkNum_GPUs']
+#
+# NOTE: These helpers do no defensive checking by request—headers & data must match.
+
+from typing import Dict, Any, List, Tuple
+import pandas as pd
+from collections import Counter
+
+
+# -------- small utilities --------
+
+def _parse_24h_exact(series_str: str) -> List[float]:
+    # Accept ';' or ',' separated 24 numbers (no guards)
+    parts = [p.strip() for p in str(series_str).replace(",", ";").split(";")]
+    return [float(x) for x in parts]
+
+def _parse_gpu_from_node_type_exact(s: str) -> Tuple[str, str]:
+    """ '8_A100s' -> ('A100','8_A100'), '4_H100' -> ('H100','4_H100') """
+    t = s.strip().upper().replace("-", "_")
+    t = t[:-1] if t.endswith("S") else t  # drop trailing 'S' in '8_A100S'
+    # Split like '8_A100'
+    n, g = t.split("_", 1)
+    return (g, f"{n}_{g}")  # accel_type, gpu_config
+
+def _counts_from_nodetypes_exact(nodetypes_str: str) -> Dict[int, int]:
+    """ '0;0;1;5;5' -> {0:2,1:1,5:2} """
+    seq = [int(x.strip()) for x in nodetypes_str.split(";") if x.strip()]
+    return dict(sorted(Counter(seq).items()))
+
+def _parse_24h_semicolon(val):
+    """
+    Parse a semicolon-separated string of 24 floats (e.g., '1.0;1.1;...;0.9').
+    Returns a list[float] of length 24 or None if missing/invalid.
+    """
+    if val is None:
+        return None
+    # Pandas may already give a float(NaN) for empty cells
+    try:
+        import math
+        if isinstance(val, float) and math.isnan(val):
+            return None
+    except Exception:
+        pass
+
+    if isinstance(val, (list, tuple)) and len(val) == 24:
+        try:
+            return [float(v) for v in val]
+        except Exception:
+            return None
+
+    if not isinstance(val, str):
+        # Might be a single number or unexpected type
+        s = str(val)
+    else:
+        s = val
+
+    tokens = [t.strip() for t in s.split(';') if t.strip() != ""]
+    if len(tokens) != 24:
+        return None
+    try:
+        return [float(t) for t in tokens]
+    except Exception:
+        return None
+
+
+def _parse_node_type_counts_from_row(row, expected_types=6):
+    """
+    Accepts several header names and formats:
+      - 'Node_Type_Counts' or 'node_type_counts' or 'NodeTypeCounts' etc.
+      - Value can be:
+          * semicolon or comma separated 'k:v' pairs, e.g. "0:167;1:167;...;5:166"
+          * OR a flat list of N ints in order of type id 0..N-1, e.g. "167;167;167;167;166;166"
+    Returns (counts_dict, counts_str).
+    """
+    # Try multiple header spellings
+    candidates = [
+        "Node_Type_Counts", "node_type_counts", "NodeTypeCounts",
+        "NodeTypeCounts(0-5)", "NodeTypeCounts_0to5", "NodeTypeCounts_0_5"
+    ]
+    raw = None
+    for k in candidates:
+        if k in row and row[k] is not None and str(row[k]).strip() != "":
+            raw = str(row[k]).strip()
+            break
+    if not raw:
+        return {}, ""
+
+    # Split on ';' first (common), fallback to ','.
+    parts = [p.strip() for p in raw.replace(",", ";").split(";") if p.strip() != ""]
+    counts = {}
+
+    # Case A: "k:v" style
+    if ":" in parts[0]:
+        for item in parts:
+            if ":" not in item:
+                continue
+            k, v = item.split(":", 1)
+            try:
+                k_i = int(k.strip())
+                v_i = int(float(v.strip()))
+                counts[k_i] = v_i
+            except Exception:
+                # ignore bad tokens
+                pass
+    else:
+        # Case B: flat list like "a;b;c;d;e;f"
+        ints = []
+        for item in parts:
+            try:
+                ints.append(int(float(item)))
+            except Exception:
+                # ignore bad tokens
+                pass
+        if ints:
+            # Map sequentially to type ids [0..len-1]
+            counts = {i: val for i, val in enumerate(ints)}
+
+    # Keep only non-negative ints; trim/sort by key for a stable string
+    counts = {int(k): int(v) for k, v in counts.items() if int(v) >= 0}
+    counts_str = ",".join(f"{k}:{counts[k]}" for k in sorted(counts.keys()))
+    return counts, counts_str
+
+
+def load_dc_specs_exact(self) -> dict[int, dict]:
+    """
+    Load Datacenter_specs.csv using the CURRENT headers, including 24-hour
+    COP and TOU profiles and water/cooling fields. Returns:
+      { dc_id: {
+          'dc_id', 'carbon_intensity_g_per_kwh',
+          'water_static_m3_per_kwh_heat', 'water_cycling_density_m3_per_kwh_heat',
+          'blowdown_ratio', 'potable_EI_kWh_per_m3', 'wastewater_EI_kWh_per_m3',
+          'tou_24h', 'cop_24h', 'node_type_counts'
+        }, ... }
+    """
+    import pandas as pd
+    import os
+
+    path = "sim_specs/Datacenter_specs.csv"
+    df = pd.read_csv(path)
+
+    # Expected column set (per the CSV you sent)
+    COL_DC      = "DC_Num"
+    COL_CI      = "Carbon_Intensity"
+    COL_WS      = "Water_Static"
+    COL_WCD     = "Water_Cycling_Density"
+    COL_SR      = "Solids_Ratio"
+    COL_PEI     = "Potable_Energy_Intensity"
+    COL_WWEI    = "Wastewater_Energy_Intensity"
+    COL_TOU24   = "Time_of_Use(24_Hours)"
+    COL_COP24   = "COP_Profile(24_Hours)"
+    COL_TYPES   = "Node_Types"
+    COL_TOTAL   = "Total_Nodes"
+
+    missing = [c for c in [COL_DC, COL_CI, COL_WS, COL_WCD, COL_SR, COL_PEI, COL_WWEI, COL_TOU24, COL_COP24, COL_TYPES]
+               if c not in df.columns]
+    if missing:
+        raise ValueError(f"[DC Specs] Missing required columns: {missing}\nFound: {list(df.columns)}")
+
+    out: dict[int, dict] = {}
+    for _, row in df.iterrows():
+        did = int(_safe_float(row[COL_DC]))
+        if did < 0:
+            continue
+
+        carbon = _safe_float(row[COL_CI])  # g CO2 per kWh
+
+        # Water/cooling fields
+        water_static = _safe_float(row[COL_WS])                     # m^3 per kWh_heat (constant adder)
+        water_cycle  = _safe_float(row[COL_WCD])                    # m^3 per kWh_heat evaporated
+        blowdown     = _safe_float(row[COL_SR])                    # ratio (e.g., 0.30)
+        potable_ei   = _safe_float(row[COL_PEI])                    # kWh per m^3
+        waste_ei     = _safe_float(row[COL_WWEI])                   # kWh per m^3
+
+        # 24-hour arrays
+        tou_24  = _parse_24h_semicolon(row[COL_TOU24])
+        cop_24  = _parse_24h_semicolon(row[COL_COP24])
+
+        # Node types list → counts
+        type_counts, node_type_counts_str = _parse_node_type_counts_from_row(row[COL_TYPES])
+
+        total_nodes = _safe_float(row[COL_TOTAL])
+
+        out[did] = {
+            "dc_id": did,
+            "carbon_intensity_g_per_kwh": carbon,
+            "water_static_m3_per_kwh_heat": water_static,
+            "water_cycling_density_m3_per_kwh_heat": water_cycle,
+            "blowdown_ratio": blowdown,
+            "potable_EI_kWh_per_m3": potable_ei,
+            "wastewater_EI_kWh_per_m3": waste_ei,
+            "time_of_use_24h": tou_24,
+            "cop_profile_24h": cop_24,
+            "node_type_counts": type_counts,
+            "node_type_counts_str": node_type_counts_str,
+            "Total_Nodes": total_nodes,
+        }
+
+        # Guardrails + helpful logs if values look suspicious
+        if (water_static == 0.0 and water_cycle == 0.0) or (cop_24 is None):
+            self._logger.warning(
+                "[DC %d] Cooling/water fields may be missing: "
+                "water_static=%.6f, water_cycle=%.6f, blowdown=%.2f, potable_EI=%.4f, wastewater_EI=%.4f, cop_24h=%s",
+                did, water_static, water_cycle, blowdown, potable_ei, waste_ei,
+                "None" if cop_24 is None else "OK"
             )
 
-            # Create processors
-            for pid in range(pcount):
-                proc = Processor(
-                    proc_id=pid,
-                    node_id=node_id,
-                    epoch_length=epoch_length,
-                    power_state="on",
-                    tdp_kw=tdp_kw,
-                    idle_kw=idle_kw,
-                    model_perf=model_perf or {},
-                )
-                nodes_by_dc[dc_id][node_id].processors.append(proc)
+    return out
 
-    # per-DC summary
-    for dc_id, dc in dcs.items():
-        n_nodes = len(dc.nodes)
-        n_procs = sum(len(n.processors) for n in dc.nodes)
-        local_dprint(f"[BUILD] DC {dc_id} summary: nodes={n_nodes}, procs={n_procs}")
 
-    return [dcs[k] for k in sorted(dcs.keys())]
+# -------- Node type templates (from Node_Specs) --------
+
+def load_node_type_templates_exact(node_specs_csv: str) -> Dict[int, Dict[str, Any]]:
+    """
+    Returns: dict[Type_ID] -> template dict with:
+      accel_type, gpu_config, processor_count, tdp_kw, idle_kw
+    (This CSV doesn’t provide power; we leave tdp/idle at 0.0 so GPU tables can fill them.)
+    """
+    df = pd.read_csv(node_specs_csv)
+    templates: Dict[int, Dict[str, Any]] = {}
+
+    for _, row in df.iterrows():
+        tid = int(row["Node_Num"])  # use Node_Num as the Type_ID
+        accel_type, gpu_config = _parse_gpu_from_node_type_exact(row["Node_Type"])
+        templates[tid] = {
+            "accel_type": accel_type,   # "A100" or "H100"
+            "gpu_config": gpu_config,   # e.g., "8_A100"
+            "processor_count": 1,       # default = 1 processor per node
+            "tdp_kw": 0.0,              # filled later from GPU tables
+            "idle_kw": 0.0,             # filled later
+        }
+
+    return templates
+
+
+# -------- GPU perf/power tables --------
+
+def load_gpu_table_exact(gpu_csv_path: str, chip: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Build a lookup keyed by '<num>_<chip>' (e.g., '8_A100', '4_H100') → full row dict
+    with an added '_meta': {'tdp_kw': TDP/1000}.
+    """
+    t = pd.read_csv(gpu_csv_path)
+    table: Dict[str, Dict[str, Any]] = {}
+    for _, row in t.iterrows():
+        num = int(row["num_GPUs"])
+        key = f"{num}_{chip}"
+        d = row.to_dict()
+        d["_meta"] = {"tdp_kw": float(row["TDP"]) / 1000.0}
+        table[key] = d
+    return table
+
+def build_gpu_tables_exact(a100_csv: str, h100_csv: str) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    return {
+        "A100": load_gpu_table_exact(a100_csv, "A100"),
+        "H100": load_gpu_table_exact(h100_csv, "H100"),
+    }
+
+
+# -------- Latency matrix --------
+
+def load_latency_matrix_exact(lat_csv: str) -> List[List[float]]:
+    """
+    Reads Geo_Latencies.csv and returns an NxN float matrix (drops the 'Datacenter_Dest' label column).
+    """
+    df = pd.read_csv(lat_csv)
+    df_num = df.drop(columns=["Datacenter_Dest"])
+    return df_num.astype(float).values.tolist()
+
+
+# -------- Epoch length (optional helper) --------
+
+def build_world_from_csvs_exact(
+    dc_specs_csv: str,
+    node_specs_csv: str,
+    latency_csv: str,
+    a100_csv: str,
+    h100_csv: str,
+) -> tuple[Dict[int, Dict[str, Any]], List[Dict[str, Any]], List[List[float]], Dict[str, Dict[str, Dict[str, Any]]]]:
+    """
+    Returns:
+      dc_specs : dict[dc_id] -> per-DC parameters (already normalized)
+      nodes    : list of node records, each with model_perf and power fields
+      lat_mat  : NxN list of floats (ms)
+      gpu_tbls : {'A100': {...}, 'H100': {...}}
+    """
+    # --- small local helpers (kept here to avoid changing other files) ---
+    def _parse_counts_str_to_dict(s: str) -> Dict[int, int]:
+        """
+        Accept '0:167;1:167;2:166;3:166;4:167;5:167' OR same with commas.
+        Returns {0:167, 1:167, ...}. Ignores malformed fragments.
+        """
+        if not s:
+            return {}
+        parts = [p.strip() for p in s.replace(",", ";").split(";") if p.strip()]
+        out: Dict[int, int] = {}
+        for item in parts:
+            if ":" not in item:
+                continue
+            k, v = item.split(":", 1)
+            try:
+                ki = int(k.strip())
+                vi = int(float(v.strip()))
+                if ki >= 0 and vi >= 0:
+                    out[ki] = vi
+            except Exception:
+                # ignore malformed piece
+                pass
+        return out
+
+    def _even_split_counts(total_nodes: int, ntypes: int) -> Dict[int, int]:
+        total = max(0, int(total_nodes or 0))
+        base, rem = divmod(total, ntypes)
+        d = {i: base for i in range(ntypes)}
+        for i in range(rem):
+            d[i] += 1
+        return d
+
+    def _num(x):
+        """Convert numeric strings to float; treat None/'None'/'nan' as None."""
+        if x is None:
+            return None
+        if isinstance(x, (int, float)):
+            return float(x)
+        s = str(x).strip().lower()
+        if s in ("none", "nan", ""):
+            return None
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    # --- load the four CSV-driven artifacts with your existing helpers ---
+    dc_specs = load_dc_specs_exact(dc_specs_csv)
+    templates = load_node_type_templates_exact(node_specs_csv)
+    gpu_tbls = build_gpu_tables_exact(a100_csv, h100_csv)
+    lat_mat  = load_latency_matrix_exact(latency_csv)
+
+    # Determine number of node types from templates (expected 6: ids 0..5)
+    ntypes = len(templates)
+
+    # --- Expand nodes from counts and attach perf/power ---
+    nodes: List[Dict[str, Any]] = []
+
+    for dc_id, params in dc_specs.items():
+        # Preferred field from the updated DC loader:
+        counts_str = params.get("node_type_counts_str", "")
+
+        # Backcompat: if empty, try any legacy aliases the CSV may have used
+        if not counts_str:
+            counts_str = params.get("Node_Type_Counts", "") or params.get("node_types", "")
+
+        counts = _parse_counts_str_to_dict(counts_str)
+
+        # If still empty, fall back to even-splitting Total_Nodes
+        if not counts:
+            total_nodes = params.get("Total_Nodes", params.get("total_nodes", 0))
+            try:
+                total_nodes = int(total_nodes)
+            except Exception:
+                total_nodes = 0
+            if total_nodes > 0:
+                counts = _even_split_counts(total_nodes, ntypes)
+
+        # No nodes for this DC if counts still empty
+        if not counts:
+            continue
+
+        # Build per-type
+        next_local_node_id = 0
+        for type_id in sorted(counts):
+            num = int(counts.get(type_id, 0))
+            if num <= 0:
+                continue
+
+            tmpl = templates[type_id]
+            accel = tmpl["accel_type"]         # "A100" or "H100"
+            cfg   = tmpl["gpu_config"]         # e.g., "8_A100"
+            procs = int(tmpl.get("processor_count", 1))
+
+            # Power metadata from GPU tables
+            row  = gpu_tbls[accel][cfg]
+            meta = row.get("_meta", {})
+            tdp_kw  = float(meta.get("tdp_kw", 0.0))
+            idle_kw = float(meta.get("idle_kw", 0.1 * tdp_kw))
+
+            # Perf per model (handle missing/None cells gracefully)
+            pre_sz = _num(row.get("prefill_token_size"))
+            gen_sz = _num(row.get("gen_token_size"))
+            denom_tokens = (pre_sz or 0.0) + (gen_sz or 0.0)
+            if denom_tokens <= 0:
+                denom_tokens = 1.0  # avoid div-by-zero; not used if ms_per_request is None
+
+            ms7  = _num(row.get("Llama7b_Process"))
+            ms70 = _num(row.get("Llama70b_Process"))
+
+            perf_7b = {
+                "ms_per_request": ms7,
+                "ms_per_token":   (ms7 / denom_tokens) if ms7 is not None else None,
+            }
+            perf_70b = {
+                "ms_per_request": ms70,
+                "ms_per_token":   (ms70 / denom_tokens) if ms70 is not None else None,
+            }
+
+            for _ in range(num):
+                nodes.append({
+                    "dc_id": int(dc_id),
+                    "node_id": next_local_node_id,
+                    "type_id": int(type_id),
+                    "accel_type": accel,
+                    "gpu_config": cfg,
+                    "processor_count": procs,
+                    "tdp_kw": tdp_kw,
+                    "idle_kw": idle_kw,
+                    "model_perf": {
+                        "Llama7b":  perf_7b,
+                        "Llama70b": perf_70b,
+                    },
+                })
+                next_local_node_id += 1
+
+    return dc_specs, nodes, lat_mat, gpu_tbls
+
 
 
 

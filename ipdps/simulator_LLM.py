@@ -24,17 +24,6 @@ def write_epoch_stats(tag: str, epoch_index: int, stats_dict: dict, tag2: Option
             f.write(f"{k}: {v}\n")
 
 
-def summarize_epoch_rate(epoch_data):
-    total_duration = 900  # assuming each epoch is 900 seconds
-    summary = {
-        "llama7b_total": (epoch_data["model_type"] == "Llama7b").sum(),
-        "llama70b_total": (epoch_data["model_type"] == "Llama70b").sum(),
-    }
-    summary["llama7b_rate"] = summary["llama7b_total"] / total_duration
-    summary["llama70b_rate"] = summary["llama70b_total"] / total_duration
-    return summary
-
-
 def get_deterministic_perturbation(epoch_idx, error_rate):
     key = f"epoch_{epoch_idx}"
     hash_bytes = hashlib.sha256(key.encode()).digest()
@@ -335,9 +324,35 @@ if __name__ == "__main__":
         return grp
 
     # ---------- Load workload ----------
-    trace = pd.read_csv("simulator_ready_trace.csv")
+    import os
+    import pandas as pd
+
+    workload_path = "simulator_ready_trace.csv"
+    if not os.path.exists(workload_path):
+        raise FileNotFoundError(f"Could not find workload CSV: {workload_path}")
+
+    # Load and normalize the aggregated workload
+    trace = pd.read_csv(workload_path)
+
+    # Rename columns so Helix and Rate_Flow_Sim see consistent names
+    if "src_dc" in trace.columns and "source_dc_id" not in trace.columns:
+        trace = trace.rename(columns={"src_dc": "source_dc_id"})
+    if "total_tokens" in trace.columns and "num_tokens" not in trace.columns:
+        trace["num_tokens"] = trace["total_tokens"]
+    if "time_index" not in trace.columns:
+        trace["time_index"] = 0
+
+    # Enforce types
+    trace["epoch"] = pd.to_numeric(trace["epoch"], errors="coerce").fillna(0).astype(int)
+    trace["source_dc_id"] = pd.to_numeric(trace["source_dc_id"], errors="coerce").fillna(0).astype(int)
+    trace["num_tokens"] = pd.to_numeric(trace["num_tokens"], errors="coerce").fillna(0).astype(int)
+    trace["model_type"] = trace["model_type"].astype(str)
+
+    # Group by epoch so the loop below works
     grouped_trace = trace.groupby("epoch")
     max_epoch = int(trace["epoch"].max())
+
+    print(f"[INIT] Loaded workload with {len(trace)} entries across {max_epoch} epochs")
 
     framework = args.framework
     number_of_epoch = args.epoch
