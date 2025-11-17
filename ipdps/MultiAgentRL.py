@@ -1,508 +1,633 @@
-import gymnasium as gym
-from gymnasium import spaces
-import numpy as np
-import copy
 import os
-import supersuit
-from pettingzoo.utils.env import ParallelEnv
-from stable_baselines3.a2c import MlpPolicy
-from supersuit import pettingzoo_env_to_vec_env_v1, concat_vec_envs_v1, black_death_v3
-from pettingzoo.utils import parallel_to_aec
-from pettingzoo.utils.wrappers import BaseWrapper
-from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback
-from stable_baselines3.common.env_checker import check_env
-from stable_baselines3.common.vec_env import SubprocVecEnv, DummyVecEnv
-from simulation import LLM_Simulator
-from multiprocessing import Process, Queue
-from typing import Dict, Any, List, Tuple, Optional
+from typing import Dict, Any, List, Optional, Callable, Union, Literal
 
+import numpy as np
 import pandas as pd
+from gymnasium import spaces
 
-import joblib
+from pettingzoo.utils.env import ParallelEnv
+from pettingzoo.utils import parallel_to_aec
 
-NUM_NODE_TYPES = 6
-METRIC_ORDER = ["ttft", "carbon", "water", "cost"]
+from supersuit import black_death_v3, pettingzoo_env_to_vec_env_v1, concat_vec_envs_v1
 
-# estimator_model = joblib.load("checkpoint_epoch_1050.pkl")
+from stable_baselines3 import PPO
 
+from Rate_Flow_Sim import LLM_Simulator
 
- # def estimate_metrics(epoch_df, schedule_plan, power_plan):
- #   features = extract_features(epoch_df, schedule_plan, power_plan)
- #   prediction = estimator_model.predict([features])[0]
- #   return {
- #       "avg_ttft": prediction[0],
- #       "energy_cost": prediction[1],
- #       "carbon_emissions": prediction[2],
- #       "water_usage": prediction[3],
- #       "total_energy": prediction[4]
- #   }
+import matplotlib.pyplot as plt
+
+from stable_baselines3.common.callbacks import BaseCallback
 
 
 class ResourceEnv(ParallelEnv):
+    """
+    Multi-datacenter PettingZoo ParallelEnv for constrained PPO.
+
+    Each agent = one datacenter: "dc_0", "dc_1", ..., "dc_{N-1}".
+    Action (per agent): [logit_7b, logit_70b, power_scalar] in [0,1].
+      - First two are interpreted as logits and turned into a *global*
+        distribution over DCs for routing Llama7b / Llama70b.
+      - power_scalar selects a discrete node-type power pattern.
+
+    The env runs a single epoch per episode by calling the rate-based
+    LLM_Simulator from Rate_Flow_Sim and turns its metrics into rewards,
+    with optional constraints encoded via a Lagrangian penalty.
+    """
+
     metadata = {"render_modes": ["human"], "name": "ResourceEnv"}
 
     def __init__(self, config: Dict[str, Any]):
         super().__init__()
 
-        # === Core config from your existing setup ===
-        self.epoch_df = config["epoch_df"]
-        self.node_properties = config["node_properties"]
-        self.epoch_idx = config["epoch_idx"]
-        self.NUM_DATACENTERS = config["num_datacenters"]
-        self.max_steps = config.get("max_steps", 1)
-        self.epoch_summary = config["epoch_summary"]
+        # --- Core config from simulator_LLM / caller ---
+        self.epoch_df: pd.DataFrame = config["epoch_df"]
+        self.node_properties: Dict[str, Any] = config["node_properties"]
+        self.epoch_idx: int = int(config["epoch_idx"])
+        self.NUM_DATACENTERS: int = int(config["num_datacenters"])
+        self.epoch_summary: Dict[str, Any] = config.get("epoch_summary", {})
 
-        # === New: profile-driven reward/constraints spec ===
-        # config must include:
-        #   - "active_agent_profile": str (key in agent_specs)
-        #   - "agent_specs": dict(profile_name -> spec dict)
-        self.active_agent_profile = config["active_agent_profile"]
+        self._epoch_pool: Dict[int, pd.DataFrame] = {}
+
+        if "epoch" in self.epoch_df.columns:
+            for e, df_e in self.epoch_df.groupby("epoch"):
+                self._epoch_pool[int(e)] = df_e.copy()
+        else:
+            self._epoch_pool[int(self.epoch_idx)] = self.epoch_df.copy()
+
+        self._available_epochs: List[int] = sorted(self._epoch_pool.keys())
+
+        self.max_steps: int = int(config.get("max_steps", 1))
+
+        # Per-profile spec (weights, constraints, dual settings)
         self.agent_specs: Dict[str, Dict[str, Any]] = config["agent_specs"]
-        assert self.active_agent_profile in self.agent_specs, \
-            f"Profile '{self.active_agent_profile}' not found in agent_specs"
+        self.active_agent_profile: str = config["active_agent_profile"]
+        if self.active_agent_profile not in self.agent_specs:
+            raise KeyError(
+                f"Active profile '{self.active_agent_profile}' not found in agent_specs keys "
+                f"{list(self.agent_specs.keys())}"
+            )
+        self.profile: Dict[str, Any] = self.agent_specs[self.active_agent_profile]
 
-        self.profile = self.agent_specs[self.active_agent_profile]
-
-        # Normalized reward weights (or empty dict if none given)
+        # Reward weights (metrics -> scalar reward)
         self.reward_weights: Dict[str, float] = self._normalize_weights(
-            self.profile.get("weights", None)
+            self.profile.get("weights", {"ttft": 1.0})
         )
 
-        # Constraints setup
+        # Identify primary metric for this scheme (used for routing/power bias)
+        if self.reward_weights:
+            self.primary_metric: str = max(self.reward_weights.items(), key=lambda kv: kv[1])[0]
+        else:
+            self.primary_metric = "ttft"
+
+        # Constraints / duals
         self.constraints: Dict[str, Dict[str, Any]] = self.profile.get("constraints", {})
         self.include_duals_in_obs: bool = bool(self.profile.get("include_duals_in_obs", True))
         self.lambda_lr: Dict[str, float] = self.profile.get("lambda_lr", {})
-
-        # Dual variables (Lagrange multipliers)
         self.duals: Dict[str, float] = {}
         lambda_init = self.profile.get("lambda_init", {})
         for cname in self.constraints.keys():
             self.duals[cname] = float(lambda_init.get(cname, 0.0))
 
-        # === Agents (one per DC) ===
-        self.agents = [f"dc_{i}" for i in range(self.NUM_DATACENTERS)]
-        self.possible_agents = self.agents[:]
-        self.current_step = 0
-        self.num_power_controls = self.NUM_DATACENTERS * 6  # 6 node types per DC
+        # Basic workload snapshot (used for observations)
+        self.llama7b_total: float = float(self.epoch_summary.get("llama7b_total", 0.0))
+        self.llama70b_total: float = float(self.epoch_summary.get("llama70b_total", 0.0))
 
-        # === Workload snapshot ===
-        self.llama7b_total = int(self.epoch_summary.get("llama7b_total", 0))
-        self.llama70b_total = int(self.epoch_summary.get("llama70b_total", 0))
+        # PettingZoo agent ids
+        self.agents: List[str] = [f"dc_{i}" for i in range(self.NUM_DATACENTERS)]
+        self.possible_agents = list(self.agents)
 
-        # === Spaces ===
-        self.action_spaces: Dict[str, spaces.Space] = {}
-        self.observation_spaces: Dict[str, spaces.Space] = {}
+        # Metric tracking for normalization
+        self.metric_max_tracker: Dict[str, float] = {
+            "ttft": 1e-6,
+            "carbon": 1e-6,
+            "water": 1e-6,
+            "cost": 1e-6,
+            "total_energy": 1e-6,
+            "network_load": 1e-6,
+        }
+
+        # Moving reward scaling (adaptive normalization)
+        # Exponential moving average of |reward| so we can rescale to O(1)
+        self.reward_scale: float = 1.0
+        # Smoothing factor for EMA; can be overridden per profile
+        self.reward_scale_alpha: float = float(self.profile.get("reward_scale_alpha", 0.01))
+        # Optional clip after scaling (0 disables clipping)
+        self.reward_clip: float = float(self.profile.get("reward_clip", 10.0))
+
+        # Internal simulator (lazy init)
+        self._rate_sim = None
+
+        # Runtime state
+        self.current_step: int = 0
+        self._last_metrics = None
+        self._last_results = None
+        self._last_leftovers = None
+
+        # Action/observation spaces
         self._build_spaces()
 
-        # === Runtime state tracking ===
-        self.rewards = {agent: 0.0 for agent in self.agents}
-        self.dones = {agent: False for agent in self.agents}
-        self.dones["__all__"] = False
-        self.infos = {agent: {} for agent in self.agents}
-        self.current_actions = {}
-        self.collected_plans = {}
+        # Per-DC metric profiles and scheme-specific bias
+        self._init_dc_metric_profiles()
+        self._metric_bias: np.ndarray = self._build_metric_bias_vector()
+
         self.render_mode = "human"
-        self.power_plan: Dict[str, Any] = {}
-        self.schedule_plan: Dict[str, Any] = {}
 
-        # Metric normalization trackers
-        self.metric_max_tracker = {
-            "carbon": 1.0,
-            "ttft": 1.0,
-            "water": 1.0,
-            "cost": 1.0,
-        }
+    # ------------------------------------------------------------------
+    # PettingZoo required attributes
+    # ------------------------------------------------------------------
+    def observation_space(self, agent):
+        return self.observation_spaces[agent]
 
-        # Episodic budget tracking
-        self.episodic_cost_totals: Dict[str, float] = {k: 0.0 for k in self.constraints.keys()}
-        self.episodic_cost_counts: Dict[str, int] = {k: 0 for k in self.constraints.keys()}
-        # print(f"[ENV] Current agents: {self.agents} (len={len(self.agents)})", flush=True)
+    def action_space(self, agent):
+        return self.action_spaces[agent]
 
-    def _build_spaces(self) -> None:
-        # --- Action space (shared shape for all DC agents) ---
-        act_space = spaces.Box(low=0.0, high=1.0, shape=(3,), dtype=np.float32)
+    # ------------------------------------------------------------------
+    # Helper: normalize weights
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _normalize_weights(weights: Dict[str, float]) -> Dict[str, float]:
+        total = float(sum(abs(v) for v in weights.values()))
+        if total <= 0:
+            return weights
+        return {k: float(v) / total for k, v in weights.items()}
+
+    # ------------------------------------------------------------------
+    # Build action/observation spaces
+    # ------------------------------------------------------------------
+    def _build_spaces(self):
+        """
+        Build action and observation spaces.
+
+        Action per agent:
+          [logit_7b, logit_70b, power_scalar]
+
+        - logit_7b, logit_70b: in [-5, 5], fed into a softmax over DCs.
+          This gives enough dynamic range for sharp or flat distributions.
+        - power_scalar: in [0, 1], used to pick a discrete power pattern.
+        """
+        act_space = spaces.Box(
+            low=np.array([-5.0, -5.0, 0.0], dtype=np.float32),
+            high=np.array([5.0, 5.0, 1.0], dtype=np.float32),
+            dtype=np.float32,
+        )
+
+        # Observation: [workload features, last metrics, duals, agent one-hot]
+        #   workload: llama7b share, llama70b share
+        #   last metrics: 4 (ttft, carbon, water, cost) + total_energy + network_load
+        base_obs_dim = 2 + 6
+
+        dual_dim = len(self.constraints) if self.include_duals_in_obs else 0
+        agent_id_dim = self.NUM_DATACENTERS
+
+        obs_dim = base_obs_dim + dual_dim + agent_id_dim
+
+        obs_space = spaces.Box(
+            low=-np.inf * np.ones(obs_dim, dtype=np.float32),
+            high=np.inf * np.ones(obs_dim, dtype=np.float32),
+            dtype=np.float32,
+        )
+
         self.action_spaces = {agent: act_space for agent in self.agents}
-
-        # --- Observation size computation ---
-        base_obs_size = 8 + len(self.agents)
-
-        constraint_extra = 0
-        self._obs_has_duals = bool(self.include_duals_in_obs and len(self.constraints) > 0)
-        self._obs_has_headroom = False
-
-        if self._obs_has_duals:
-            # one slot per constrained metric for λ (dual)
-            constraint_extra += len(self.constraints)
-
-            # add headroom slots for episodic-window constraints
-            episodic_cnt = sum(1 for c in self.constraints.values()
-                               if c.get("window", "episode") == "episode")
-            if episodic_cnt > 0:
-                self._obs_has_headroom = True
-                constraint_extra += episodic_cnt
-
-        obs_size = base_obs_size + constraint_extra
-
-        obs_space = spaces.Box(low=0.0, high=1.0, shape=(obs_size,), dtype=np.float32)
         self.observation_spaces = {agent: obs_space for agent in self.agents}
 
-    @staticmethod
-    def _normalize_weights(weights: Optional[Dict[str, float]]) -> Dict[str, float]:
-        if not weights:
-            return {}
+    # ------------------------------------------------------------------
+    # Internal helpers: per-DC metric profiles and routing bias
+    # ------------------------------------------------------------------
+    def _init_dc_metric_profiles(self) -> None:
+        """Initialize simple per-DC carbon / water / price profiles.
 
-        total = sum(float(weights.get(m, 0.0)) for m in METRIC_ORDER)
-        if total <= 0:
-            # No positive weights, treat as equal 10 / num_metrics
-            equal_weight = 10.0 / len(METRIC_ORDER)
-            return {m: equal_weight for m in METRIC_ORDER}
+        We try to pull arrays from epoch_summary if present, otherwise fall
+        back to a monotonic pattern over DC index so that schemes at least
+        see some heterogeneity (which helps different reward weightings
+        learn different policies).
+        """
+        num_dc = int(self.NUM_DATACENTERS)
+        idxs = np.arange(num_dc, dtype=np.float32)
 
-        scale_factor = 10.0 / total
-        return {m: float(weights.get(m, 0.0)) * scale_factor for m in METRIC_ORDER}
-
-    def _strong_schedule(self, profile_name: Optional[str] = None) -> np.ndarray:
-
-        persona = profile_name or self.active_agent_profile
-
-        def _base_plan_for(base: str) -> np.ndarray:
-            dist_7b = np.ones(self.NUM_DATACENTERS, dtype=np.float32)
-            dist_70b = np.ones(self.NUM_DATACENTERS, dtype=np.float32)
-
-            if base == "carbon_agent":
-                # Lower carbon intensity → higher weight
-                carbon_intensity = np.array([
-                    343.27, 505.88, 220.25, 205.31, 21.00, 444.15,
-                    230.33, 230.33, 350.40, 332.12, 516.20, 549.72
-                ], dtype=np.float32)
-                inverse = 1.0 / (carbon_intensity + 1e-6)
-                dist_7b = inverse / inverse.sum()
-                dist_70b = dist_7b.copy()
-
-            elif base == "water_agent":
-                water_intensity = np.array([
-                    0.005, 0.012, 0.021, 0.037, 0.042, 0.043,
-                    0.064, 0.080, 0.101, 0.107, 0.120, 0.160
-                ], dtype=np.float32)
-                inverse = 1.0 / (water_intensity + 1e-6)
-                dist_7b = inverse / inverse.sum()
-                dist_70b = dist_7b.copy()
-
-            elif base == "cost_agent":
-                avg_energy_cost = np.array([
-                    0.128777, 0.114167, 0.271030, 0.130333, 0.054000,
-                    0.062917, 0.112918, 0.151667, 0.159167, 0.069625,
-                    0.155417, 0.157000
-                ], dtype=np.float32)
-                inverse = 1.0 / (avg_energy_cost + 1e-6)
-                dist_7b = inverse / inverse.sum()
-                dist_70b = dist_7b.copy()
-
-            elif base == "time_agent":
-                # Uniform preference (or plug a latency-aware prior if you have one)
-                dist_7b[:] = 1.0 / self.NUM_DATACENTERS
-                dist_70b[:] = 1.0 / self.NUM_DATACENTERS
-
-            else:
-                # Default to uniform if unknown base is requested
-                dist_7b[:] = 1.0 / self.NUM_DATACENTERS
-                dist_70b[:] = 1.0 / self.NUM_DATACENTERS
-
-            return np.concatenate([dist_7b, dist_70b], dtype=np.float32)
-
-        # If persona is one of the base agents, just return that base plan.
-        if persona in {"carbon_agent", "water_agent", "cost_agent", "time_agent"}:
-            return _base_plan_for(persona)
-
-        # Otherwise, build a mixed plan using the normalized weights (sum = 10).
-        # Map metrics → base personas.
-        metric_to_base = {
-            "carbon": "carbon_agent",
-            "ttft": "time_agent",
-            "water": "water_agent",
-            "cost": "cost_agent",
-        }
-
-        # If no weights provided ({}), fall back to time_agent (or choose a default you prefer).
-        if not self.reward_weights:
-            return _base_plan_for("time_agent")
-
-        combined_7b = np.zeros(self.NUM_DATACENTERS, dtype=np.float32)
-        combined_70b = np.zeros(self.NUM_DATACENTERS, dtype=np.float32)
-
-        # Linearly combine base plans according to weights (they already sum to 10).
-        weight_sum = 0.0
-        for metric, w in self.reward_weights.items():
-            if w <= 0.0:
-                continue
-            base = metric_to_base.get(metric)
-            if base is None:
-                continue
-            base_plan = _base_plan_for(base)
-            base_7b = base_plan[:self.NUM_DATACENTERS]
-            base_70b = base_plan[self.NUM_DATACENTERS:]
-            combined_7b += float(w) * base_7b
-            combined_70b += float(w) * base_70b
-            weight_sum += float(w)
-
-        # Normalize; if degenerate, default to uniform
-        if weight_sum <= 0.0 or combined_7b.sum() <= 0.0 or combined_70b.sum() <= 0.0:
-            dist_7b = np.full(self.NUM_DATACENTERS, 1.0 / self.NUM_DATACENTERS, dtype=np.float32)
-            dist_70b = dist_7b.copy()
+        # Carbon intensity per DC (gCO2/kWh or relative units)
+        ci_raw = self.epoch_summary.get("dc_carbon_intensity", None)
+        if isinstance(ci_raw, (list, tuple, np.ndarray)) and len(ci_raw) == num_dc:
+            self._dc_carbon = np.asarray(ci_raw, dtype=np.float32)
         else:
-            dist_7b = combined_7b / combined_7b.sum()
-            dist_70b = combined_70b / combined_70b.sum()
+            # Fallback: arbitrary but monotonic gradient (higher index -> "cleaner")
+            self._dc_carbon = 1.0 + (idxs / max(1, num_dc - 1))
 
-        return np.concatenate([dist_7b, dist_70b], dtype=np.float32)
+        # Water intensity per DC (L/kWh or relative units)
+        water_raw = self.epoch_summary.get("dc_water_intensity", None)
+        if isinstance(water_raw, (list, tuple, np.ndarray)) and len(water_raw) == num_dc:
+            self._dc_water = np.asarray(water_raw, dtype=np.float32)
+        else:
+            # Fallback: slightly favor higher-index DCs for water efficiency
+            self._dc_water = 1.0 + 0.5 * (idxs / max(1, num_dc - 1))
 
-    def _strong_power(self, profile_name: Optional[str] = None) -> np.ndarray:
-        persona = profile_name or self.active_agent_profile
+        # Energy price per DC ($/kWh or relative units)
+        price_raw = self.epoch_summary.get("dc_energy_price", None)
+        if isinstance(price_raw, (list, tuple, np.ndarray)) and len(price_raw) == num_dc:
+            self._dc_price = np.asarray(price_raw, dtype=np.float32)
+        else:
+            # Fallback: simple increasing price with index
+            self._dc_price = 1.0 + (idxs / max(1, num_dc - 1))
 
-        # Number of discrete power patterns (e.g., 0..7 scaled to 0..1)
-        pattern_levels = 8
-        pattern_indices = {
-            "carbon_agent": 1,  # Only 2_A100s
-            "water_agent": 1,  # Only 2_A100s
-            "cost_agent": 1,  # Only 2_A100s
-            "time_agent": 6  # Only 8_H100s (second strongest)
-        }
+    def _build_metric_bias_vector(self) -> np.ndarray:
+        """Return a per-DC multiplicative bias based on primary_metric.
 
-        # Base agent case
-        if persona in pattern_indices:
-            idx = pattern_indices[persona]
-            return np.array([idx / (pattern_levels - 1)], dtype=np.float32)
+        This bias is deliberately mild: it is *multiplicative* on top of the
+        learned base distribution and the locality bias, so PPO can still
+        override it, but schemes with different primary metrics naturally
+        gravitate toward different DCs.
+        """
+        num_dc = int(self.NUM_DATACENTERS)
+        ones = np.ones(num_dc, dtype=np.float32)
 
-        # Mixed agent case — use the normalized weights
-        if not self.reward_weights:
-            # No weights? Default to time_agent lever
-            return self._strong_power("time_agent")
+        metric = getattr(self, "primary_metric", "ttft")
 
-        # Metric → base agent mapping
-        metric_to_base = {
-            "carbon": "carbon_agent",
-            "ttft": "time_agent",
-            "water": "water_agent",
-            "cost": "cost_agent",
-        }
+        if metric == "carbon":
+            # Prefer lower-carbon DCs: bias ∝ 1 / CI
+            ci = np.maximum(self._dc_carbon, 1e-3)
+            bias = 1.0 / ci
+        elif metric == "water":
+            # Prefer lower-water DCs
+            w = np.maximum(self._dc_water, 1e-3)
+            bias = 1.0 / w
+        elif metric in ("cost", "energy_cost", "price"):
+            # Prefer cheaper DCs
+            p = np.maximum(self._dc_price, 1e-3)
+            bias = 1.0 / p
+        elif metric == "ttft":
+            # Simple "fast vs slow" prior: prefer lower-index DCs
+            idxs = np.arange(num_dc, dtype=np.float32)
+            # Map idxs in [0, N-1] -> bias in [1.0, 2.0]
+            bias = 2.0 - (idxs / max(1, num_dc - 1))
+        else:
+            bias = ones
 
-        # Get base lever values in the same metric order
-        levers = []
-        weights = []
-        for metric, w in self.reward_weights.items():
-            if w <= 0.0:
-                continue
-            base_agent = metric_to_base.get(metric)
-            if not base_agent:
-                continue
-            base_val = self._strong_power(base_agent)[0]  # recursive call for base
-            levers.append(base_val)
-            weights.append(w)
+        # Normalize so that average bias is ~1.0 (keeps behavior well-scaled)
+        mean = float(bias.mean()) if bias.size > 0 else 1.0
+        if mean <= 0.0 or not np.isfinite(mean):
+            return ones
+        return (bias / mean).astype(np.float32)
 
-        if not levers:
-            return self._strong_power("time_agent")
-
-        # Weighted average (weights already sum to 10 in your setup)
-        mixed_lever = np.dot(weights, levers) / sum(weights)
-        return np.array([mixed_lever], dtype=np.float32)
-
-    def _default_schedule(self, agent):
-        return self._strong_schedule(agent)
-
-    def _default_power(self, agent):
-        return self._strong_power(agent)
-
-    def get_default_action(self, agent: str) -> np.ndarray:
-        # Which agent index?
-        try:
-            dc_idx = int(agent.split("_")[1])
-        except Exception:
-            dc_idx = 0
-
-        # Global prior distributions for 7B/70B
-        prior = self._strong_schedule(self.active_agent_profile)  # shape = 2 * NUM_DATACENTERS
-        n = self.NUM_DATACENTERS
-        dist_7b = prior[:n]
-        dist_70b = prior[n:]
-
-        # Power prior
-        power_scalar = float(self._strong_power(self.active_agent_profile)[0])
-
-        # Return within Box(low=0, high=1)
-        a0 = float(np.clip(dist_7b[dc_idx], 0.0, 1.0))
-        a1 = float(np.clip(dist_70b[dc_idx], 0.0, 1.0))
-        a2 = float(np.clip(power_scalar, 0.0, 1.0))
-        return np.array([a0, a1, a2], dtype=np.float32)
-
-    def reset(self, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
-        # --- Core episode state ---
+    # ------------------------------------------------------------------
+    # Reset
+    # ------------------------------------------------------------------
+    def reset(self, seed=None, options=None):
+        # Keep the PettingZoo agent list alive
+        self.agents = list(self.possible_agents)
         self.current_step = 0
-        self.rewards = {agent: 0.0 for agent in self.agents}
-        self.dones = {agent: False for agent in self.agents}
-        self.dones["__all__"] = False
-        self.infos = {agent: {} for agent in self.agents}
-        self.collected_plans = {}
-        self.power_plan = {}
-        self.schedule_plan = {}
 
-        # --- Metric normalization trackers (per-episode reset) ---
-        self.metric_max_tracker = {
-            "carbon": 1.0,
-            "ttft": 1.0,
-            "water": 1.0,
-            "cost": 1.0,
-        }
+        # Clear last metrics
+        self._last_metrics = None
+        self._last_results = None
+        self._last_leftovers = None
 
-        # --- Constraint episodic accumulators ---
-        for k in self.episodic_cost_totals.keys():
-            self.episodic_cost_totals[k] = 0.0
-            self.episodic_cost_counts[k] = 0
+        # Reset Lagrange multipliers and reward scale each episode
+        for cname in self.duals.keys():
+            self.duals[cname] = 0.0
+        self.reward_scale = 1.0
 
-        # --- Default actions per agent ---
-        # Prefer user's helper if present; otherwise fall back to strong schedule/power prior
-        if hasattr(self, "get_default_action") and callable(getattr(self, "get_default_action")):
-            self.current_actions = {agent: self.get_default_action(agent) for agent in self.agents}
+        # ------------------------------------------------------
+        # Randomly select an epoch from the pool (if >1 available)
+        # ------------------------------------------------------
+        if hasattr(self, "_epoch_pool") and self._epoch_pool:
+            # Uniform random choice; you could bias this if desired
+            chosen = int(np.random.choice(self._available_epochs))
+            self.epoch_idx = chosen
+            self.epoch_df = self._epoch_pool[chosen].copy()
+
+            # Update basic workload snapshot for observations
+            if (
+                "model_type" in self.epoch_df.columns
+                and "num_tokens" in self.epoch_df.columns
+            ):
+                self.llama7b_total = float(
+                    self.epoch_df[self.epoch_df["model_type"] == "Llama7b"]["num_tokens"].sum()
+                )
+                self.llama70b_total = float(
+                    self.epoch_df[self.epoch_df["model_type"] == "Llama70b"]["num_tokens"].sum()
+                )
+            # else: keep whatever was in epoch_summary as a fallback
+        # else: single-epoch case; self.epoch_df / epoch_idx already set
+
+        # (Optional) recompute metric bias in case epoch_summary changed upstream
+        self._init_dc_metric_profiles()
+        self._metric_bias = self._build_metric_bias_vector()
+
+        # Initial observation after choosing the epoch
+        obs = self._get_obs_dict()
+        infos = {agent: {} for agent in self.agents}
+        print(
+            f"[ResourceEnv] Starting episode with epoch_idx={self.epoch_idx}, "
+            f"total rows={len(self.epoch_df)}"
+        )
+        return obs, infos
+
+    def _softmax_across_dcs(self, logits_per_agent: Dict[str, float]) -> np.ndarray:
+        """Softmax over DC agents for a single model."""
+        vals = np.array([logits_per_agent[a] for a in self.agents], dtype=np.float64)
+        vals = np.clip(vals, -50.0, 50.0)
+        vals -= np.max(vals)
+        ex = np.exp(vals)
+        s = ex.sum()
+        if s <= 0 or not np.isfinite(s):
+            return np.full(len(self.agents), 1.0 / len(self.agents), dtype=np.float64)
+        return ex / s
+
+    def _apply_safety_layer(self, normalized_actions: Dict[str, np.ndarray]):
+        """
+        Placeholder safety layer: currently a no-op that just returns the
+        actions unchanged. You can extend this to project onto a feasible set
+        if you want hard per-step guarantees.
+        """
+        flags = {agent: False for agent in normalized_actions.keys()}
+        return normalized_actions, flags
+
+    # ------------------------------------------------------------------
+    # Moving reward scaling helper
+    # ------------------------------------------------------------------
+    def _scale_reward(self, raw_reward: float) -> float:
+        """Apply exponential moving scaling + optional clipping."""
+        alpha = self.reward_scale_alpha
+        abs_r = abs(raw_reward)
+
+        # Initialize scale sensibly if very small
+        if self.reward_scale <= 1e-6:
+            self.reward_scale = max(abs_r, 1.0)
         else:
-            # Fallback: derive from strong schedule (global DC shares) + strong power (scalar)
-            prior = self._strong_schedule(self.active_agent_profile)  # [dist_7b..., dist_70b...]
-            dist_7b = prior[:self.NUM_DATACENTERS]
-            dist_70b = prior[self.NUM_DATACENTERS:]
-            power_scalar = float(self._strong_power(self.active_agent_profile)[0])
-            self.current_actions = {
-                f"dc_{i}": np.array([float(dist_7b[i]), float(dist_70b[i]), power_scalar], dtype=np.float32)
-                for i in range(self.NUM_DATACENTERS)
+            self.reward_scale = (1.0 - alpha) * self.reward_scale + alpha * max(abs_r, 1.0)
+
+        scaled = raw_reward / max(self.reward_scale, 1e-6)
+
+        if self.reward_clip > 0.0:
+            scaled = float(np.clip(scaled, -self.reward_clip, self.reward_clip))
+
+        return float(scaled)
+
+    def step(self, actions: Dict[str, np.ndarray]):
+        assert set(actions.keys()) == set(self.agents), (
+            f"Action keys {list(actions.keys())} do not match agents {self.agents}"
+        )
+        self.current_step += 1
+
+        # ------------------------------------------------------------------
+        # 1) Decode actions: logits -> global routing dists, power scalars
+        # ------------------------------------------------------------------
+        raw = {a: np.asarray(actions[a], dtype=np.float32).copy() for a in self.agents}
+
+        # First two dims: logits for 7B / 70B (in [-5,5])
+        logits_7b = {a: float(raw[a][0]) for a in self.agents}
+        logits_70b = {a: float(raw[a][1]) for a in self.agents}
+        # Third dim: power scalar in [0,1]
+        power_scalars = {a: float(np.clip(raw[a][2], 0.0, 1.0)) for a in self.agents}
+
+        # Global distributions over DCs (one per model)
+        dist_7b = self._softmax_across_dcs(logits_7b)  # shape [NUM_DATACENTERS]
+        dist_70b = self._softmax_across_dcs(logits_70b)
+
+        # Align dists with agents order, attach power scalar
+        normalized_actions: Dict[str, np.ndarray] = {}
+        for idx, agent in enumerate(self.agents):
+            normalized_actions[agent] = np.array(
+                [dist_7b[idx], dist_70b[idx], power_scalars[agent]], dtype=np.float32
+            )
+
+        # Optional safety layer (currently a no-op but keeps plumbing + flags)
+        projected_actions, projection_flags = self._apply_safety_layer(normalized_actions)
+
+        # Replace dist_7b / dist_70b with the possibly adjusted values
+        dist_7b = np.array([projected_actions[a][0] for a in self.agents], dtype=np.float64)
+        dist_70b = np.array([projected_actions[a][1] for a in self.agents], dtype=np.float64)
+        power_scalars = {a: float(projected_actions[a][2]) for a in self.agents}
+
+        # ------------------------------------------------------------------
+        # 2) Build rate-based workload from epoch_df
+        # ------------------------------------------------------------------
+        df = self.epoch_df
+
+        # Be robust to different column names
+        if "source_dc_id" in df.columns:
+            src_col = "source_dc_id"
+        elif "source_dc" in df.columns:
+            src_col = "source_dc"
+        elif "src_dc" in df.columns:
+            src_col = "src_dc"
+        else:
+            raise KeyError(
+                "epoch_df must have one of ['source_dc_id', 'source_dc', 'src_dc']"
+            )
+
+        if "model_type" in df.columns:
+            model_col = "model_type"
+        elif "model" in df.columns:
+            model_col = "model"
+        else:
+            raise KeyError(
+                "epoch_df must have one of ['model_type', 'model']"
+            )
+
+        if "num_tokens" in df.columns:
+            tok_col = "num_tokens"
+        elif "total_tokens" in df.columns:
+            tok_col = "total_tokens"
+        elif "tokens" in df.columns:
+            tok_col = "tokens"
+        else:
+            raise KeyError(
+                "epoch_df must have one of ['num_tokens', 'total_tokens', 'tokens']"
+            )
+
+        # Aggregate tokens per (src_dc, model_type) for this epoch
+        work_df = (
+            df.groupby([src_col, model_col], as_index=False)[tok_col]
+            .sum()
+            .rename(
+                columns={
+                    src_col: "src_dc",
+                    model_col: "model_type",
+                    tok_col: "total_tokens",
+                }
+            )
+        )
+
+        # ------------------------------------------------------------------
+        # 3) Build workload_df + schedule_plan for LLM_Simulator
+        #    Fractional routing, biased toward nearest DC index + scheme bias.
+        # ------------------------------------------------------------------
+        req_rows: List[Dict[str, Any]] = []
+        plan_map: Dict[int, int] = {}
+        row_idx = 0
+
+        num_dc = self.NUM_DATACENTERS
+        max_dc_distance = max(1, num_dc - 1)
+
+        for r in work_df.itertuples(index=False):
+            src_dc = int(getattr(r, "src_dc"))
+            model = str(getattr(r, "model_type"))
+            tokens = float(getattr(r, "total_tokens"))
+
+            if tokens <= 0.0:
+                continue
+
+            # Base global distribution for this model from the agents
+            if model == "Llama7b":
+                base_dist = np.asarray(dist_7b, dtype=np.float64).copy()
+            else:
+                base_dist = np.asarray(dist_70b, dtype=np.float64).copy()
+
+            # Apply proximity bias + scheme-specific metric bias.
+            weights = np.zeros_like(base_dist)
+            for dc_id in range(num_dc):
+                dist_idx = abs(dc_id - src_dc)
+                # closeness in [0.5, 1.0]; tweak 0.5 for stronger/weaker bias
+                closeness = 1.0 - 0.5 * (dist_idx / max_dc_distance)
+                closeness = max(closeness, 0.0)
+                weights[dc_id] = (
+                    base_dist[dc_id]
+                    * closeness
+                    * float(self._metric_bias[dc_id])
+                )
+
+            total_w = float(weights.sum())
+            if total_w <= 0.0 or not np.isfinite(total_w):
+                # Fallback: uniform if something degenerates
+                weights[:] = 1.0 / num_dc
+            else:
+                weights /= total_w
+
+            # Split this (src_dc, model) workload across DCs using the biased weights
+            for dc_id in range(num_dc):
+                share = float(weights[dc_id])
+                if share <= 0.0:
+                    continue
+
+                token_share = tokens * share
+                if token_share <= 0.0:
+                    continue
+
+                req_rows.append(
+                    {
+                        "source_dc": src_dc,
+                        "model": model,
+                        "arrival_ms": 0,
+                        "tokens": token_share,
+                    }
+                )
+                plan_map[row_idx] = int(dc_id)
+                row_idx += 1
+
+        # Failsafe: if no rows were generated, fall back to src->src
+        if not req_rows:
+            for r in work_df.itertuples(index=False):
+                src_dc = int(getattr(r, "src_dc"))
+                model = str(getattr(r, "model_type"))
+                tokens = float(getattr(r, "total_tokens"))
+                if tokens <= 0.0:
+                    continue
+                req_rows.append(
+                    {
+                        "source_dc": src_dc,
+                        "model": model,
+                        "arrival_ms": 0,
+                        "tokens": tokens,
+                    }
+                )
+                plan_map[row_idx] = src_dc
+                row_idx += 1
+
+        workload_df = pd.DataFrame(req_rows)
+        self.schedule_plan = {"map": plan_map}
+
+        # ------------------------------------------------------------------
+        # 4) Build power_plan from projected power scalars
+        # ------------------------------------------------------------------
+        # Patterns over node types (indexes must match DC node_ids)
+        power_patterns = [
+            [0, 0, 0, 0, 0, 0],  # all off
+            [1, 0, 0, 0, 0, 0],  # 8_A100s
+            [0, 1, 0, 0, 0, 0],  # 8_H100s
+            [0, 0, 1, 0, 0, 0],  # 4_A100s
+            [0, 0, 0, 1, 0, 0],  # 4_H100s
+            [1, 1, 0, 0, 0, 0],  # both 8-GPU types
+            [0, 0, 1, 1, 0, 0],  # both 4-GPU types
+            [1, 1, 1, 1, 0, 0],  # all big GPU types
+        ]
+        num_patterns = len(power_patterns)
+
+        # Translate pattern into per-DC plan slice compatible with Datacenter.apply_power_plan
+        self.power_plan: Dict[int, Dict[str, Dict[int, str]]] = {}
+        for agent in self.agents:
+            dc_id = int(agent.split("_")[1])
+            lever_val = float(np.clip(power_scalars[agent], 0.0, 1.0))
+
+            # Scheme-specific skew on power lever:
+            #  - ttft-like schemes push toward higher patterns
+            #  - carbon/water/cost-like schemes push toward lower patterns
+            metric = getattr(self, "primary_metric", "ttft")
+            if metric == "ttft":
+                # push toward higher patterns
+                lever_val = 0.5 + 0.5 * lever_val
+            elif metric in ("carbon", "water", "cost", "energy_cost", "price"):
+                # push toward lower patterns
+                lever_val = 0.5 * lever_val
+
+            lever_val = float(np.clip(lever_val, 0.0, 1.0))
+            idx = min(int(lever_val * num_patterns), num_patterns - 1)
+            node_pattern = power_patterns[idx]
+
+            self.power_plan[dc_id] = {
+                "unit": {
+                    node_type: ("ON" if on else "OFF")
+                    for node_type, on in enumerate(node_pattern)
+                }
             }
 
-        # --- Build observations with validation ---
-        obs: Dict[str, np.ndarray] = {}
-        shapes: Dict[str, Tuple[int, ...]] = {}
-        expected_shape: Optional[Tuple[int, ...]] = None
+        # ------------------------------------------------------------------
+        # 5) Call rate-based LLM_Simulator for this epoch
+        # ------------------------------------------------------------------
+        if self._rate_sim is None:
+            # epoch_summary should carry these; fall back to sensible defaults
+            spec_dir = self.epoch_summary.get("spec_dir", "sim_specs")
+            epoch_len = int(self.epoch_summary.get("epoch_length", 900))
+            self._rate_sim = LLM_Simulator(
+                spec_dir=spec_dir,
+                epoch_length=epoch_len,
+                debug=False,
+            )
 
-        for agent in self.agents:
-            # Use provided observe(...) if the project already has it; else use our builder
-            if hasattr(self, "observe") and callable(getattr(self, "observe")):
-                o = self.observe(agent)  # existing user method
-            else:
-                o = self._build_observation(agent)  # new builder
-            obs[agent] = o
-            shapes[agent] = o.shape
-            if expected_shape is None:
-                expected_shape = o.shape
-            elif o.shape != expected_shape:
-                print(f"[reset ⚠️] Observation shape mismatch for {agent}: got {o.shape}, expected {expected_shape}",
-                      flush=True)
-
-        if any(shape != expected_shape for shape in shapes.values()):
-            print(f"[reset ⚠️] Inconsistent observation shapes at reset: {shapes}", flush=True)
-
-        info = {agent: {} for agent in self.agents}
-        return obs, info
-
-    def _run_metrics_backend(self):
-        metrics, results, leftover_requests_out = LLM_Simulator(
+        metrics, results, dc_usage = self._rate_sim.run_epoch(
             self.epoch_idx,
-            self.epoch_df,
+            workload_df,
             self.schedule_plan,
             self.power_plan,
         )
-        self._last_metrics = dict(metrics)  # cache for callbacks
+        self._last_metrics = dict(metrics)
         self._last_results = results
-        self._last_leftovers = leftover_requests_out
-        return metrics, results, leftover_requests_out
+        self._last_leftovers = dc_usage
 
-    def get_last_metrics(self):
-        return getattr(self, "_last_metrics", None)
-
-    def get_last_leftovers(self):
-        return getattr(self, "_last_leftovers", None)
-
-
-    def step(self, actions):
-        import time
-        assert set(actions.keys()) == set(self.agents), (
-            f"[step ❌] Agent mismatch in actions: {list(actions.keys())} vs expected {self.agents}"
-        )
-        self.current_step += 1
-        agents = list(self.agents)
-
-        # --- Parse & normalize cross-agent distributions (softmax over DCs) ---
-        raw = {a: np.asarray(actions[a], dtype=np.float32).copy() for a in agents}
-
-        def _softmax(vec):
-            v = np.clip(np.asarray(vec, dtype=np.float64), -50.0, 50.0)
-            v -= np.max(v)
-            ex = np.exp(v)
-            s = ex.sum()
-            return (ex / s) if (s > 0 and np.isfinite(s)) else np.full_like(ex, 1.0 / len(ex))
-
-        logits_7b = [raw[a][0] for a in agents]
-        logits_70b = [raw[a][1] for a in agents]
-        dist_7b = _softmax(logits_7b).astype(np.float32)  # sum(dist_7b)=1
-        dist_70b = _softmax(logits_70b).astype(np.float32)  # sum(dist_70b)=1
-        power_scalars = [float(np.clip(raw[a][2], 0.0, 1.0)) for a in agents]
-
-        normalized_actions = {
-            a: np.array([dist_7b[i], dist_70b[i], power_scalars[i]], dtype=np.float32)
-            for i, a in enumerate(agents)
-        }
-
-        # --- Safety layer (hard step constraints) ---
-        projected_actions, projection_flags = self._apply_safety_layer(normalized_actions)
-
-        # --- Build schedule plan from distributions ---
-        df_7b = self.epoch_df[self.epoch_df['model_type'] == 'Llama7b']
-        df_70b = self.epoch_df[self.epoch_df['model_type'] == 'Llama70b']
-        self.schedule_plan = self._build_schedule_plan(df_7b, df_70b, dist_7b, dist_70b)
-
-        # --- Build power plan from scalar lever -> discrete node-type pattern ---
-        power_patterns = [
-            [0, 0, 0, 0, 0, 0],  # All Off
-            [0, 0, 0, 0, 1, 0],  # Only 2_A100s
-            [0, 0, 0, 0, 0, 1],  # Only 2_H100s
-            [0, 0, 1, 0, 0, 0],  # Only 4_A100s
-            [0, 0, 0, 1, 0, 0],  # Only 4_H100s
-            [1, 0, 0, 0, 0, 0],  # Only 8_A100s
-            [0, 1, 0, 0, 0, 0],  # Only 8_H100s
-            [1, 1, 1, 1, 1, 1],  # All On
-        ]
-        num_patterns = len(power_patterns)
-        self.power_plan = {}
-        for i, agent in enumerate(agents):
-            dc_id = int(agent.split("_")[1])
-            lever_val = float(np.clip(projected_actions[agent][2], 0.0, 1.0))
-            idx = min(int(lever_val * num_patterns), num_patterns - 1)
-            node_pattern = power_patterns[idx]
-            self.power_plan[dc_id] = {
-                node_type: ("On" if on else "Off") for node_type, on in enumerate(node_pattern)
-            }
-
-        # --- Run simulator & expose ALL raw metrics ---
-        t0 = time.time()
-        metrics, results, leftover_requests_out = self._run_metrics_backend()
-        metric_time = time.time() - t0
-
-        # Raw metrics (domain units)
-        ttft = float(metrics.get("avg_ttft", 0.0))
-        cost = float(metrics.get("energy_cost", 0.0))
+        # ------------------------------------------------------------------
+        # 6) Turn metrics into normalized reward + constraint penalty
+        # ------------------------------------------------------------------
+        ttft = float(metrics.get("avg_ttft_sec", metrics.get("avg_ttft", 0.0)))
         carbon = float(metrics.get("carbon_emissions", 0.0))
         water = float(metrics.get("water_usage", 0.0))
-        total_energy = float(metrics.get("total_energy", 0.0))
-        network_load, network_load_detail = self._extract_network_load(metrics)
+        cost = float(metrics.get("energy_cost", 0.0))
+        total_energy = float(metrics.get("total_energy", metrics.get("energy_kwh", 0.0)))
+        network_load = float(metrics.get("avg_net_latency_ms", 0.0))
 
-        # --- Update normalizers (invert-lower-is-better for reward view) ---
+        # Update max trackers for moving normalization
         self.metric_max_tracker["ttft"] = max(self.metric_max_tracker["ttft"], ttft)
-        self.metric_max_tracker["cost"] = max(self.metric_max_tracker["cost"], cost)
         self.metric_max_tracker["carbon"] = max(self.metric_max_tracker["carbon"], carbon)
         self.metric_max_tracker["water"] = max(self.metric_max_tracker["water"], water)
-        # Optional extras for logging
-        if "total_energy" not in self.metric_max_tracker:
-            self.metric_max_tracker["total_energy"] = 1.0
-        if "network_load" not in self.metric_max_tracker:
-            self.metric_max_tracker["network_load"] = 1.0
-        self.metric_max_tracker["total_energy"] = max(self.metric_max_tracker["total_energy"], total_energy)
-        self.metric_max_tracker["network_load"] = max(self.metric_max_tracker["network_load"], network_load)
+        self.metric_max_tracker["cost"] = max(self.metric_max_tracker["cost"], cost)
+        self.metric_max_tracker["total_energy"] = max(
+            self.metric_max_tracker["total_energy"], total_energy
+        )
+        self.metric_max_tracker["network_load"] = max(
+            self.metric_max_tracker["network_load"], network_load
+        )
 
-        def inv_norm(x, key):
+        def inv_norm(x: float, key: str) -> float:
             denom = max(self.metric_max_tracker[key], 1e-12)
+            # larger x -> smaller normalized score in [0,1]
             return float(np.clip(1.0 - (x / denom), 0.0, 1.0))
 
         global_norm = {
@@ -510,1742 +635,679 @@ class ResourceEnv(ParallelEnv):
             "carbon": inv_norm(carbon, "carbon"),
             "water": inv_norm(water, "water"),
             "cost": inv_norm(cost, "cost"),
-            # extras if you later want them in reward:
             "total_energy": inv_norm(total_energy, "total_energy"),
             "network_load": inv_norm(network_load, "network_load"),
         }
 
-        # --- Reward: weights dict (sum=10), "good = high" normalized metrics ---
-        rw = 0.0
+        # Base reward from weights
+        base_rw = 0.0
         for m, w in self.reward_weights.items():
-            rw += float(w) * float(global_norm.get(m, 0.0))
+            base_rw += float(w) * float(global_norm.get(m, 0.0))
 
-        # --- Constraints: per-step costs + episodic accumulation ---
-        if hasattr(self, "_compute_constraint_costs"):
-            costs_step = self._compute_constraint_costs({
-                "global": {
-                    "avg_ttft": ttft,
-                    "energy_cost": cost,
-                    "carbon_emissions": carbon,
-                    "water_usage": water,
-                    "total_energy": total_energy,
-                    "network_load": network_load,
-                },
-                "global_norm": global_norm,
-            })
-        else:
-            costs_step = {}
+        # Constraints: Lagrangian penalty
+        constraint_costs = {
+            "ttft": ttft,
+            "carbon": carbon,
+            "water": water,
+            "cost": cost,
+            "total_energy": total_energy,
+            "network_load": network_load,
+        }
+        total_penalty = 0.0
+        for cname, rule in self.constraints.items():
+            val = float(constraint_costs.get(cname, 0.0))
+            bound = float(rule.get("bound", rule.get("budget", 0.0)))
+            ctype = rule.get("type", "upper_bound")
+            if ctype == "upper_bound":
+                viol = max(0.0, val - bound)
+            elif ctype == "lower_bound":
+                viol = max(0.0, bound - val)
+            else:
+                viol = 0.0
+            lr = float(self.lambda_lr.get(cname, 0.0))
+            self.duals[cname] = max(0.0, self.duals.get(cname, 0.0) + lr * viol)
+            total_penalty += self.duals.get(cname, 0.0) * viol
 
-        for cname, cdef in self.constraints.items():
-            if cdef.get("window", "episode") == "episode":
-                self.episodic_cost_totals[cname] += float(costs_step.get(cname, 0.0))
-                self.episodic_cost_counts[cname] += 1
+        # Moving reward scaling
+        raw_reward = float(base_rw - total_penalty)
+        final_reward = self._scale_reward(raw_reward)
 
-        # --- Collected plans (store all RAW metrics + leftovers) ---
-        self.collected_plans[self.current_step] = {
+        # ------------------------------------------------------------------
+        # 7) Build outputs for all agents (single-step episode)
+        # ------------------------------------------------------------------
+        rewards = {agent: final_reward for agent in self.agents}
+        terminations = {agent: True for agent in self.agents}
+        truncations = {agent: False for agent in self.agents}
+
+        infos = {
             agent: {
-                "metrics_raw": {
-                    "avg_ttft": ttft,
-                    "energy_cost": cost,
+                "raw_metrics": {
+                    "ttft": ttft,
                     "carbon_emissions": carbon,
                     "water_usage": water,
+                    "energy_cost": cost,
                     "total_energy": total_energy,
                     "network_load": network_load,
                 },
                 "metrics_normalized": global_norm,
                 "schedule_plan": self.schedule_plan,
                 "power_plan": self.power_plan,
-                "metric_time": metric_time,
                 "projected": bool(projection_flags.get(agent, False)),
-                "leftovers": leftover_requests_out,
-                "results_sample_size": len(self._last_results) if hasattr(self, "_last_results") else None,
-            } for agent in agents
+                "duals": dict(self.duals),
+                "dc_usage": dc_usage,
+                "reward_raw": raw_reward,
+                "reward_scaled": final_reward,
+                "reward_scale": self.reward_scale,
+            }
+            for agent in self.agents
         }
 
-        # --- Observations / rewards / dones / infos ---
-        if hasattr(self, "observe") and callable(getattr(self, "observe")):
-            obs = {agent: self.observe(agent) for agent in agents}
-        else:
-            obs = {agent: self._build_observation(agent) for agent in agents}
-
-        rewards = {agent: float(rw) for agent in agents}
-        done_now = (self.current_step >= self.max_steps)
-        terminations = {agent: done_now for agent in agents}
-        terminations["__all__"] = done_now
-        truncations = {agent: False for agent in agents}
-        truncations["__all__"] = False
-
-        if hasattr(self, "_current_constraint_status"):
-            constraints_status = self._current_constraint_status()
-        else:
-            constraints_status = {}
-
-        infos = {
-            agent: {
-                "metrics": {
-                    "raw": {
-                        "avg_ttft": ttft,
-                        "energy_cost": cost,
-                        "carbon_emissions": carbon,
-                        "water_usage": water,
-                        "total_energy": total_energy,
-                        "network_load": network_load,
-                    },
-                    "norm": global_norm,
-                },
-                "costs": costs_step,
-                "constraints": constraints_status,
-                "duals": getattr(self, "duals", {}).copy(),
-                "projected": bool(projection_flags.get(agent, False)),
-                "leftovers": {
-                    "count": len(self._last_leftovers) if hasattr(self, "_last_leftovers") else 0
-                },
-                "step_idx": self.current_step,
-                "metric_time": metric_time,
-            } for agent in agents
-        }
-
-        if done_now and hasattr(self, "_update_duals_after_episode"):
-            self._update_duals_after_episode()
-
-        self.rewards = rewards
-        self.dones = terminations.copy()
-        self.infos = infos
+        obs = self._get_obs_dict()
         return obs, rewards, terminations, truncations, infos
 
-    def _apply_safety_layer(self, actions):
-        # Fast path: nothing to enforce
-        has_hard_step = any(
-            c.get("hard", False) and c.get("window", "episode") == "step"
-            for c in self.constraints.values()
-        )
-        if not has_hard_step:
-            return actions, {a: False for a in self.agents}
-
-        import numpy as np
-
-        agents = list(self.agents)
-        n = self.NUM_DATACENTERS
-
-        # Extract current distributions and power scalars
-        dist7b = np.array([float(actions[a][0]) for a in agents], dtype=np.float64)
-        dist70b = np.array([float(actions[a][1]) for a in agents], dtype=np.float64)
-        power = np.array([float(np.clip(actions[a][2], 0.0, 1.0)) for a in agents], dtype=np.float64)
-
-        # Helpers
-        def _mask_and_renorm(dist, mask):
-            dist = np.where(mask, dist, 0.0)
-            s = dist.sum()
-            if s > 1e-12:
-                return dist / s, True
-            # If all mass was masked out, fallback to uniform over allowed entries
-            allowed = np.count_nonzero(mask)
-            if allowed == 0:
-                # No feasible DCs -> return original (will be caught by caller)
-                return dist, False
-            out = np.zeros_like(dist)
-            out[mask] = 1.0 / float(allowed)
-            return out, True
-
-        def _cap_simplex_with_upper_bounds(p, ub):
-            p = np.asarray(p, dtype=np.float64).clip(0.0, None)
-            ub = np.asarray(ub, dtype=np.float64).clip(0.0, 1.0)
-
-            if ub.sum() < 1.0 - 1e-12:
-                # Infeasible caps; best we can do is saturate the caps and report infeasible
-                return ub.copy(), False
-
-            # Iterative water-filling under upper bounds
-            x = np.minimum(p, ub)
-            total = x.sum()
-            if abs(total - 1.0) < 1e-9:
-                return x, True
-            if total > 1.0:
-                # Scale down proportionally, then re-cap to ensure x<=ub
-                x = x * (1.0 / total)
-                x = np.minimum(x, ub)
-                # Final renorm (there is room because sum(ub)>=1)
-                s = x.sum()
-                if s < 1.0 - 1e-12:
-                    # Distribute deficit to coordinates with slack
-                    for _ in range(5):  # a few passes usually suffice
-                        slack = ub - x
-                        room = slack.sum()
-                        if room <= 1e-12:
-                            break
-                        add = min(1.0 - s, room)
-                        # Proportional to slack
-                        x += (slack / max(room, 1e-12)) * add
-                        s = x.sum()
-                        if abs(s - 1.0) < 1e-9:
-                            break
-                else:
-                    x /= s
-                return x, True
-            else:
-                # We have deficit; add mass in proportion to remaining headroom (ub - x)
-                for _ in range(10):
-                    s = x.sum()
-                    if abs(s - 1.0) < 1e-9:
-                        break
-                    deficit = 1.0 - s
-                    slack = ub - x
-                    room = slack.sum()
-                    if room <= 1e-12:
-                        # No room left; fallback to proportional renorm (shouldn't happen if sum(ub)>=1)
-                        x = x / max(x.sum(), 1e-12)
-                        break
-                    x += (slack / room) * deficit
-                    # ensure we don't exceed ub due to numerical issues
-                    x = np.minimum(x, ub)
-                # final tiny renorm
-                x = x / max(x.sum(), 1e-12)
-                return x, True
-
-        # Defaults: everything allowed, no caps
-        mask_7b = np.ones(n, dtype=bool)
-        mask_70b = np.ones(n, dtype=bool)
-        cap_7b = np.ones(n, dtype=np.float64)  # per-DC upper bound on 7B share
-        cap_70b = np.ones(n, dtype=np.float64)  # per-DC upper bound on 70B share
-        per_dc_power_max = 1.0
-        global_power_max_sum = None
-
-        # Parse hard step constraints
-        for cname, cdef in self.constraints.items():
-            if not (cdef.get("hard", False) and cdef.get("window", "episode") == "step"):
-                continue
-            rule = cdef.get("rule", None)
-
-            if rule == "mask_7b":
-                allowed = np.array(cdef.get("allowed_dcs", []), dtype=int)
-                m = np.zeros(n, dtype=bool)
-                m[np.clip(allowed, 0, n - 1)] = True
-                mask_7b &= m
-            elif rule == "mask_70b":
-                allowed = np.array(cdef.get("allowed_dcs", []), dtype=int)
-                m = np.zeros(n, dtype=bool)
-                m[np.clip(allowed, 0, n - 1)] = True
-                mask_70b &= m
-            elif rule == "per_dc_share_max_7b":
-                cap = float(cdef.get("max", 1.0))
-                cap_7b = np.minimum(cap_7b, cap)
-            elif rule == "per_dc_share_max_70b":
-                cap = float(cdef.get("max", 1.0))
-                cap_70b = np.minimum(cap_70b, cap)
-            elif rule == "per_dc_power_max":
-                per_dc_power_max = float(cdef.get("max", 1.0))
-            elif rule == "global_power_max_sum":
-                global_power_max_sum = float(cdef.get("max_sum", None))
-            else:
-                # Ignore unknown rules; they might be cost-only constraints handled elsewhere
-                continue
-
-        # Apply masks
-        changed = False
-        dist7b_new, ok7b = _mask_and_renorm(dist7b, mask_7b)
-        dist70b_new, ok70b = _mask_and_renorm(dist70b, mask_70b)
-        changed |= (not np.allclose(dist7b, dist7b_new) or not np.allclose(dist70b, dist70b_new))
-        dist7b, dist70b = dist7b_new, dist70b_new
-
-        # Apply per-DC share caps (project onto capped simplex)
-        if cap_7b.min() < 1.0 - 1e-12:
-            proj7b, feas7b = _cap_simplex_with_upper_bounds(dist7b, cap_7b)
-            changed |= not np.allclose(dist7b, proj7b)
-            dist7b = proj7b
-            if not feas7b:
-                # Infeasible caps; we relaxed by setting x=ub (sum<1). Renormalize softly to keep scheduler happy.
-                s = dist7b.sum()
-                if s > 0:
-                    dist7b = dist7b / s
-
-        if cap_70b.min() < 1.0 - 1e-12:
-            proj70b, feas70b = _cap_simplex_with_upper_bounds(dist70b, cap_70b)
-            changed |= not np.allclose(dist70b, proj70b)
-            dist70b = proj70b
-            if not feas70b:
-                s = dist70b.sum()
-                if s > 0:
-                    dist70b = dist70b / s
-
-        # Per-DC power cap
-        if per_dc_power_max < 1.0 - 1e-12:
-            power_capped = np.minimum(power, per_dc_power_max)
-            changed |= not np.allclose(power, power_capped)
-            power = power_capped
-
-        # Global power cap (scale down proportionally if exceeded)
-        if global_power_max_sum is not None:
-            s = power.sum()
-            if s > global_power_max_sum + 1e-12 and s > 1e-12:
-                scale = global_power_max_sum / s
-                power_scaled = power * scale
-                changed |= True
-                power = power_scaled
-
-        # Rebuild projected actions and flags
-        projected_actions = {}
-        projection_flags = {}
-        for i, a in enumerate(agents):
-            before = actions[a]
-            after = np.array([dist7b[i], dist70b[i], power[i]], dtype=np.float32)
-            projected_actions[a] = after
-            projection_flags[a] = (changed or not np.allclose(before, after))
-
-        return projected_actions, projection_flags
-
-    def _compute_constraint_costs(self, metrics_pack: Dict[str, Dict[str, float]]) -> Dict[str, float]:
-        costs: Dict[str, float] = {}
-
-        g_raw = metrics_pack.get("global", {})
-        g_norm = metrics_pack.get("global_norm", {})
-
-        # Canonical mapping from constraint names to metric keys
-        # You can extend this as needed (e.g., "slo_violation_rate": "slo_violation_rate")
-        name_to_metric_raw = {
-            "avg_ttft": "avg_ttft",
-            "ttft": "avg_ttft",
-            "energy_cost": "energy_cost",
-            "cost": "energy_cost",
-            "carbon_emissions": "carbon_emissions",
-            "carbon": "carbon_emissions",
-            "water_usage": "water_usage",
-            "water": "water_usage",
-            "total_energy": "total_energy",
-            "network_load": "network_load",
-        }
-
-        # For normalized space, use keys that match your reward normalization
-        name_to_metric_norm = {
-            "ttft": "ttft",
-            "carbon": "carbon",
-            "water": "water",
-            "cost": "cost",
-            "total_energy": "total_energy",
-            "network_load": "network_load",
-        }
-
-        for cname, cdef in self.constraints.items():
-            units = cdef.get("budget_units", "raw")  # "raw" or "norm"
-
-            if units == "raw":
-                # Look up raw metric by name or alias; if missing, fall back to 0.0
-                raw_key = name_to_metric_raw.get(cname, cname)
-                c_val = float(g_raw.get(raw_key, 0.0))
-            else:
-                # Normalized with "good = high" (1 = best). Convert to cost where higher = worse.
-                norm_key = name_to_metric_norm.get(cname, cname)
-                good = float(g_norm.get(norm_key, 0.0))
-                c_val = float(1.0 - np.clip(good, 0.0, 1.0))  # turn "good" into "cost"
-
-            costs[cname] = c_val
-
-        return costs
-
-    def _current_constraint_status(self) -> Dict[str, Dict[str, float]]:
-        status: Dict[str, Dict[str, float]] = {}
-        for cname, cdef in self.constraints.items():
-            budget = float(cdef.get("budget", 0.0))
-            window = cdef.get("window", "episode")
-            if window == "episode":
-                avg = self._episodic_avg_cost(cname)
-                status[cname] = {
-                    "avg_cost": avg,
-                    "budget": budget,
-                    "margin": budget - avg,
-                }
-            else:
-                status[cname] = {
-                    "avg_cost": float('nan'),
-                    "budget": budget,
-                    "margin": float('nan'),
-                }
-        return status
-
-    def _episodic_avg_cost(self, cname: str) -> float:
-        cnt = max(int(self.episodic_cost_counts.get(cname, 0)), 1)
-        tot = float(self.episodic_cost_totals.get(cname, 0.0))
-        return tot / cnt
-
-    def _update_duals_after_episode(self) -> None:
-        for cname, cdef in self.constraints.items():
-            if cdef.get("window", "episode") != "episode":
-                continue
-
-            budget = float(cdef.get("budget", 0.0))
-            alpha = float(self.lambda_lr.get(cname, 1e-3))
-            avg_cost = self._episodic_avg_cost(cname)
-
-            new_lam = self.duals.get(cname, 0.0) + alpha * (avg_cost - budget)
-            # Non-negativity
-            new_lam = max(0.0, new_lam)
-
-            # Optional clipping range for stability
-            lam_clip = cdef.get("lambda_clip", None)
-            if isinstance(lam_clip, (list, tuple)) and len(lam_clip) == 2:
-                lo, hi = float(lam_clip[0]), float(lam_clip[1])
-                if hi < lo:
-                    lo, hi = hi, lo
-                new_lam = min(max(new_lam, lo), hi)
-
-            self.duals[cname] = float(new_lam)
-
-    def _build_schedule_plan(self, df_7b, df_70b, dist_7b, dist_70b):
-
-        local_pref_threshold = 0.20  # same spirit as your original heuristic
-
-        def _normalize_proportions(w):
-            w = np.asarray(w, dtype=np.float64)
-            w = np.clip(w, 0.0, None)
-            s = w.sum()
-            if s <= 0.0 or not np.isfinite(s):
-                return np.full(self.NUM_DATACENTERS, 1.0 / self.NUM_DATACENTERS, dtype=np.float64)
-            return w / s
-
-        def _integer_quotas(n_items, proportions):
-            raw = proportions * float(n_items)
-            floors = np.floor(raw).astype(int)
-            rema = raw - floors
-            remaining = int(n_items - floors.sum())
-            if remaining > 0:
-                order = np.argsort(-rema)  # descending remainder
-                for i in range(remaining):
-                    floors[order[i % len(order)]] += 1
-            return floors  # length = num_dcs, sum == n_items
-
-        def _assign_requests(requests_df, proportions):
-            if requests_df is None or len(requests_df) == 0:
-                return []
-
-            proportions = _normalize_proportions(proportions)
-            n = len(requests_df)
-            quotas = _integer_quotas(n, proportions)
-            remaining = quotas.copy()
-
-            max_share = float(proportions.max())
-            meaningful = proportions >= (local_pref_threshold * max_share)
-
-            assignments = []
-            # Iterate in row order (time_index already present in df)
-            for row in requests_df.itertuples():
-                src = int(row.source_dc_id)
-
-                # Prefer local if it still has quota and its share is meaningful
-                if 0 <= src < self.NUM_DATACENTERS and remaining[src] > 0 and meaningful[src]:
-                    target_dc = src
-                else:
-                    # Pick DC with largest remaining quota (ties → lowest index)
-                    if remaining.sum() > 0:
-                        target_dc = int(np.argmax(remaining))
-                    else:
-                        # Shouldn't happen, but fallback to source
-                        target_dc = src if (0 <= src < self.NUM_DATACENTERS) else 0
-
-                remaining[target_dc] -= 1
-
-                assignments.append({
-                    "target_dc_id": int(target_dc),
-                    "model_type": str(row.model_type),
-                    "num_tokens": int(row.num_tokens),
-                    "batch_size": int(getattr(row, "batch_size", 1)),
-                    "source_dc_id": int(row.source_dc_id),
-                    "time_index": int(row.time_index),
-                })
-
-            return assignments
-
-        # Build per-model plans and concatenate
-        dist_7b = _normalize_proportions(dist_7b)
-        dist_70b = _normalize_proportions(dist_70b)
-
-        plan_7b = _assign_requests(df_7b, dist_7b)
-        plan_70b = _assign_requests(df_70b, dist_70b)
-
-        return plan_7b + plan_70b
-
-    def observe(self, agent: str):
-        # --- Shapes & one-hot ---
-        obs_dim = self.observation_spaces[agent].shape[0]
-        onehot_dim = len(self.agents)
-        try:
-            agent_idx = self.agents.index(agent)
-            agent_onehot = np.eye(onehot_dim, dtype=np.float32)[agent_idx]
-        except ValueError:
-            agent_onehot = np.zeros(onehot_dim, dtype=np.float32)
-
-        # --- If no data yet this step, return zeros + onehot (matches declared shape) ---
-        if (
-                self.current_step == 0
-                or self.current_step not in self.collected_plans
-                or agent not in self.collected_plans[self.current_step]
-        ):
-            vec = np.zeros(obs_dim, dtype=np.float32)
-            # place onehot starting at index 8
-            start = 8
-            end = start + onehot_dim
-            if end <= obs_dim:
-                vec[start:end] = agent_onehot[: max(0, min(onehot_dim, obs_dim - start))]
-            return vec
-
-        try:
-            # --- Pull latest per-step artifacts ---
-            agent_data = self.collected_plans[self.current_step][agent]
-            # Prefer the new raw metrics dict; fall back to legacy "metrics"
-            m_raw = agent_data.get("metrics_raw") or agent_data.get("metrics", {})
-            power_plan = agent_data.get("power_plan", {})
-            dc_id = int(agent.split("_")[1])
-
-            # Raw simulator metrics (domain units)
-            carbon = float(m_raw.get("carbon_emissions", 0.0))
-            ttft = float(m_raw.get("avg_ttft", 0.0))
-            water = float(m_raw.get("water_usage", 0.0))
-            cost = float(m_raw.get("energy_cost", 0.0))
-
-            # --- Dynamic normalization (per-episode max trackers) ---
-            max_tracker = getattr(self, "metric_max_tracker", {
-                "carbon": max(carbon, 1.0),
-                "ttft": max(ttft, 1.0),
-                "water": max(water, 1.0),
-                "cost": max(cost, 1.0),
-            })
-
-            carbon_norm = float(np.clip(carbon / max(max_tracker["carbon"], 1e-12), 0.0, 1.0))
-            ttft_norm = float(np.clip(ttft / max(max_tracker["ttft"], 1e-12), 0.0, 1.0))
-            water_norm = float(np.clip(water / max(max_tracker["water"], 1e-12), 0.0, 1.0))
-            cost_norm = float(np.clip(cost / max(max_tracker["cost"], 1e-12), 0.0, 1.0))
-
-            # Workload scalars (normalize to a rough [0,1] range; adjust if desired)
-            load_7b = float(np.clip(self.llama7b_total / 10000.0, 0.0, 1.0))
-            load_70b = float(np.clip(self.llama70b_total / 10000.0, 0.0, 1.0))
-
-            # Power summary for this DC: ratio of "On" nodes (6 types total)
-            on_count = sum(1 for s in power_plan.get(dc_id, {}).values() if s == "On")
-            power_ratio = float(np.clip(on_count / 6.0, 0.0, 1.0))
-
-            # Progress in episode
-            step_ratio = float(np.clip(self.current_step / max(1, self.max_steps), 0.0, 1.0))
-
-            scalar_features = np.array([
-                carbon_norm, ttft_norm, water_norm, cost_norm,
-                load_7b, load_70b, power_ratio, step_ratio
-            ], dtype=np.float32)
-
-            # --- Optional: duals and episodic headroom features ---
-            extras = []
-            if getattr(self, "_obs_has_duals", False) and len(self.constraints) > 0:
-                # Duals (sorted by constraint name for determinism)
-                for cname in sorted(self.constraints.keys()):
-                    lam = self.duals.get(cname, 0.0)
-                    extras.append(self._normalize_dual(lam))
-                # Episodic headroom (only for episode-window constraints)
-                if getattr(self, "_obs_has_headroom", False):
-                    for cname in sorted(self.constraints.keys()):
-                        cdef = self.constraints[cname]
-                        if cdef.get("window", "episode") == "episode":
-                            extras.append(self._episodic_headroom(cname))
-
-            # --- Assemble observation: [8 scalars | onehot | extras] ---
-            obs_vec = np.concatenate([scalar_features, agent_onehot, np.array(extras, dtype=np.float32)],
-                                     dtype=np.float32)
-
-            # Shape guard: pad or truncate to declared shape if needed
-            if obs_vec.shape[0] != obs_dim:
-                if obs_vec.shape[0] < obs_dim:
-                    pad = np.zeros(obs_dim - obs_vec.shape[0], dtype=np.float32)
-                    obs_vec = np.concatenate([obs_vec, pad], dtype=np.float32)
-                else:
-                    obs_vec = obs_vec[:obs_dim]
-
-            return obs_vec
-
-        except Exception as e:
-            print(f"[observe ❌] Error for agent {agent} at step {self.current_step}: {e}", flush=True)
-            # Fallback: zeros + onehot
-            vec = np.zeros(obs_dim, dtype=np.float32)
-            start = 8
-            end = start + onehot_dim
-            if end <= obs_dim:
-                vec[start:end] = agent_onehot[: max(0, min(onehot_dim, obs_dim - start))]
-            return vec
-
-    def _normalize_dual(self, lam: float) -> float:
-        # tanh squashing: 0 -> 0.5, grows toward 1.0 as λ→∞
-        return float(np.tanh(float(lam)) * 0.5 + 0.5)
-
-    def _episodic_headroom(self, cname: str) -> float:
-        c_def = self.constraints.get(cname, {})
-        budget = float(c_def.get("budget", 0.0))
-        if budget <= 0.0:
-            return 0.0
-        avg_cost = self._episodic_avg_cost(cname)  # defined earlier
-        margin = budget - avg_cost
-        return float(np.clip(margin / budget, 0.0, 1.0))
-
-    def _extract_network_load(self, metrics: dict):
-        net = metrics.get("network_load", 0.0)
-        if isinstance(net, dict):
-            scalar = float(net.get("avg_load_ratio", 0.0))
-            detail = {
-                "total_active_seconds": float(net.get("total_active_seconds", 0.0)),
-                "total_capacity_seconds": float(net.get("total_capacity_seconds", 0.0)),
-                "per_datacenter": [
-                    {
-                        "datacenter_id": int(d.get("datacenter_id", 0)),
-                        "location": d.get("location", ""),
-                        "load_ratio": float(d.get("load_ratio", 0.0)),
-                        "active_seconds": float(d.get("active_seconds", 0.0)),
-                        "capacity_seconds": float(d.get("capacity_seconds", 0.0)),
-                    }
-                    for d in net.get("per_datacenter", [])
-                ],
-            }
-            return scalar, detail
-        return float(net), None
-
-    def _to_scalar(self, x, reduce: str = "sum") -> float:
-        if isinstance(x, dict):
-            vals = list(x.values())
-        elif isinstance(x, (list, tuple)):
-            vals = list(x)
+    # ------------------------------------------------------------------
+    # Observation helper
+    # ------------------------------------------------------------------
+    def _get_obs_dict(self) -> Dict[str, np.ndarray]:
+        obs: Dict[str, np.ndarray] = {}
+        # Basic workload snapshot, normalized to something reasonable
+        total_tokens = self.llama7b_total + self.llama70b_total
+        norm_7b = float(self.llama7b_total / (total_tokens + 1e-9))
+        norm_70b = float(self.llama70b_total / (total_tokens + 1e-9))
+
+        # Last metrics normalized (or zeros if none yet)
+        if self._last_metrics is None:
+            last_ttft = last_carbon = last_water = last_cost = 0.0
+            last_total_energy = last_network_load = 0.0
         else:
-            try:
-                return float(x)
-            except Exception:
-                return 0.0
-
-        arr = np.array(vals, dtype=np.float64)
-        if reduce == "mean":
-            return float(np.nanmean(arr)) if arr.size else 0.0
-        if reduce == "max":
-            return float(np.nanmax(arr)) if arr.size else 0.0
-        # default: sum
-        return float(np.nansum(arr)) if arr.size else 0.0
-
-    def render(self, mode="human"):
-        print(f"[Step {self.current_step}] Agent outputs:")
-        for agent, result in self.collected_plans[self.current_step].items():
-            m = result["metrics"]
-            print(f"  {agent}: TTFT={m['avg_ttft']:.3f}s, Carbon={m['carbon_emissions']:.2f}g, Water={m['water_usage']:.2f}L, Cost=${m['energy_cost']:.4f}")
-
-    def observation_space(self, agent):
-        return self.observation_spaces[agent]
-
-    def action_space(self, agent):
-        return self.action_spaces[agent]
-
-    def get_schedule_plan(self, agent_id):
-        return self.schedule_plan.get(agent_id, [])
-
-    def get_power_plan(self, agent_id):
-        return self.power_plan.get(agent_id, {})
-
-    def get_collected_plans(self):
-        return self.collected_plans
-
-    def get_rewards(self):
-        return self.rewards
-
-    def get_current_step(self):
-        return self.current_step
-
-    def get_agents(self):
-        return self.agents
-
-    def observe_all(self):
-        return {agent: self.observe(agent) for agent in self.agents}
-
-
-import os
-import json
-import csv
-import matplotlib.pyplot as plt
-import psutil
-import gc
-import time
-from stable_baselines3.common.callbacks import CheckpointCallback, BaseCallback, CallbackList
-import threading
-import datetime
-from torch.utils.tensorboard import SummaryWriter
-import traceback
-import pandas as pd
-from pathlib import Path
-
-class CustomLoggerCallback(BaseCallback):
-    def __init__(self, scheme_id, epoch_idx, log_dir, agent_list, verbose=0):
-        super().__init__(verbose)
-        self.scheme_id = scheme_id
-        self.epoch_idx = epoch_idx
-        self.log_dir = log_dir
-        self.agent_list = agent_list
-        self.step = 0
-
-        # Time series we summarize at rollout end
-        self.episode_rewards = []
-        self.episode_metrics = {
-            "ttft": [], "carbon": [], "water": [], "cost": [],
-            "total_energy": [], "network_load": [],
-            "metric_time": [], "leftovers": [], "proj_frac": []
-        }
-
-        # Paths
-        self.step_log_file = os.path.join(log_dir, f"{scheme_id}_epoch_{epoch_idx}_steps.csv")
-        self.summary_file = os.path.join(log_dir, "summary", f"{scheme_id}_epoch_{epoch_idx}_summary.csv")
-        self.combined_summary_file = os.path.join(log_dir, "summary", f"combined_epoch_{epoch_idx}_summary.csv")  # legacy
-        self.combined_summary_file_v2 = os.path.join(log_dir, "summary", f"combined_epoch_{epoch_idx}_summary_v2.csv")
-        self.plan_dir = os.path.join(log_dir, "plans")
-        self.plot_dir = os.path.join(log_dir, "plots")
-        self.details_file = os.path.join(log_dir, f"{scheme_id}_epoch_{epoch_idx}_details.jsonl")
-        self.writer = SummaryWriter(log_dir=os.path.join(log_dir, "tensorboard", scheme_id))
-
-        # Ensure subfolders exist
-        for path in [self.plan_dir, self.plot_dir, os.path.dirname(self.summary_file)]:
-            os.makedirs(path, exist_ok=True)
-
-        # Initialize step CSV (now includes new columns)
-        if not os.path.exists(self.step_log_file):
-            with open(self.step_log_file, "w") as f:
-                f.write("step,reward,ttft,carbon,water,cost,total_energy,network_load,metric_time,leftovers,proj_frac\n")
-
-        # Legacy combined summary (kept as-is for backward compatibility)
-        if not os.path.exists(self.combined_summary_file):
-            with open(self.combined_summary_file, "w") as f:
-                f.write("agent,epoch,avg_reward,avg_ttft,avg_carbon,avg_water,avg_cost\n")
-
-        # New combined summary V2 with extra metrics
-        if not os.path.exists(self.combined_summary_file_v2):
-            with open(self.combined_summary_file_v2, "w") as f:
-                f.write("agent,epoch,avg_reward,avg_ttft,avg_carbon,avg_water,avg_cost,avg_total_energy,avg_network_load,avg_metric_time,avg_leftovers,avg_proj_frac\n")
-
-    # --- unwrap helper (unchanged) ---
-    def _unwrap_to_resource_env(self, env):
-        def recursive_find(env, max_depth=20):
-            visited = set()
-            stack = [(env, 0)]
-            while stack:
-                current, depth = stack.pop()
-                if id(current) in visited or depth > max_depth:
-                    continue
-                visited.add(id(current))
-                if isinstance(current, ResourceEnv):
-                    return current
-                for attr in dir(current):
-                    if attr.startswith("__"):
-                        continue
-                    try:
-                        sub = getattr(current, attr)
-                        if isinstance(sub, (list, tuple)):
-                            stack.extend((item, depth + 1) for item in sub)
-                        elif hasattr(sub, "__class__"):
-                            stack.append((sub, depth + 1))
-                    except Exception:
-                        continue
-            return None
-        return recursive_find(env)
-
-    def _on_step(self) -> bool:
-        try:
-            env = self._unwrap_to_resource_env(self.model.get_env())
-            if env is None or env.current_step not in env.collected_plans:
-                return True
-
-            metrics_list = []
-            rewards_list = []
-            metric_times = []
-            proj_flags = []
-            # costs/constraints/duals (take from first agent if consistent across agents)
-            constraints_status = None
-            duals_snapshot = None
-            costs_snapshot = None
-
-            leftovers_count = 0
-            if hasattr(env, "get_last_leftovers"):
-                last_leftovers = env.get_last_leftovers()
-                leftovers_count = len(last_leftovers) if last_leftovers is not None else 0
-
-            for agent_id in env.agents:
-                step_data = env.collected_plans[env.current_step].get(agent_id)
-                if step_data is None:
-                    continue
-
-                # Prefer new metrics_raw; fallback to legacy "metrics"
-                metrics = step_data.get("metrics_raw") or step_data.get("metrics", {})
-                reward = env.rewards.get(agent_id, 0.0)
-                metric_time = step_data.get("metric_time", None)
-                projected = step_data.get("projected", False)
-
-                # Also peek into env.infos for constraints/duals/costs
-                info = env.infos.get(agent_id, {})
-                if constraints_status is None:
-                    constraints_status = info.get("constraints", None)
-                if duals_snapshot is None:
-                    duals_snapshot = info.get("duals", None)
-                if costs_snapshot is None:
-                    costs_snapshot = info.get("costs", None)
-
-                # Standardize metric keys for averaging
-                m_row = {
-                    "avg_ttft": metrics.get("avg_ttft", metrics.get("ttft", 0.0)),
-                    "carbon_emissions": metrics.get("carbon_emissions", metrics.get("carbon", 0.0)),
-                    "water_usage": metrics.get("water_usage", metrics.get("water", 0.0)),
-                    "energy_cost": metrics.get("energy_cost", metrics.get("cost", 0.0)),
-                    "total_energy": metrics.get("total_energy", 0.0),
-                    "network_load": 0.0
-                }
-                metrics_list.append(m_row)
-                rewards_list.append(float(reward))
-                if metric_time is not None:
-                    metric_times.append(float(metric_time))
-                proj_flags.append(1.0 if projected else 0.0)
-
-            if not metrics_list:
-                return True
-
-            # Averages across agents for this env step
-            avg_reward = float(np.mean(rewards_list))
-            avg_ttft = float(np.mean([m["avg_ttft"] for m in metrics_list]))
-            avg_carbon = float(np.mean([m["carbon_emissions"] for m in metrics_list]))
-            avg_water = float(np.mean([m["water_usage"] for m in metrics_list]))
-            avg_cost = float(np.mean([m["energy_cost"] for m in metrics_list]))
-            avg_total_energy = float(np.mean([m["total_energy"] for m in metrics_list]))
-            avg_network_load = float(np.mean([m["network_load"] for m in metrics_list]))
-            avg_time = float(np.mean(metric_times)) if metric_times else 0.0
-            proj_frac = float(np.mean(proj_flags)) if proj_flags else 0.0
-
-            # Accumulate for rollout summary
-            self.episode_rewards.append(avg_reward)
-            self.episode_metrics["ttft"].append(avg_ttft)
-            self.episode_metrics["carbon"].append(avg_carbon)
-            self.episode_metrics["water"].append(avg_water)
-            self.episode_metrics["cost"].append(avg_cost)
-            self.episode_metrics["total_energy"].append(avg_total_energy)
-            self.episode_metrics["network_load"].append(avg_network_load)
-            self.episode_metrics["metric_time"].append(avg_time)
-            self.episode_metrics["leftovers"].append(float(leftovers_count))
-            self.episode_metrics["proj_frac"].append(proj_frac)
-
-            # Step CSV (new columns appended)
-            with open(self.step_log_file, "a") as f:
-                f.write(f"{self.step},{avg_reward:.4f},{avg_ttft:.4f},{avg_carbon:.2f},{avg_water:.2f},{avg_cost:.4f},{avg_total_energy:.4f},{avg_network_load:.4f},{avg_time:.4f},{leftovers_count},{proj_frac:.4f}\n")
-
-            # Per-step details JSONL (constraints/duals/costs; one line per step)
-            try:
-                details_row = {
-                    "step": int(self.step),
-                    "reward_avg": avg_reward,
-                    "metrics_avg": {
-                        "avg_ttft": avg_ttft,
-                        "carbon_emissions": avg_carbon,
-                        "water_usage": avg_water,
-                        "energy_cost": avg_cost,
-                        "total_energy": avg_total_energy,
-                        "network_load": avg_network_load,
-                        "metric_time": avg_time,
-                        "leftovers": int(leftovers_count),
-                        "proj_frac": proj_frac,
-                    },
-                    "constraints": constraints_status,
-                    "duals": duals_snapshot,
-                    "costs": costs_snapshot,
-                }
-                with open(self.details_file, "a") as jf:
-                    jf.write(json.dumps(details_row) + "\n")
-            except Exception as _:
-                pass  # don't interrupt training for logging hiccups
-
-            # Save a representative plan every 1000 steps (now with constraints + duals)
-            if self.step % 1000 == 0:
-                rep_agent = env.agents[0]
-                rep_data = env.collected_plans[env.current_step].get(rep_agent, {})
-                plan_path = os.path.join(self.plan_dir, f"{self.scheme_id}_epoch_{self.epoch_idx}_step_{self.step}.json")
-                with open(plan_path, "w") as f:
-                    json.dump({
-                        "step": int(self.step),
-                        "schedule_plan": rep_data.get("schedule_plan", []),
-                        "power_plan": rep_data.get("power_plan", {}),
-                        "constraints": constraints_status,
-                        "duals": duals_snapshot,
-                        "leftovers": env.get_last_leftovers() if hasattr(env, "get_last_leftovers") else None,
-                    }, f, indent=2)
-
-            # TensorBoard scalars (new)
-            self.writer.add_scalar("step/avg_total_energy", avg_total_energy, self.num_timesteps)
-            self.writer.add_scalar("step/avg_network_load", avg_network_load, self.num_timesteps)
-            self.writer.add_scalar("step/metric_time", avg_time, self.num_timesteps)
-            self.writer.add_scalar("step/leftovers", leftovers_count, self.num_timesteps)
-            self.writer.add_scalar("step/proj_frac", proj_frac, self.num_timesteps)
-
-            # Keep your existing TB metrics too
-            self.writer.add_scalar("step/avg_reward", avg_reward, self.num_timesteps)
-            self.writer.add_scalar("step/avg_ttft", avg_ttft, self.num_timesteps)
-            self.writer.add_scalar("step/avg_carbon", avg_carbon, self.num_timesteps)
-            self.writer.add_scalar("step/avg_water", avg_water, self.num_timesteps)
-            self.writer.add_scalar("step/avg_cost", avg_cost, self.num_timesteps)
-
-            self.step += 1
-
-        except Exception as e:
-            print(f"[CustomLogger ❌] Step logging error: {e}", flush=True)
-
-        return True
-
-    def _on_rollout_end(self) -> None:
-        try:
-            n = len(self.episode_rewards)
-            if n == 0:
-                print("[CustomLogger] No steps recorded.")
-                return
-
-            def _avg(key): return float(np.mean(self.episode_metrics[key])) if self.episode_metrics[key] else 0.0
-
-            avg_reward = float(np.mean(self.episode_rewards))
-            avg_ttft = _avg("ttft")
-            avg_carbon = _avg("carbon")
-            avg_water = _avg("water")
-            avg_cost = _avg("cost")
-            avg_total_energy = _avg("total_energy")
-            avg_network_load = _avg("network_load")
-            avg_time = _avg("metric_time")
-            avg_leftovers = _avg("leftovers")
-            avg_proj_frac = _avg("proj_frac")
-
-            # Per-profile summary CSV (single-row)
-            with open(self.summary_file, "w") as f:
-                f.write("epoch,avg_reward,avg_ttft,avg_carbon,avg_water,avg_cost,avg_total_energy,avg_network_load,avg_metric_time,avg_leftovers,avg_proj_frac\n")
-                f.write(f"{self.epoch_idx},{avg_reward:.4f},{avg_ttft:.4f},{avg_carbon:.2f},{avg_water:.2f},{avg_cost:.4f},{avg_total_energy:.4f},{avg_network_load:.4f},{avg_time:.4f},{avg_leftovers:.2f},{avg_proj_frac:.4f}\n")
-
-            # Legacy combined (kept to avoid breaking downstream tools)
-            with open(self.combined_summary_file, "a") as f:
-                f.write(f"{self.scheme_id},{self.epoch_idx},{avg_reward:.4f},{avg_ttft:.4f},{avg_carbon:.2f},{avg_water:.2f},{avg_cost:.4f}\n")
-
-            # New combined V2 with extra metrics
-            with open(self.combined_summary_file_v2, "a") as f:
-                f.write(f"{self.scheme_id},{self.epoch_idx},{avg_reward:.4f},{avg_ttft:.4f},{avg_carbon:.2f},{avg_water:.2f},{avg_cost:.4f},{avg_total_energy:.4f},{avg_network_load:.4f},{avg_time:.4f},{avg_leftovers:.2f},{avg_proj_frac:.4f}\n")
-
-            # TensorBoard rollout summaries (new + legacy)
-            self.writer.add_scalar("rollout/avg_reward", avg_reward, self.num_timesteps)
-            self.writer.add_scalar("rollout/avg_ttft", avg_ttft, self.num_timesteps)
-            self.writer.add_scalar("rollout/avg_carbon", avg_carbon, self.num_timesteps)
-            self.writer.add_scalar("rollout/avg_water", avg_water, self.num_timesteps)
-            self.writer.add_scalar("rollout/avg_cost", avg_cost, self.num_timesteps)
-            self.writer.add_scalar("rollout/avg_total_energy", avg_total_energy, self.num_timesteps)
-            self.writer.add_scalar("rollout/avg_network_load", avg_network_load, self.num_timesteps)
-            self.writer.add_scalar("rollout/avg_metric_time", avg_time, self.num_timesteps)
-            self.writer.add_scalar("rollout/avg_leftovers", avg_leftovers, self.num_timesteps)
-            self.writer.add_scalar("rollout/avg_proj_frac", avg_proj_frac, self.num_timesteps)
-
-            # Plots (keep your existing behavior; add plots for new metrics)
-            metric_map = {
-                "reward": self.episode_rewards,
-                "ttft": self.episode_metrics["ttft"],
-                "carbon": self.episode_metrics["carbon"],
-                "water": self.episode_metrics["water"],
-                "cost": self.episode_metrics["cost"],
-                "total_energy": self.episode_metrics["total_energy"],
-                "network_load": self.episode_metrics["network_load"],
-                "metric_time": self.episode_metrics["metric_time"],
-                "leftovers": self.episode_metrics["leftovers"],
-                "proj_frac": self.episode_metrics["proj_frac"],
-            }
-
-            window = 20
-            for key, values in metric_map.items():
-                if not values:
-                    continue
-                steps = list(range(len(values)))
-                raw_series = pd.Series(values, dtype=float)
-                smoothed = raw_series.rolling(window=window).mean()
-
-                fig, ax = plt.subplots(figsize=(10, 5))
-                ax.plot(steps, values, label=f"{key.capitalize()} (Raw)", alpha=0.4)
-                ax.plot(steps, smoothed, label=f"{key.capitalize()} (Smoothed)", linewidth=2)
-                ax.set_title(f"{key.capitalize()} over Steps – {self.scheme_id} (Epoch {self.epoch_idx})")
-                ax.set_xlabel("Step")
-                ax.set_ylabel(key.replace('_', ' ').capitalize())
-                ax.grid(True)
-                ax.legend()
-                plt.tight_layout()
-                plot_path = os.path.join(self.plot_dir, f"{self.scheme_id}_epoch_{self.epoch_idx}_{key}.png")
-                plt.savefig(plot_path)
-                plt.close(fig)
-
-                print(f"[CustomLogger ✅] Saved {key} plot → {plot_path}", flush=True)
-
-            print(f"[CustomLogger ✅] Logged rollout summary + plots for '{self.scheme_id}'", flush=True)
-
-        except Exception as e:
-            print(f"[CustomLogger ❌] Rollout summary logging error: {e}", flush=True)
-
-    def _on_training_end(self) -> None:
-        self.writer.flush()
-        self.writer.close()
-        print(f"[CustomLogger ✅] Training finished for '{self.scheme_id}'", flush=True)
-
-
-def get_memory_usage():
-    return psutil.Process(os.getpid()).memory_info().rss / 1024 ** 2  # in MB
-
-def monitor_memory(agent_id, stop_event, epoch_idx):
-    log_file = f"memlog_{agent_id}.txt"
-    while not stop_event.is_set():
-        process = psutil.Process(os.getpid())
-        used = process.memory_info().rss / 1024 ** 2  # in MB
-        mem = psutil.virtual_memory()
-
-        msg_lines = [
-            f"[{agent_id}] Memory Report @ {datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
-            f"  Current Epoch   : {epoch_idx}",
-            f"  Process RAM     : {used:.2f} MB",
-            f"  Total RAM       : {mem.total / (1024 ** 2):.2f} MB",
-            f"  Available RAM   : {mem.available / (1024 ** 2):.2f} MB",
-            f"  Used RAM        : {mem.used / (1024 ** 2):.2f} MB",
-            f"  RAM Usage %     : {mem.percent:.2f}%\n"
-        ]
-
-        msg = "\n".join(msg_lines)
-        print(msg, flush=True)
-
-        with open(log_file, "a") as f:
-            f.write(msg + "\n")
-
-        time.sleep(90)
-
-def train_reward_scheme(scheme_id, env_config, total_timesteps=100_000, save_dir="trained_models/sb3_agents"):
-    """
-    Trains a single profile (formerly 'scheme') named `scheme_id`.
-
-    IMPORTANT:
-      - `env_config` MUST include: env_config["agent_specs"] = {<profile_name>: {...}, ...}
-      - This function will set env_config["active_agent_profile"] = scheme_id (non-destructively).
-    """
-
-    print(f"Training reward scheme: {scheme_id}", flush=True)
-
-    # --- Validate new config surface ---
-    if "agent_specs" not in env_config or not isinstance(env_config["agent_specs"], dict):
-        raise ValueError(
-            "env_config must include 'agent_specs' (dict of profiles). "
-            "Example: env_config['agent_specs'] = {'time_under_slo': {...}, ...}"
+            last_ttft = float(
+                self._last_metrics.get("avg_ttft_sec", self._last_metrics.get("avg_ttft", 0.0))
+            )
+            last_carbon = float(self._last_metrics.get("carbon_emissions", 0.0))
+            last_water = float(self._last_metrics.get("water_usage", 0.0))
+            last_cost = float(self._last_metrics.get("energy_cost", 0.0))
+            last_total_energy = float(
+                self._last_metrics.get("total_energy", self._last_metrics.get("energy_kwh", 0.0))
+            )
+            last_network_load = float(self._last_metrics.get("avg_net_latency_ms", 0.0))
+
+        last_features = np.array(
+            [
+                last_ttft,
+                last_carbon,
+                last_water,
+                last_cost,
+                last_total_energy,
+                last_network_load,
+            ],
+            dtype=np.float32,
         )
-    if scheme_id not in env_config["agent_specs"]:
-        raise KeyError(f"Profile '{scheme_id}' not found in env_config['agent_specs'] keys: "
-                       f"{list(env_config['agent_specs'].keys())}")
 
-    # --- Prepare env config (non-destructive copy) ---
-    cfg = dict(env_config)
-    cfg["active_agent_profile"] = scheme_id
-    # DO NOT set 'reward_agent_type' anymore; the env ignores it
+        # Duals (if included)
+        dual_vec = np.zeros(len(self.constraints), dtype=np.float32)
+        if self.include_duals_in_obs and self.constraints:
+            for i, cname in enumerate(self.constraints.keys()):
+                dual_vec[i] = float(self.duals.get(cname, 0.0))
 
-    raw_env = ResourceEnv(cfg)
-    death_wrapped = black_death_v3(raw_env)
-    vec_env = supersuit.pettingzoo_env_to_vec_env_v1(death_wrapped)
-    venv = supersuit.concat_vec_envs_v1(vec_env, num_vec_envs=2, base_class="stable_baselines3")
+        # Build per-agent observation
+        for dc_idx, agent in enumerate(self.agents):
+            agent_one_hot = np.zeros(self.NUM_DATACENTERS, dtype=np.float32)
+            agent_one_hot[dc_idx] = 1.0
 
-    # --- Paths per profile ---
-    model_path = os.path.join(save_dir, scheme_id)
-    os.makedirs(model_path, exist_ok=True)
-    final_model_file = os.path.join(model_path, "final_model.zip")
-    latest_checkpoint = os.path.join(model_path, "ppo_agent_latest.zip")
+            vec = np.concatenate(
+                [
+                    np.array([norm_7b, norm_70b], dtype=np.float32),
+                    last_features,
+                    dual_vec,
+                    agent_one_hot,
+                ],
+                axis=0,
+            )
+            obs[agent] = vec
 
-    agent_list = raw_env.agents
-    logger_callback = CustomLoggerCallback(scheme_id, cfg["epoch_idx"], model_path, agent_list)
+        return obs
 
-    checkpoint_callback = CheckpointCallback(
-        save_freq=10_000,
-        save_path=model_path,
-        name_prefix="ppo_agent",
-        save_replay_buffer=False,
-        save_vecnormalize=False,
-    )
-
-    callbacks = [checkpoint_callback, logger_callback]
-
-    # --- (Re)load model if present ---
-    if Path(final_model_file).exists():
-        print(f"Resuming from existing model: {final_model_file}", flush=True)
-        model = PPO.load(final_model_file, env=venv, verbose=1, n_steps=64, batch_size=64, device="cpu")
-    elif Path(latest_checkpoint).exists():
-        print(f"Resuming from latest checkpoint: {latest_checkpoint}", flush=True)
-        model = PPO.load(latest_checkpoint, env=venv, verbose=1, n_steps=64, batch_size=64, device="cpu")
-    else:
-        print(f"Starting fresh for scheme: {scheme_id}", flush=True)
-        model = PPO(MlpPolicy, env=venv, verbose=1, n_steps=64, batch_size=64, device="cpu")
-
-    # --- Optional memory monitor (kept as in your code) ---
-    stop_event = threading.Event()
-    monitor_thread = threading.Thread(target=monitor_memory, args=(scheme_id, stop_event, cfg["epoch_idx"]))
-    monitor_thread.start()
-
-    try:
-        print(f"[{scheme_id}] Memory before training: {get_memory_usage():.2f} MB", flush=True)
-        model.learn(total_timesteps=total_timesteps, callback=callbacks)
-        print(f"[{scheme_id}] Memory after training: {get_memory_usage():.2f} MB", flush=True)
-    except Exception as e:
-        print(f"[{scheme_id}] Training failed: {e}", flush=True)
-        traceback.print_exc()
-    finally:
-        model.save(final_model_file, exclude=["replay_buffer", "optimizer"])
-        print(f"✅ Finished training {scheme_id} — saved to {final_model_file}", flush=True)
-
-        stop_event.set()
-        monitor_thread.join()
-
-        del model, venv, vec_env, death_wrapped, raw_env
-        gc.collect()
-        print(f"[{scheme_id}] Post-cleanup memory: {get_memory_usage():.2f} MB", flush=True)
-
-    return None
+    # ------------------------------------------------------------------
+    # Accessor for last metrics (used after running an episode)
+    # ------------------------------------------------------------------
+    def get_last_metrics(self) -> Optional[Dict[str, Any]]:
+        return self._last_metrics
 
 
 
-import multiprocessing
 
-def train_reward_scheme_wrapper(agent_id, env_config, total_timesteps):
-    # env_config is expected to already contain 'agent_specs'
-    return train_reward_scheme(agent_id, env_config, total_timesteps=total_timesteps)
+# ======================================================================
+# Inference helper used by simulator_LLM
+# ======================================================================
 
-def train_all_schemes(epoch_df,
-                      epoch_summary,
-                      epoch_idx,
-                      node_properties,
-                      agent_specs,                # <-- NEW required arg (dict of profiles)
-                      num_datacenters=12,
-                      total_timesteps=100_000):
+def run_multiagent(
+    epoch_df: pd.DataFrame,
+    epoch_summary: Dict[str, Any],
+    epoch_idx: int,
+    node_properties: Dict[str, Any],
+    model_base_path: str = "trained_models/sb3_agents",
+) -> Dict[str, Dict[str, Any]]:
     """
-    Trains all profiles listed in `agent_specs` (dict), keeping the original function name.
+    Run all trained MARL profiles for a single epoch and return
+    profile_id -> metrics dict.
 
-    Example `agent_specs`:
-    {
-      "time_under_slo": {
-        "weights": {"ttft": 10, "carbon": 0, "water": 0, "cost": 0},
-        "constraints": {
-          "slo_violation_rate": {"budget": 0.25, "scope": "global", "window": "episode", "hard": False}
-        },
-        "lambda_init": {"slo_violation_rate": 0.0},
-        "lambda_lr": {"slo_violation_rate": 0.005},
-        "include_duals_in_obs": True
-      },
-      "carbon_capped": {
-        "weights": {"ttft": 7, "carbon": 2, "water": 0, "cost": 1},
-        "constraints": {
-          "carbon": {"budget": 2.2e5, "scope": "global", "window": "episode", "hard": False, "budget_units": "raw"}
-        }
-      }
-    }
+    Mirrors the training env construction:
+        raw_env      = ResourceEnv(cfg)
+        death_wrapped = black_death_v3(raw_env)
+        vec_env      = pettingzoo_env_to_vec_env_v1(death_wrapped)
+        venv         = concat_vec_envs_v1(vec_env, num_vec_envs=1, base_class="stable_baselines3")
+
+    NOTE: Episodes are single-step, so we do exactly one predict+step.
     """
 
-    reward_schemes = list(agent_specs.keys())
-
-    base_env_config = {
-        "epoch_df": epoch_df,
-        "epoch_summary": epoch_summary,
-        "epoch_idx": epoch_idx,
-        "node_properties": node_properties,
-        "num_datacenters": num_datacenters,
-        "max_steps": 50,
-        "agent_specs": agent_specs,  # <- pass through
-        # 'active_agent_profile' gets set inside train_reward_scheme
-    }
-
-    for scheme_id in reward_schemes:
-        print(f"\n==== Training reward scheme: {scheme_id} ====")
-        p = multiprocessing.Process(
-            target=train_reward_scheme_wrapper,
-            args=(scheme_id, base_env_config, total_timesteps),
-        )
-        p.start()
-        p.join()
-
-
-from concurrent.futures import ProcessPoolExecutor, as_completed
-import os
-
-
-def timed(name):
-    def wrapper(func):
-        def inner(*args, **kwargs):
-            start = time.perf_counter()
-            result = func(*args, **kwargs)
-            end = time.perf_counter()
-            print(f"[⏱️ {name}] Took {end - start:.4f} seconds")
-            return result
-        return inner
-    return wrapper
-
-def run_agent_inference(agent_id, epoch_df, epoch_summary, epoch_idx, node_properties,
-                        model_base_path="trained_models/sb3_agents"):
-    import os
-    import numpy as np
-    from stable_baselines3 import PPO
-    import supersuit
-    from supersuit import black_death_v3
-
-    # Build/derive agent_specs and num_datacenters
+    # --- Determine which profiles to run ---
     try:
-        from simulator_LLM import build_agent_specs
-        if isinstance(epoch_summary, dict) and "num_datacenters" in epoch_summary:
-            num_dc = int(epoch_summary["num_datacenters"])
+        from simulator_LLM import build_agent_specs  # defines profiles
+
+        # Infer number of datacenters
+        if isinstance(epoch_summary, dict):
+            if "num_datacenters" in epoch_summary:
+                num_dc = int(epoch_summary["num_datacenters"])
+            elif "datacenters" in epoch_summary:
+                num_dc = int(len(epoch_summary["datacenters"]))
+            else:
+                try:
+                    num_dc = int(epoch_df["source_dc_id"].max()) + 1
+                except Exception:
+                    num_dc = 12
         else:
             try:
                 num_dc = int(epoch_df["source_dc_id"].max()) + 1
             except Exception:
                 num_dc = 12
+
         agent_specs = build_agent_specs(num_datacenters=num_dc)
+        profile_ids = list(agent_specs.keys())
     except Exception:
-        # Minimal default profiles if builder isn’t available
+        # Fallback if build_agent_specs is unavailable
+        num_dc = 12
         agent_specs = {
             "time_agent":   {"weights": {"ttft": 10}},
             "carbon_agent": {"weights": {"carbon": 10}},
             "water_agent":  {"weights": {"water": 10}},
             "cost_agent":   {"weights": {"cost": 10}},
         }
-        num_dc = 12
+        profile_ids = list(agent_specs.keys())
 
-    # === REQUIRED by ResourceEnv (__init__) ===
-    # - active_agent_profile
-    # - agent_specs
-    # - epoch_df, node_properties, epoch_idx, num_datacenters, epoch_summary
-    config = {
-        "epoch_df": epoch_df,
-        "node_properties": node_properties,
-        "epoch_idx": epoch_idx,
-        "num_datacenters": num_dc,
-        "max_steps": 1,                # single decision/step per inference
-        "epoch_summary": epoch_summary,
-        "active_agent_profile": agent_id,  # <— this fixes your KeyError
-        "agent_specs": agent_specs,        # <— profiles dictionary
-    }
+    results: Dict[str, Dict[str, Any]] = {}
 
-    # Build env and keep a handle to the raw ResourceEnv to collect metrics
-    raw_env = ResourceEnv(config)  # uses config["active_agent_profile"] immediately:contentReference[oaicite:1]{index=1}
-    env = black_death_v3(raw_env)
-    vec = supersuit.pettingzoo_env_to_vec_env_v1(env)
-    venv = supersuit.concat_vec_envs_v1(vec, num_vec_envs=1, base_class="stable_baselines3")
+    for profile_id in profile_ids:
+        # Look for either <profile>.zip or <profile>/final_model.zip
+        model_path = os.path.join(model_base_path, f"{profile_id}.zip")
+        if not os.path.isfile(model_path):
+            alt_path = os.path.join(model_base_path, profile_id, "final_model.zip")
+            if os.path.isfile(alt_path):
+                model_path = alt_path
+            else:
+                # Skip profiles without a trained model
+                continue
 
-    # Load trained policy for this agent/profile
-    # Try final model; you can add checkpoint fallback if needed
-    model_file = os.path.join(model_base_path, agent_id, "final_model.zip")
-    model = PPO.load(model_file, env=venv, device="cpu")
+        print(f"[MARL EVAL] Running profile '{profile_id}' on epoch {epoch_idx}")
 
-    # Roll one episode (max_steps=1 → one predict/step)
-    obs = venv.reset()
-    action, _ = model.predict(obs, deterministic=True)
-    obs, rewards, dones, infos = venv.step(action)
+        config = {
+            "epoch_df": epoch_df,
+            "node_properties": node_properties,
+            "epoch_idx": epoch_idx,
+            "num_datacenters": num_dc,
+            "epoch_summary": epoch_summary,
+            "agent_specs": agent_specs,
+            "active_agent_profile": profile_id,
+            "max_steps": 1,
+        }
 
-    # Fetch metrics produced by the simulator inside the env step
-    metrics = raw_env.get_last_metrics() or {}
-    return agent_id, metrics
+        # Build env same as in training
+        raw_env = ResourceEnv(config)
+        death_wrapped = black_death_v3(raw_env)
+        vec_env = pettingzoo_env_to_vec_env_v1(death_wrapped)
+        venv = concat_vec_envs_v1(
+            vec_env,
+            num_vec_envs=1,
+            num_cpus=1,
+            base_class="stable_baselines3",
+        )
 
+        # Force model to CPU for evaluation (simple & avoids CUDA issues)
+        model = PPO.load(model_path, env=venv, device="cpu")
 
-import cloudpickle
+        # Single-step episode: reset -> predict -> step once
+        obs = venv.reset()
+        action, _ = model.predict(obs, deterministic=True)
+        obs, reward, done, info = venv.step(action)
 
-def run_multiagent(epoch_df, epoch_summary, epoch_idx, node_properties,
-                   model_base_path="trained_models/sb3_agents"):
-    # --- Determine which profiles to run ---
-    try:
-        from simulator_LLM import build_agent_specs  # your helper that defines profiles
-        # Infer number of datacenters (prefer explicit, fall back to data)
-        if isinstance(epoch_summary, dict) and "num_datacenters" in epoch_summary:
-            num_dc = int(epoch_summary["num_datacenters"])
-        else:
-            try:
-                num_dc = int(epoch_df["source_dc_id"].max()) + 1
-            except Exception:
-                num_dc = 12  # sensible default
-        agent_specs = build_agent_specs(num_datacenters=num_dc)
-        agent_ids = list(agent_specs.keys())
-    except Exception:
-        # Fallback to base agents if helper isn't available
-        agent_ids = ["time_agent", "carbon_agent", "water_agent", "cost_agent"]
+        # After episode, ResourceEnv cached metrics on the underlying raw_env
+        metrics = raw_env.get_last_metrics()
+        if metrics is None or metrics == {}:
+            # If that failed, fall back to parsing `info` from the VecEnv
+            # (the env puts per-agent metrics under "raw_metrics")
+            extracted = None
 
-    results = {}
-    print("[Multiagent] Running agents one by one (no multiprocessing)...")
+            # VecEnv usually returns list[dict] for info; handle both list/dict
+            if isinstance(info, (list, tuple)) and len(info) > 0:
+                info0 = info[0]
+            else:
+                info0 = info
 
-    for agent_id in agent_ids:
-        try:
-            agent_id, metrics = run_agent_inference(
-                agent_id, epoch_df, epoch_summary, epoch_idx, node_properties, model_base_path
-            )
-            results[agent_id] = metrics
-        except Exception as e:
-            print(f"[Multiagent] ERROR: Exception during inference for {agent_id}: {e}")
-            results[agent_id] = {"error": str(e)}
+            if isinstance(info0, dict):
+                # Case A: flattened "raw_metrics" at top level
+                if "raw_metrics" in info0:
+                    extracted = info0["raw_metrics"]
+                else:
+                    # Case B: dict of per-agent infos
+                    for v in info0.values():
+                        if isinstance(v, dict) and "raw_metrics" in v:
+                            extracted = v["raw_metrics"]
+                            break
 
-    print("[Multiagent] Inference complete.")
+            if extracted is not None:
+                rm = dict(extracted)
+                # Normalize into the keys simulator_LLM expects
+                metrics = {
+                    "avg_ttft_sec": float(rm.get("ttft", 0.0)),
+                    "avg_ttft": float(rm.get("ttft", 0.0)),
+                    "carbon_emissions": float(rm.get("carbon_emissions", 0.0)),
+                    "water_usage": float(rm.get("water_usage", 0.0)),
+                    "energy_cost": float(rm.get("energy_cost", 0.0)),
+                    "total_energy": float(rm.get("total_energy", rm.get("energy_kwh", 0.0))),
+                    "avg_net_latency_ms": float(rm.get("network_load", 0.0)),
+                }
+            else:
+                # Still nothing – last resort: an empty dict so caller doesn't see None
+                print("[MARL EVAL] WARNING: Could not extract metrics from env or info for "
+                      f"profile '{profile_id}' on epoch {epoch_idx}")
+                metrics = {}
+
+        results[profile_id] = metrics
+
+        venv.close()
+        print(f"[MARL EVAL] Finished profile '{profile_id}'")
+        results[profile_id] = metrics
+
+        venv.close()
+        print(f"[MARL EVAL] Finished profile '{profile_id}'")
+
     return results
 
 
 
 
-# def train_marl_agents(env, total_timesteps=100000, save_path="trained_models/marl_agents"):
-#     os.makedirs(save_path, exist_ok=True)
-#     vec_env = supersuit.pettingzoo_env_to_vec_env_v1(env)
-#     concat_env = supersuit.concat_vec_envs_v1(vec_env, num_vec_envs=1, num_cpus=6, base_class="stable_baselines3")
-#
-#     agent_models = {}
-#     for agent in env.agents:
-#         model = PPO(
-#             policy="MlpPolicy",
-#             env=concat_env,
-#             learning_rate=3e-4,
-#             n_steps=2048,
-#             batch_size=64,
-#             n_epochs=10,
-#             gamma=0.99,
-#             gae_lambda=0.95,
-#             clip_range=0.2,
-#         )
-#
-#         obs, info = env.reset()
-#
-#         # for _ in range(1):
-#         #     action, _ = model.predict(obs, deterministic=True)
-#         #
-#         #     # Debug: Check Action Dtype Before Passing to Step Function
-#         #     print(f"DEBUG: {agent} - SB3 Raw Action Before Step: {action}, dtype: {action.dtype}")
-#         #
-#         #     # Ensure Action is `int8` before sending to step
-#         #     action = action.astype(np.int8)
-#         #     print(f"DEBUG: {agent} - Action After Cast: {action}, dtype: {action.dtype}")
-#         #
-#         #     obs, rewards, dones, infos = env.step(action)
-#         #
-#         #     obs_dict = {agent: obs[i] for i, agent in enumerate(env.agents)}
-#         #
-#         #
-#         #     for agent_id, obs_val in obs_dict.items():
-#         #         print(f"DEBUG: {agent_id} - Observation dtype: {obs_val.dtype}, Shape: {obs_val.shape}")
-#
-#         model.learn(total_timesteps=total_timesteps)
-#
-#         model_path = os.path.join(save_path, f"{agent}.zip")
-#         model.save(model_path)
-#
-#         agent_models[agent] = model
-#
-#     return agent_models
 
-def main():
-    # Test Configuration
-    fake_func_invocations = np.array([
-        np.linspace(10, 100, 901),
-        np.linspace(5, 50, 901)
-    ])
-    config = {
-        "number_of_nodes": 8,
-        "max_steps": 10,
-        "epoch_idx": 0,
-        "func_distribution_arr": fake_func_invocations
+# ======================================================================
+# Framework entrypoint for simulator_LLM
+# ======================================================================
+
+def milp_optimizer(
+    epoch_data,
+    epoch_idx: int,
+    node_properties: Dict[str, Any],
+    epoch_summary: Dict[str, Any],
+):
+    """
+    Make MARL look like a traditional "framework" to simulator_LLM.
+
+    This is called once per epoch, runs each trained profile via run_multiagent,
+    picks a preferred profile's metrics to report, and returns the standard
+    (stats, results, leftovers) triple expected by simulator_LLM.
+    """
+    if isinstance(epoch_data, pd.DataFrame):
+        df = epoch_data
+    else:
+        df = pd.DataFrame(epoch_data)
+
+    profile_metrics = run_multiagent(
+        df,
+        epoch_summary,
+        epoch_idx,
+        node_properties,
+    )
+
+    if not profile_metrics:
+        empty = {
+            "processed_tokens": 0.0,
+            "avg_ttft_sec": 0.0,
+            "avg_ttft": 0.0,
+            "energy_kwh": 0.0,
+            "total_energy": 0.0,
+            "energy_cost": 0.0,
+            "carbon_emissions": 0.0,
+            "water_usage": 0.0,
+        }
+        # was: return empty, [], {}
+        return empty, {}, {}
+
+    # Preference order when reporting framework stats
+    preference = [
+        "green_perf",
+        "cost_guard",
+        "water_saver",
+        "peak_power_guard",
+        "time_agent",
+        "carbon_agent",
+        "water_agent",
+        "cost_agent",
+    ]
+    chosen_id = None
+    for name in preference:
+        if name in profile_metrics:
+            chosen_id = name
+            break
+    if chosen_id is None:
+        chosen_id = next(iter(profile_metrics.keys()))
+
+    stats = dict(profile_metrics.get(chosen_id, {}))
+
+    # Normalize key names so simulator_LLM aggregation works
+    if "avg_ttft_sec" not in stats and "avg_ttft" in stats:
+        stats["avg_ttft_sec"] = float(stats["avg_ttft"])
+    if "avg_ttft" not in stats and "avg_ttft_sec" in stats:
+        stats["avg_ttft"] = float(stats["avg_ttft_sec"])
+
+    if "energy_kwh" in stats and "total_energy" not in stats:
+        stats["total_energy"] = float(stats["energy_kwh"])
+
+    # was: return stats, [], {}
+    return stats, profile_metrics, {}
+
+
+# ======================================================================
+# Simple training helper
+# ======================================================================
+
+def make_training_vec_env(
+    profile_id: str,
+    agent_specs: Dict[str, Dict[str, Any]],
+    epoch_df: pd.DataFrame,
+    epoch_summary: Dict[str, Any],
+    epoch_idx: int,
+    node_properties: Dict[str, Any],
+    num_datacenters: int,
+    num_envs: int = 1,
+):
+    """
+    Build a vectorized SB3-compatible env for a single profile.
+
+    Pattern requested by user:
+        raw_env      = ResourceEnv(cfg)
+        death_wrapped = black_death_v3(raw_env)
+        vec_env      = pettingzoo_env_to_vec_env_v1(death_wrapped)
+        venv         = concat_vec_envs_v1(vec_env, num_vec_envs=..., base_class='stable_baselines3')
+    """
+    if not isinstance(epoch_df, pd.DataFrame):
+        epoch_df = pd.DataFrame(epoch_df)
+
+    cfg = {
+        "epoch_df": epoch_df,
+        "node_properties": node_properties,
+        "epoch_idx": epoch_idx,
+        "num_datacenters": num_datacenters,
+        "epoch_summary": epoch_summary,
+        "agent_specs": agent_specs,
+        "active_agent_profile": profile_id,
+        "max_steps": 1,
     }
 
-    env = ResourceEnv(config)
+    # Base ParallelEnv
+    raw_env = ResourceEnv(cfg)
 
-    observations = env.reset()
-    print("\n Initial Observations:", observations)
+    # Black-death wrapper so agents that “die” still produce valid obs/rewards
+    death_wrapped = black_death_v3(raw_env)
 
-    # Run a few test steps
-    for step in range(config["max_steps"]):
-        print(f"\n Step {step + 1}")
+    # PettingZoo -> SB3 VecEnv
+    vec_env = pettingzoo_env_to_vec_env_v1(death_wrapped)
 
-        # Generate a random action (MultiBinary action per agent)
-        actions = {agent: env.action_spaces[agent].sample() for agent in env.agents}
+    # Optionally replicate to multiple vector envs
+    if num_envs > 1:
+        vec_env = concat_vec_envs_v1(
+            vec_env,
+            num_vec_envs=num_envs,
+            num_cpus=num_envs,
+            base_class="stable_baselines3",
+        )
+    else:
+        # Keep interface symmetric: still return a VecEnv
+        vec_env = concat_vec_envs_v1(
+            vec_env,
+            num_vec_envs=1,
+            num_cpus=1,
+            base_class="stable_baselines3",
+        )
 
-        # Step the environment
-        observations, rewards, dones, infos = env.step(actions)
-
-        print("Actions:", actions)
-        print("Observations:", observations)
-        print("Rewards:", rewards)
-        print("Dones:", dones)
-
-        if all(dones.values()):
-            print("\n Finished")
-            break
-
-if __name__ == "__main__":
-    main()
+    return vec_env
 
 
-# class TimeEnv(gym.Env):
-#     def __init__(self, config=None):
-#         super().__init__()
-#         if config is None:
-#             config = {}
-#
-#         self.rng = seed
-#         self.num_nodes = config.get("number_of_nodes", 8)
-#
-#         self.action_space = spaces.MultiBinary(self.num_nodes)
-#
-#         self.observation_space = spaces.Box(
-#             low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32
-#         )
-#
-#         self.epoch_idx = config.get("epoch_idx", 0)
-#         # Internal counters / arrays
-#         self.current_step = 0
-#         self.prev_action = 0
-#         self.prev_reward = 0.0
-#         self.max_steps = config.get("max_steps", 20)
-#
-#         self.vm_distribution_arr = config.get("vm_distribution_arr", np.zeros((8, 901)))
-#         self.new_vm_distribution_arr = copy.deepcopy(self.vm_distribution_arr)
-#         self.func_distribution_arr = config.get("func_distribution_arr", np.zeros((3, 901)))
-#         self.leftover_resource_time_arr = config.get("leftover_resource_time_arr", np.zeros((8, 901)))
-#         self.func_priority_list = config.get("func_priority_list", [0,1])
-#         self.lut_list = config.get("lut_list", [])
-#
-#     def seed(self, seed=None):
-#         self.rng = seed
-#
-#     def reset(self, *, seed=None, options=None):
-#         super().reset(seed=seed)
-#         self.current_step = 0
-#
-#         self.leftover_resource_time_arr.fill(0.0)
-#         obs = self._get_obs()
-#         info = {}
-#         return obs, info
-#
-#     def step(self, action):
-#         self.current_step += 1
-#
-#         self.new_vm_distribution_arr[self.epoch_idx, :] = action
-#
-#         (
-#             cumulative_resource_time_arr,
-#             average_time_to_first_token,
-#             total_carbon_emissions,
-#             total_water_usage,
-#             total_invocation_served,
-#             updated_vm_distribution_arr
-#         ) = simulation(
-#             vm_distribution_arr=self.vm_distribution_arr,
-#             new_vm_distribution_arr=self.new_vm_distribution_arr,
-#             func_distribution_arr=self.func_distribution_arr,
-#             leftover_resource_time_arr=self.leftover_resource_time_arr,
-#             func_priority_list=self.func_priority_list,
-#             lut_list=self.lut_list
-#         )
-#
-#
-#         self.vm_distribution_arr = updated_vm_distribution_arr
-#         # leftover_resource_time_arr for next step
-#         self.leftover_resource_time_arr = cumulative_resource_time_arr[:, epoch_length:]
-#
-#
-#
-#         reward = -float(average_time_to_first_token)
-#         terminated = (self.current_step >= self.max_steps)
-#         truncated = False
-#
-#         self.prev_action = float(self.multi_binary_to_int(action))
-#         self.prev_reward = float(reward)
-#
-#         obs = self._get_obs()
-#
-#         info = {"time_val": average_time_to_first_token}
-#         return obs, reward, terminated, truncated, info
-#
-#     def _get_obs(self):
-#
-#         obs = np.array([
-#             self.prev_action,
-#             self.prev_reward,
-#             self.current_step
-#         ], dtype=np.float32)
-#         return obs
-#
-#     def multi_binary_to_int(self, action):
-#         bit_string = ''.join(str(int(a)) for a in action)
-#         return int(bit_string, 2)
-#
-#
 
-# class CarbonEnv(gym.Env):
-#     def __init__(self, config=None):
-#         super().__init__()
-#         if config is None:
-#             config = {}
-#
-#         self.rng = seed
-#         self.num_nodes = config.get("number_of_nodes", 8)
-#
-#         self.action_space = spaces.MultiBinary(self.num_nodes)
-#
-#         self.observation_space = spaces.Box(
-#             low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32
-#         )
-#
-#         self.epoch_idx = config.get("epoch_idx", 0)
-#
-#         self.current_step = 0
-#         self.prev_action = 0
-#         self.prev_reward = 0.0
-#         self.max_steps = config.get("max_steps", 20)
-#
-#         self.vm_distribution_arr = config.get("vm_distribution_arr", np.zeros((8, 901)))
-#         self.new_vm_distribution_arr = copy.deepcopy(self.vm_distribution_arr)
-#         self.func_distribution_arr = config.get("func_distribution_arr", np.zeros((3, 901)))
-#         self.leftover_resource_time_arr = config.get("leftover_resource_time_arr", np.zeros((8, 901)))
-#         self.func_priority_list = config.get("func_priority_list", [0,1])
-#         self.lut_list = config.get("lut_list", [])
-#
-#     def seed(self, seed=None):
-#         self.rng = seed
-#
-#     def reset(self, *, seed=None, options=None):
-#         super().reset(seed=seed)
-#         self.current_step = 0
-#         self.leftover_resource_time_arr.fill(0.0)
-#         obs = self._get_obs()
-#         info = {}
-#         return obs, info
-#
-#     def step(self, action):
-#         self.current_step += 1
-#         # print("epoch")
-#         # print(self.epoch_idx)
-#         # print("Action taken: ")
-#         # print(action)
-#         self.new_vm_distribution_arr[self.epoch_idx, :] = action
-#
-#         (
-#             cumulative_resource_time_arr,
-#             average_time_to_first_token,
-#             total_carbon_emissions,
-#             total_water_usage,
-#             total_invocation_served,
-#             updated_vm_distribution_arr
-#         ) = simulation(
-#             vm_distribution_arr=self.vm_distribution_arr,
-#             new_vm_distribution_arr=self.new_vm_distribution_arr,
-#             func_distribution_arr=self.func_distribution_arr,
-#             leftover_resource_time_arr=self.leftover_resource_time_arr,
-#             func_priority_list=self.func_priority_list,
-#             lut_list=self.lut_list
-#         )
-#
-#         self.vm_distribution_arr = updated_vm_distribution_arr
-#         self.leftover_resource_time_arr = cumulative_resource_time_arr[:, epoch_length:]
-#         # print("vm distribution: ")
-#         # print(self.vm_distribution_arr)
-#         # print("cumulative resource array: ")
-#         # print(cumulative_resource_time_arr)
-#         # print("leftover resource array")
-#         # print(self.leftover_resource_time_arr)
-#         # print("Carbon Emissions")
-#         # print(total_carbon_emissions)
-#         reward = -float(total_carbon_emissions)
-#
-#         terminated = (self.current_step >= self.max_steps)
-#         truncated = False
-#
-#         self.prev_action = float(self.multi_binary_to_int(action))
-#         self.prev_reward = float(reward)
-#         obs = self._get_obs()
-#         # print("observation space")
-#         # print(obs)
-#         info = {"carbon_val": total_carbon_emissions}
-#         return obs, reward, terminated, truncated, info
-#
-#     def _get_obs(self):
-#
-#         obs = np.array([
-#             self.prev_action,
-#             self.prev_reward,
-#             self.current_step
-#         ], dtype=np.float32)
-#         return obs
-#
-#     def multi_binary_to_int(self, action):
-#         bit_string = ''.join(str(int(a)) for a in action)
-#         return int(bit_string, 2)
-#
-#
-#
+# ======================================================================
+# PPO training helpers (used by simulator_LLM.train_marl_constrained_profiles)
+# ======================================================================
 
-# class WaterEnv(gym.Env):
-#     def __init__(self, config=None):
-#         super().__init__()
-#         if config is None:
-#             config = {}
-#
-#         self.rng = seed
-#         self.num_nodes = config.get("number_of_nodes", 8)
-#
-#         self.action_space = spaces.MultiBinary(self.num_nodes)
-#
-#         self.observation_space = spaces.Box(
-#             low=-np.inf, high=np.inf, shape=(3,), dtype=np.float32
-#         )
-#
-#         self.epoch_idx = config.get("epoch_idx", 0)
-#
-#         self.current_step = 0
-#         self.prev_action = 0
-#         self.prev_reward = 0.0
-#         self.max_steps = config.get("max_steps", 20)
-#
-#         self.vm_distribution_arr = config.get("vm_distribution_arr", np.zeros((901, 8)))
-#         self.new_vm_distribution_arr = copy.deepcopy(self.vm_distribution_arr)
-#         self.func_distribution_arr = config.get("func_distribution_arr", np.zeros((3, 901)))
-#         self.leftover_resource_time_arr = config.get("leftover_resource_time_arr", np.zeros((8, 901)))
-#         self.func_priority_list = config.get("func_priority_list", [0,1])
-#         self.lut_list = config.get("lut_list", [])
-#
-#     def seed(self, seed=None):
-#         self.rng = seed
-#
-#     def reset(self, *, seed=None, options=None):
-#         super().reset(seed=seed)
-#         self.current_step = 0
-#         self.leftover_resource_time_arr.fill(0.0)
-#         obs = self._get_obs()
-#         info = {}
-#         return obs, info
-#
-#     def step(self, action):
-#         self.current_step += 1
-#         self.new_vm_distribution_arr[self.epoch_idx, :] = action
-#
-#         (
-#             cumulative_resource_time_arr,
-#             average_time_to_first_token,
-#             total_carbon_emissions,
-#             total_water_usage,
-#             total_invocation_served,
-#             updated_vm_distribution_arr
-#         ) = simulation(
-#             vm_distribution_arr=self.vm_distribution_arr,
-#             new_vm_distribution_arr=self.new_vm_distribution_arr,
-#             func_distribution_arr=self.func_distribution_arr,
-#             leftover_resource_time_arr=self.leftover_resource_time_arr,
-#             func_priority_list=self.func_priority_list,
-#             lut_list=self.lut_list
-#         )
-#
-#         self.vm_distribution_arr = updated_vm_distribution_arr
-#         self.leftover_resource_time_arr = cumulative_resource_time_arr[:, epoch_length:]
-#
-#         reward = float(total_water_usage)
-#         terminated = (self.current_step >= self.max_steps)
-#         truncated = False
-#
-#         self.prev_action = float(self.multi_binary_to_int(action))
-#         self.prev_reward = float(reward)
-#
-#         obs = self._get_obs()
-#         info = {"water_val": total_water_usage}
-#         return obs, reward, terminated, truncated, info
-#
-#     def _get_obs(self):
-#
-#         obs = np.array([
-#             self.prev_action,
-#             self.prev_reward,
-#             self.current_step
-#         ], dtype=np.float32)
-#         return obs
-#
-#     def multi_binary_to_int(self, action):
-#         bit_string = ''.join(str(int(a)) for a in action)
-#         return int(bit_string, 2)
-#
+def train_reward_scheme(
+    profile_id: str,
+    *,
+    epoch_df: pd.DataFrame,
+    epoch_summary: Dict[str, Any],
+    epoch_idx: int,
+    node_properties: Dict[str, Any],
+    agent_specs: Dict[str, Dict[str, Any]],
+    num_datacenters: int,
+    total_timesteps: int = 100_000,
+    num_envs: int = 1,
+    overwrite_existing: bool = False,
+    model_dir: str = "trained_models/sb3_agents",
+) -> None:
+    """
+    Train a single MARL profile (e.g. 'green_perf') on ResourceEnv using PPO.
 
-# def train_marl_agents(config=None, total_timesteps=20000, n_envs=3):
-#     save_dir = "trained_models"
-#     if config is None:
-#         config = {}
-#
-#     env_classes = {
-#         "carbon_model": CarbonEnv,
-#         "time_model": TimeEnv,
-#         "water_model": WaterEnv
-#     }
-#
-#     os.makedirs(save_dir, exist_ok=True)
-#
-#     trained_models = {}
-#     for agent_name, env_class in env_classes.items():
-#         print(f"Starting training for {agent_name}...")
-#
-#         # Create parallel environments
-#         parallel_env = make_parallel_env(env_class, config, n_envs)
-#         model_path = os.path.join(save_dir, f"{agent_name}.zip")
-#         if os.path.exists(model_path):
-#             # Load the previously trained model
-#             print(f"Loading previously trained model from {model_path}")
-#             model = PPO.load(model_path)
-#             # Attach parallel environments to the loaded model
-#             parallel_env = make_parallel_env(env_class, config, n_envs)
-#             model.set_env(parallel_env)
-#         else:
-#             # Initialize a new model if none exists
-#             print("No previously trained model found. Initializing a new model.")
-#             parallel_env = make_parallel_env(env_class, config, n_envs)
-#             model = PPO("MlpPolicy", parallel_env, verbose=1, device='cpu')
-#
-#         # Train with progress bar
-#         progress_callback = TQDMProgressBarCallback(total_timesteps=total_timesteps)
-#         step_tracker_callback = StepTrackingCallback(agent_max_steps=100)
-#         model.learn(total_timesteps=total_timesteps, callback=[progress_callback, step_tracker_callback])
-#
-#         # Store trained model
-#         trained_models[agent_name] = model
-#
-#         parallel_env.close()
-#
-#         model_path = os.path.join(save_dir, f"{agent_name}.zip")
-#         model.save(model_path)
-#
-#         print(f"Finished training for {agent_name}.\n")
-#
-#     return trained_models
-#
-#
-# def make_parallel_env(env_class, config, n_env=3):
-#     def make_env(seed):
-#         def _init():
-#             env = env_class(config)
-#             env.seed(seed)
-#             return env
-#         return _init
-#     return SubprocVecEnv([make_env(i) for i in range(n_env)])
-#
-#
-# class TQDMProgressBarCallback(BaseCallback):
-#     def __init__(self, total_timesteps, verbose=0):
-#         super().__init__(verbose)
-#         self.total_timesteps = total_timesteps
-#         self.pbar = None
-#
-#     def _on_training_start(self):
-#         self.pbar = tqdm(total=self.total_timesteps, desc="Training Progress", unit="steps")
-#
-#     def _on_step(self):
-#         self.pbar.update(self.model.n_envs)  # Update progress bar with the number of environments
-#         return True
-#
-#     def _on_training_end(self):
-#         self.pbar.close()
-#
-# class StepTrackingCallback(BaseCallback):
-#     def __init__(self, agent_max_steps, verbose=0):
-#         super().__init__(verbose)
-#         self.agent_max_steps = agent_max_steps
-#         self.steps_taken = 0
-#
-#     def _on_step(self) -> bool:
-#         self.steps_taken += self.training_env.num_envs
-#         if self.steps_taken >= self.agent_max_steps:
-#             print(f"Stopping training: Agent reached {self.steps_taken} steps (max: {self.agent_max_steps}).")
-#             return False  # Stops training
-#         return True
-#
-#
-# if __name__ == "__main__":
-#     config = {
-#         "max_steps": 20
-#     }
-#     models = train_marl_agents(config, total_timesteps=5000)
-#     print("Trained 3 separate PPO models using real simulation() logic.")
+    - Keeps ResourceEnv truly multi-agent (one agent per DC).
+    - Uses Supersuit's PettingZoo -> VecEnv adapter.
+    - Logs and plots reward/value curves via RewardPlotCallback.
+    """
+    os.makedirs(model_dir, exist_ok=True)
+
+    # Paths for saving
+    root_model_path = os.path.join(model_dir, f"{profile_id}.zip")
+    profile_dir = os.path.join(model_dir, profile_id)
+    final_model_path = os.path.join(profile_dir, "final_model.zip")
+
+    if not overwrite_existing and (os.path.exists(root_model_path) or os.path.exists(final_model_path)):
+        print(f"[MARL TRAIN] {profile_id}: model exists, skipping (overwrite_existing=False).")
+        return
+
+    os.makedirs(profile_dir, exist_ok=True)
+
+    print(f"[MARL TRAIN] Training profile '{profile_id}' for {total_timesteps} timesteps")
+
+    # Build vectorized multi-agent env
+    vec_env = make_training_vec_env(
+        profile_id=profile_id,
+        agent_specs=agent_specs,
+        epoch_df=epoch_df,
+        epoch_summary=epoch_summary,
+        epoch_idx=epoch_idx,
+        node_properties=node_properties,
+        num_datacenters=num_datacenters,
+        num_envs=num_envs,
+    )
+
+    # Create PPO model
+    model = PPO(
+        policy="MlpPolicy",
+        env=vec_env,
+        verbose=1,
+    )
+
+    # Attach callback to log and plot reward/value
+    plot_cb = RewardPlotCallback(
+        profile_id=profile_id,
+        out_dir=profile_dir,
+        verbose=1,
+    )
+
+    # Train
+    model.learn(total_timesteps=total_timesteps, callback=plot_cb)
+
+    # Save models
+    model.save(root_model_path)
+    model.save(final_model_path)
+
+    vec_env.close()
+    print(f"[MARL TRAIN] Finished '{profile_id}'. Saved to:")
+    print(f"  - {root_model_path}")
+    print(f"  - {final_model_path}")
+    print(f"  - reward/value plot: {os.path.join(profile_dir, profile_id + '_reward_plot.png')}")
+
+
+
+def train_all_schemes(
+    *,
+    epoch_df: pd.DataFrame,
+    epoch_summary: Dict[str, Any],
+    epoch_idx: int,
+    node_properties: Dict[str, Any],
+    agent_specs: Dict[str, Dict[str, Any]],
+    num_datacenters: int,
+    total_timesteps: int = 100_000,
+    num_envs: int = 1,
+    overwrite_existing: bool = False,
+    model_dir: str = "trained_models/sb3_agents",
+) -> None:
+    """
+    Train PPO for *all* provided profiles in agent_specs, sequentially.
+
+    This is what simulator_LLM.train_marl_constrained_profiles(...) calls.
+    It keeps the training loop multi-agent by using ResourceEnv via Supersuit.
+    """
+    # Make sure epoch_df is a DataFrame
+    if not isinstance(epoch_df, pd.DataFrame):
+        epoch_df = pd.DataFrame(epoch_df)
+
+    profile_ids = list(agent_specs.keys())
+    print(f"[MARL TRAIN] Using epoch {epoch_idx} for training data")
+    print(f"[MARL TRAIN] Profiles to train: {profile_ids}")
+
+    for pid in profile_ids:
+        spec = agent_specs[pid]
+        # You could skip unconstrained or specific profiles here if desired
+        train_reward_scheme(
+            profile_id=pid,
+            epoch_df=epoch_df,
+            epoch_summary=epoch_summary,
+            epoch_idx=epoch_idx,
+            node_properties=node_properties,
+            agent_specs=agent_specs,
+            num_datacenters=num_datacenters,
+            total_timesteps=total_timesteps,
+            num_envs=num_envs,
+            overwrite_existing=overwrite_existing,
+            model_dir=model_dir,
+        )
+
+    print("[MARL TRAIN] Completed training for all profiles in agent_specs.")
+
+
+class RewardPlotCallback(BaseCallback):
+    """
+    Collects mean reward, optional raw reward (from infos['reward_raw']),
+    and critic value estimates over time, and saves a plot at the end
+    of training.
+
+    Works with SB3 + Supersuit PettingZoo wrapper.
+    """
+
+    def __init__(self, profile_id: str, out_dir: str, verbose: int = 0):
+        super().__init__(verbose)
+        self.profile_id = profile_id
+        self.out_dir = out_dir
+
+        self.timesteps = []
+        self.mean_rewards = []
+        self.mean_raw_rewards = []
+        self.mean_values = []
+
+    def _on_step(self) -> bool:
+        # Called after each environment step
+        t = self.num_timesteps
+
+        # rewards: shape (n_envs,)
+        rewards = self.locals.get("rewards", None)
+        if rewards is not None:
+            rewards = np.array(rewards, dtype=np.float32)
+            if rewards.size > 0:
+                self.timesteps.append(t)
+                self.mean_rewards.append(float(rewards.mean()))
+                self.logger.record("train/mean_reward_scaled", self.mean_rewards[-1])
+
+        # critic values: shape (n_envs, 1) or (n_envs,)
+        values = self.locals.get("values", None)
+        if values is not None:
+            if hasattr(values, "detach"):  # it's a torch tensor
+                values = values.detach().cpu().numpy()
+            values = np.array(values, dtype=np.float32)
+            if values.size > 0:
+                # Flatten to (n_envs,)
+                if values.ndim > 1:
+                    values = values.squeeze(-1)
+                self.mean_values.append(float(values.mean()))
+                self.logger.record("train/mean_value", self.mean_values[-1])
+        else:
+            self.mean_values.append(np.nan)
+
+        # raw reward (if env puts it in infos)
+        infos = self.locals.get("infos", None)
+        raw_vals = []
+        if infos is not None and len(infos) > 0:
+            # infos is usually a list of dicts, one per env
+            for info in infos:
+                if not isinstance(info, dict):
+                    continue
+                rr = info.get("reward_raw", None)
+                if rr is None:
+                    continue
+                if isinstance(rr, (list, tuple, np.ndarray)):
+                    raw_vals.append(float(np.mean(rr)))
+                else:
+                    raw_vals.append(float(rr))
+
+        if raw_vals:
+            mean_raw = float(np.mean(raw_vals))
+            self.mean_raw_rewards.append(mean_raw)
+            self.logger.record("train/mean_reward_raw", mean_raw)
+        else:
+            # keep array lengths aligned
+            self.mean_raw_rewards.append(np.nan)
+
+        return True
+
+    def _on_training_end(self) -> None:
+        """Save a plot of reward/value vs timesteps when training finishes."""
+        if not self.timesteps:
+            if self.verbose > 0:
+                print(f"[{self.profile_id}] RewardPlotCallback: no timesteps logged, skipping plot.")
+            return
+
+        os.makedirs(self.out_dir, exist_ok=True)
+        out_path = os.path.join(self.out_dir, f"{self.profile_id}_reward_plot.png")
+
+        plt.figure(figsize=(8, 4))
+        plt.plot(self.timesteps, self.mean_rewards, label="scaled reward")
+        # Only plot raw reward if we actually got any finite values
+        if np.any(np.isfinite(self.mean_raw_rewards)):
+            plt.plot(self.timesteps, self.mean_raw_rewards, label="raw reward (env)", alpha=0.7)
+        if np.any(np.isfinite(self.mean_values)):
+            plt.plot(self.timesteps, self.mean_values, label="value estimate (critic)", alpha=0.7)
+
+        plt.xlabel("timesteps")
+        plt.ylabel("value")
+        plt.title(f"Training: {self.profile_id}")
+        plt.legend()
+        plt.tight_layout()
+        plt.savefig(out_path)
+        plt.close()
+
+        if self.verbose > 0:
+            print(f"[{self.profile_id}] Saved reward/value plot to {out_path}")
+
 

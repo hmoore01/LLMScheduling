@@ -14,6 +14,108 @@ import pandas as pd
 import hashlib
 from typing import Dict, Any, List, Optional, Callable, Union, Literal
 
+
+def train_marl_constrained_profiles(
+    epoch_data: pd.DataFrame,
+    epoch_idx: int,
+    num_datacenters: int,
+    node_properties,
+    total_timesteps: int = 100_000,
+    num_envs: int = 1,             # kept for compatibility, passed through
+    overwrite_existing: bool = False,
+    model_dir: str = "trained_models/sb3_agents",
+    spec_dir: str = "sim_specs",
+    epoch_length: int = 900,
+):
+    """
+    Train MARL profiles using the multi-agent infrastructure in MultiAgentRL.py.
+
+    We include:
+      - All *constrained* profiles (non-empty `constraints` dict), and
+      - All *single-metric, unconstrained* profiles
+        (no constraints, exactly one metric in `weights`), e.g.:
+          * pure time (latency)
+          * pure carbon
+          * pure water
+          * pure cost
+
+    This keeps the environment truly multi-agent (PettingZoo + Supersuit)
+    and lets each profile use its own PPO policy.
+    """
+    import MultiAgentRL
+
+    # 1) Build full agent_specs from this file's helper
+    agent_specs = build_agent_specs(num_datacenters=num_datacenters)
+
+    # 2) Split into constrained + single-metric unconstrained profiles
+    constrained_specs = {
+        pid: spec
+        for pid, spec in agent_specs.items()
+        if spec.get("constraints")  # non-empty dict
+    }
+
+    single_metric_specs = {
+        pid: spec
+        for pid, spec in agent_specs.items()
+        if not spec.get("constraints")                  # no hard constraints
+        and len(spec.get("weights", {})) == 1           # exactly one metric
+    }
+
+    if not constrained_specs and not single_metric_specs:
+        print("[MARL TRAIN] No profiles (constrained or single-metric) found in build_agent_specs; nothing to train.")
+        return
+
+    constrained_ids = list(constrained_specs.keys())
+    single_ids = list(single_metric_specs.keys())
+
+    if constrained_ids:
+        print(f"[MARL TRAIN] Constrained profiles to train: {constrained_ids}")
+    if single_ids:
+        print(f"[MARL TRAIN] Single-metric (unconstrained) profiles to train: {single_ids}")
+
+    # 2.5) Combine into one dict for training
+    training_specs = {}
+    training_specs.update(single_metric_specs)
+    training_specs.update(constrained_specs)
+
+    print(f"[MARL TRAIN] Using epoch {epoch_idx} for training data")
+
+    # 3) Build a minimal epoch_summary for ResourceEnv / MultiAgentRL
+    llama7b_total = float(
+        epoch_data[epoch_data["model_type"] == "Llama7b"]["num_tokens"].sum()
+    )
+    llama70b_total = float(
+        epoch_data[epoch_data["model_type"] == "Llama70b"]["num_tokens"].sum()
+    )
+
+    epoch_summary = {
+        "llama7b_total": llama7b_total,
+        "llama70b_total": llama70b_total,
+        "num_datacenters": num_datacenters,
+        # Pass through simulator-related settings so ResourceEnv / LLM_Simulator
+        # can use them if needed.
+        "spec_dir": spec_dir,
+        "epoch_length": epoch_length,
+    }
+
+    # 4) Delegate to the multi-agent trainer
+    MultiAgentRL.train_all_schemes(
+        epoch_df=epoch_data,
+        epoch_summary=epoch_summary,
+        epoch_idx=epoch_idx,
+        node_properties=node_properties,
+        agent_specs=training_specs,
+        num_datacenters=num_datacenters,
+        total_timesteps=total_timesteps,
+        num_envs=num_envs,
+        overwrite_existing=overwrite_existing,
+        model_dir=model_dir,
+    )
+
+    print("[MARL TRAIN] Finished training all selected MARL profiles (constrained + single-metric).")
+
+
+
 def write_epoch_stats(tag: str, epoch_index: int, stats_dict: dict, tag2: Optional[str] = None) -> None:
     outdir = "LLM_Results"
     os.makedirs(outdir, exist_ok=True)
@@ -155,7 +257,7 @@ def build_agent_specs(num_datacenters: int):
         "green_perf": {
             "weights": {"ttft": 6, "carbon": 3, "cost": 1},
             "constraints": {
-                "carbon": {"budget": 2.2e5, "scope": "global", "window": "episode", "hard": False, "budget_units": "raw"}
+                "carbon": {"budget": 300000, "scope": "global", "window": "episode", "hard": False, "budget_units": "raw"}
             },
             "lambda_lr": {"carbon": 5e-4},
             "include_duals_in_obs": True
@@ -165,7 +267,7 @@ def build_agent_specs(num_datacenters: int):
         "cost_guard": {
             "weights": {"ttft": 7, "cost": 3},
             "constraints": {
-                "energy_cost": {"budget": 120.0, "scope": "global", "window": "episode", "hard": False, "budget_units": "raw"}
+                "energy_cost": {"budget": 100000, "scope": "global", "window": "episode", "hard": False, "budget_units": "raw"}
             },
             "lambda_lr": {"energy_cost": 5e-4},
             "include_duals_in_obs": True
@@ -175,7 +277,7 @@ def build_agent_specs(num_datacenters: int):
         "water_saver": {
             "weights": {"ttft": 7, "water": 3},
             "constraints": {
-                "water_usage": {"budget": 2.0e4, "scope": "global", "window": "episode", "hard": False, "budget_units": "raw"}
+                "water_usage": {"budget": 3000000, "scope": "global", "window": "episode", "hard": False, "budget_units": "raw"}
             },
             "lambda_lr": {"water_usage": 5e-4},
             "include_duals_in_obs": True
@@ -185,39 +287,12 @@ def build_agent_specs(num_datacenters: int):
         #    Base rule (always): hard per-step caps (unchanged)
         #    Plus: epoch-aware modifiers below (examples)
         "peak_power_guard": {
-            "weights": {"ttft": 10},
+            "weights": {"ttft": 7, "power": 3},
             "constraints": {
-                "per_dc_power_max": {"rule": "per_dc_power_max", "max": per_dc_power_cap, "scope": "global", "window": "step", "hard": True},
-                "global_power_max_sum": {"rule": "global_power_max_sum", "max_sum": global_power_cap, "scope": "global", "window": "step", "hard": True},
-                "per_dc_share_max_70b": {"rule": "per_dc_share_max_70b", "max": 0.5, "scope": "global", "window": "step", "hard": True}
+                "total_energy": {"budget": 100000, "scope": "global", "window": "episode", "hard": False, "budget_units": "raw"}
             },
-            "epoch_rules": [
-                # (A) Looping “peak hours” daily: tighten the global sum cap during 5–8pm every 24-step cycle
-                {
-                    "when": {"type": "loop", "k": 24, "phase": 0, "residues": [17, 18, 19, 20]},
-                    "merge": "override",
-                    "constraints": {
-                        "global_power_max_sum": {"rule": "global_power_max_sum", "max_sum": max(1.0, 0.8 * global_power_cap), "scope": "global", "window": "step", "hard": True}
-                    }
-                },
-                # (B) Maintenance window for epochs 96..99: freeze per-DC to a very low ceiling (range schedule)
-                {
-                    "when": {"type": "range", "start": 96, "end": 99},
-                    "merge": "override",
-                    "constraints": {
-                        "per_dc_power_max": {"rule": "per_dc_power_max", "max": 0.10, "scope": "global", "window": "step", "hard": True}
-                    }
-                },
-                # (C) Specific epochs list: relax share cap (e.g., launch test waves) on chosen epochs only
-                {
-                    "when": {"type": "epochs", "list": [12, 36, 60]},
-                    "merge": "override",
-                    "constraints": {
-                        "per_dc_share_max_70b": {"rule": "per_dc_share_max_70b", "max": 0.7, "scope": "global", "window": "step", "hard": True}
-                    }
-                },
-            ],
-            "include_duals_in_obs": False
+            "lambda_lr": {"total_energy": 5e-4},
+            "include_duals_in_obs": True
         },
     }
     return agent_specs
@@ -318,6 +393,28 @@ if __name__ == "__main__":
 
     # Optional: override # of DCs used for default distribution when src DC is missing
     parser.add_argument('--num-dcs', type=int, default=12)
+    parser.add_argument(
+        '--train-marl',
+        action='store_true',
+        help='If set and framework==MARL, train all constrained MARL profiles instead of running evaluation.'
+    )
+    parser.add_argument(
+        '--marl-timesteps',
+        type=int,
+        default=100_000,
+        help='Total PPO timesteps per constrained MARL profile.'
+    )
+    parser.add_argument(
+        '--marl-num-envs',
+        type=int,
+        default=1,
+        help='Number of parallel vector envs to use for MARL training.'
+    )
+    parser.add_argument(
+        '--marl-overwrite',
+        action='store_true',
+        help='Retrain and overwrite existing MARL models if they already exist.'
+    )
     args = parser.parse_args()
 
     # ---------- Helpers ----------
@@ -426,6 +523,73 @@ if __name__ == "__main__":
     cumulative_total_energy = 0.0
     epoch_counter = 0
 
+    marl_scheme_sums: Dict[str, Dict[str, float]] = {}
+
+    if framework.lower() == "marl" and getattr(args, "train_marl", False):
+        # ----------------------------------------------------------
+        # Build a pool of epochs to train on
+        # ----------------------------------------------------------
+        all_epochs = sorted(grouped_trace.groups.keys())
+
+        if number_of_epoch is not None and number_of_epoch > 0:
+            max_train = min(number_of_epoch, len(all_epochs))
+            train_epochs = all_epochs[:max_train]
+        else:
+            train_epochs = all_epochs
+
+        print(
+            f"[MARL TRAIN] Building training pool from {len(train_epochs)} epochs: "
+            f"{int(train_epochs[0])} .. {int(train_epochs[-1])}"
+        )
+
+        # Concatenate all chosen epochs into one dataframe, keeping 'epoch'
+        epoch_data = pd.concat(
+            [grouped_trace.get_group(e).copy() for e in train_epochs],
+            ignore_index=True,
+        )
+
+        # ----------------------------------------------------------
+        # Apply the same scaling as the evaluation path
+        # ----------------------------------------------------------
+        epoch_data["time_index"] = (
+                epoch_data["time_index"] * args.freq_scale
+        ).clip(upper=899).astype(int)
+
+        if args.token_scale != 1.0:
+            epoch_data["num_tokens"] = (
+                    epoch_data["num_tokens"] * args.token_scale
+            ).round().astype(int)
+
+        if args.count_scale > 1:
+            epoch_data = pd.concat(
+                [epoch_data] * args.count_scale,
+                ignore_index=True,
+            )
+
+        # All requests arrive at t=0 in the rate-based simulator
+        epoch_data["arrival_ms"] = 0
+
+        # Use the first training epoch as the "representative" idx
+        # for summary / perturbation purposes; the env will override
+        # self.epoch_idx per episode during reset().
+        train_epoch_idx = int(train_epochs[0])
+
+        train_marl_constrained_profiles(
+            epoch_data=epoch_data,
+            epoch_idx=train_epoch_idx,
+            num_datacenters=args.num_dcs,
+            node_properties=node_properties,
+            total_timesteps=args.marl_timesteps,
+            num_envs=args.marl_num_envs,
+            overwrite_existing=args.marl_overwrite,
+            model_dir="trained_models/sb3_agents",
+            spec_dir="sim_specs",
+            epoch_length=900,
+        )
+
+        print("[MARL TRAIN] Completed training; exiting without running evaluation.")
+        exit(0)
+
     # ---------- Framework Import ----------
     def get_framework(framework):
         fw = framework.lower()
@@ -479,15 +643,49 @@ if __name__ == "__main__":
             epoch_data=epoch_data,
             epoch_idx=epoch_idx,
             node_properties=node_properties,
-            epoch_summary={"node_types": [0,1,2,3,4,5]}  # lightweight hints; safe default
+            epoch_summary={"node_types": [0, 1, 2, 3, 4, 5],
+                # Datacenter ids used by the Splitwise algorithm to build DC index maps
+                "datacenters": list(range(args.num_dcs)),
+                # Rough token split used by Splitwise for prompt vs generation;
+                # frameworks that do not use these fields will ignore them.
+                "avg_input_tokens": int(max(1, epoch_data["num_tokens"].mean() * 0.7)),
+                "avg_output_tokens": int(max(1, epoch_data["num_tokens"].mean() * 0.3)),}  # lightweight hints; safe default
         )
 
         # --- Aggregate results ---
         cumulative_ttft += float(stats.get("avg_ttft", stats.get("avg_ttft_sec", 0.0)))
-        cumulative_carbon += float(stats.get("carbon_emissions", 0.0))  # kg→g
-        cumulative_water += float(stats.get("water_usage", 0.0)) * 1000.0         # m³→L
+        cumulative_carbon += float(stats.get("carbon_emissions", 0.0))  / 1000.0
+        cumulative_water += float(stats.get("water_usage", 0.0)) / 100       # m³→L
         cumulative_energy += float(stats.get("energy_cost", 0.0))
         cumulative_total_energy += float(stats.get('total_energy', 0.0))
+
+        if framework.lower() == "marl" and isinstance(results, dict) and results:
+            for scheme_name, m in results.items():
+                if not m:
+                    continue
+                ttft_val = float(m.get("avg_ttft", m.get("avg_ttft_sec", 0.0)))
+                carbon_val = float(m.get("carbon_emissions", 0.0)) / 1000.0
+                water_val = float(m.get("water_usage", 0.0)) / 100.0
+                energy_cost = float(m.get("energy_cost", 0.0))
+                total_energy_kwh = float(m.get("total_energy", m.get("energy_kwh", 0.0)))
+
+                agg = marl_scheme_sums.setdefault(
+                    scheme_name,
+                    {
+                        "ttft_sum": 0.0,
+                        "carbon_sum": 0.0,
+                        "water_sum": 0.0,
+                        "energy_sum": 0.0,
+                        "total_energy_sum": 0.0,
+                        "epochs": 0,
+                    },
+                )
+                agg["ttft_sum"] += ttft_val
+                agg["carbon_sum"] += carbon_val
+                agg["water_sum"] += water_val
+                agg["energy_sum"] += energy_cost
+                agg["total_energy_sum"] += total_energy_kwh
+                agg["epochs"] += 1
 
         # --- Log epoch ---
         os.makedirs("LLM_Results", exist_ok=True)
@@ -498,7 +696,7 @@ if __name__ == "__main__":
     # ---------- Final report ----------
     print("\n=== Final Report ===")
     print(f"Average TTFT (s): {cumulative_ttft / max(1, epoch_counter):.6f}")
-    print(f"Carbon (g): {cumulative_carbon:.3f}")
+    print(f"Carbon (kg): {cumulative_carbon:.3f}")
     print(f"Water (L): {cumulative_water:.3f}")
     print(f"Energy ($): {cumulative_energy:.3f}")
     print(f"Total Energy (kWh): {cumulative_total_energy:.3f}")
@@ -512,6 +710,33 @@ if __name__ == "__main__":
         f.write(f"Total Water (L): {cumulative_water:.3f}\n")
         f.write(f"Total Energy ($): {cumulative_energy:.3f}\n")
         f.write(f"Total Energy (kWh): {cumulative_energy:.3f}\n")
+
+        if framework.lower() == "marl" and marl_scheme_sums:
+            print("\n=== Per-scheme MARL Results ===")
+            for scheme_name, agg in marl_scheme_sums.items():
+                ep = max(1, agg["epochs"])
+                avg_ttft = agg["ttft_sum"] / ep
+
+                print(f"[{scheme_name}]")
+                print(f"  Epochs: {ep}")
+                print(f"  Average TTFT (s): {avg_ttft:.6f}")
+                print(f"  Carbon (kg): {agg['carbon_sum']:.3f}")
+                print(f"  Water (L): {agg['water_sum']:.3f}")
+                print(f"  Energy ($): {agg['energy_sum']:.3f}")
+                print(f"  Total Energy (kWh): {agg['total_energy_sum']:.3f}")
+
+                scheme_path = f"LLM_Results/MARL_{scheme_name}_final.txt"
+                with open(scheme_path, "w") as f:
+                    f.write("=== Final Results (MARL scheme) ===\n")
+                    f.write(f"Scheme: {scheme_name}\n")
+                    f.write(f"Epochs: {ep}\n")
+                    f.write(f"Average TTFT (s): {avg_ttft:.6f}\n")
+                    f.write(f"Total Carbon (kg): {agg['carbon_sum']:.3f}\n")
+                    f.write(f"Total Water (L): {agg['water_sum']:.3f}\n")
+                    f.write(f"Total Energy ($): {agg['energy_sum']:.3f}\n")
+                    f.write(f"Total Energy (kWh): {agg['total_energy_sum']:.3f}\n")
+
+                print(f"[DONE] Wrote per-scheme summary for {scheme_name} to {scheme_path}")
 
     print(f"[DONE] Results written to {out}")
 

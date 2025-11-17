@@ -46,8 +46,8 @@ CONSTANTS = {
     "TEMP_SETPOINT_C": 29.0,     # supply temperature setpoint (°C)
     "IT_POWER_TEMP_ALPHA": 0.0,  # IT power flat vs. temperature
     "EXEC_MS_TEMP_ALPHA": 0.0,   # no perf degradation (can set +0.005 per °C if needed)
-    "COP_TEMP_ALPHA_PER_C": 0.04,  # +4% COP per °C above ref
-    "PUE_TEMP_ALPHA_PER_C": -0.01, # -0.01 PUE per °C above ref
+    "COP_TEMP_ALPHA_PER_C": 0.16,  # +4% COP per °C above ref
+    "PUE_TEMP_ALPHA_PER_C": -0.04, # -0.01 PUE per °C above ref
 
     # --- Cooling defaults ---
     "DEFAULT_COP": 3.0,          # mechanical cooling COP baseline
@@ -73,6 +73,109 @@ CONSTANTS = {
                       0.22, 0.25, 0.25, 0.23, 0.22, 0.20, 0.18, 0.16,
                       0.14, 0.13, 0.12, 0.12, 0.12, 0.12, 0.12, 0.12],
 }
+
+SPEC_CPU_WORKLOADS = [
+    "bwaves_r",
+    "namd_r",
+    "povray_r",
+    "cactusBSSN_r",
+    "parest_r",
+    "fotonik3d_r",
+]
+
+BASE_CPU_POWER_W = {
+    "bwaves_r":     228,
+    "namd_r":       281,
+    "cactusBSSN_r": 281,
+    "parest_r":     253,
+    "povray_r":     293,
+    "fotonik3d_r":  226,
+}
+
+# ===========================================================
+# SPEC CPU ITD curves (Xeon 8480, Sapphire Rapids, TDP=350W)
+# Normalized so multiplier = 1.0 at 30°C for each workload.
+# These are taken from the right-hand plot in the HPE/SPEC figure.
+# ===========================================================
+
+SPEC_CPU_ITD_CURVES: dict[str, list[tuple[float, float]]] = {
+    "bwaves_r": [
+        (30.0, 1.000),
+        (40.0, 1.009),  # 228 / 226
+        (50.0, 1.000),  # 226 / 226
+        (60.0, 0.987),  # 223 / 226
+        (70.0, 1.088),  # 246 / 226
+    ],
+    "namd_r": [
+        (30.0, 1.000),
+        (40.0, 1.029),  # 281 / 273
+        (50.0, 1.018),  # 278 / 273
+        (60.0, 1.000),  # 273 / 273
+        (70.0, 0.996),  # 272 / 273
+    ],
+    "povray_r": [
+        (30.0, 1.000),
+        (40.0, 1.007),  # 293 / 291
+        (50.0, 1.000),  # 291 / 291
+        (60.0, 0.983),  # 286 / 291
+        (70.0, 0.986),  # 287 / 291
+    ],
+    "cactusBSSN_r": [
+        (30.0, 1.000),
+        (40.0, 1.011),  # 281 / 278
+        (50.0, 1.004),  # 279 / 278
+        (60.0, 0.982),  # 273 / 278
+        (70.0, 0.978),  # 272 / 278
+    ],
+    "parest_r": [
+        (30.0, 1.000),
+        (40.0, 0.988),  # 253 / 256
+        (50.0, 0.992),  # 254 / 256
+        (60.0, 1.004),  # 257 / 256
+        (70.0, 1.023),  # 262 / 256
+    ],
+    "fotonik3d_r": [
+        (30.0, 1.000),
+        (40.0, 0.991),  # 226 / 228
+        (50.0, 0.978),  # 223 / 228
+        (60.0, 0.974),  # 222 / 228
+        (70.0, 1.079),  # 246 / 228
+    ],
+}
+
+
+def interpolate_itd(temp_c: float, points: list[tuple[float, float]]) -> float:
+    """
+    Linear interpolation in (temp, multiplier) space.
+
+    Assumes `points` is sorted by temperature.
+    Clamps to the endpoints if temp_c is outside the range.
+    """
+    if not points:
+        return 1.0
+
+    # Below lowest point
+    if temp_c <= points[0][0]:
+        return points[0][1]
+
+    # Above highest point
+    if temp_c >= points[-1][0]:
+        return points[-1][1]
+
+    # Find segment [T_i, T_{i+1}] containing temp_c
+    for (t0, m0), (t1, m1) in zip(points[:-1], points[1:]):
+        if t0 <= temp_c <= t1:
+            if t1 == t0:
+                return m0
+            frac = (temp_c - t0) / (t1 - t0)
+            return m0 + frac * (m1 - m0)
+
+    # Should not happen, but just in case
+    return points[-1][1]
+
+
+
+MANUAL_NODE_TYPE_COUNTS: Optional[Dict[int, Dict[int, int]]] = None
 
 
 RFS_DEBUG = os.environ.get("RFS_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
@@ -202,6 +305,7 @@ class ProcNode:
         tdp_w: float | None = None,
         idle_w: float | None = None,
         base_idle_frac: float | None = None,
+        workload_class: str = "generic",
     ):
         self.node_id = int(node_id)
         self.type_id = type_id
@@ -233,6 +337,8 @@ class ProcNode:
         self.dc_ref = None
         self.busy_ms_epoch = 0.0
 
+        self.workload_class = str(workload_class).lower()
+
     def attach_dc(self, dc):
         self.dc_ref = dc
 
@@ -245,13 +351,106 @@ class ProcNode:
             return self.base_idle_frac
         return 1.0  # ON
 
+    def _base_it_power_w(self) -> float:
+        """
+        Base IT power draw when this node is fully busy (before temp multipliers).
+
+        For GPUs and generic accelerators:
+            - Use the hardware TDP in Watts (self.tdp_w).
+
+        For CPU SPEC workloads:
+            - Override with the per-workload average power from SPEC (Sapphire Rapids
+              right-hand plot), using SPEC_CPU_BASE_POWER_W.
+        """
+        # Default: hardware TDP
+        base = float(self.tdp_w or 0.0)
+
+        # Only override for CPUs
+        if self.accel_type in ("CPU", "cpu"):
+            wc_lower = self.workload_class.lower()
+            workload_key: str | None = None
+
+            if "bwaves" in wc_lower:
+                workload_key = "bwaves_r"
+            elif "namd" in wc_lower:
+                workload_key = "namd_r"
+            elif "povray" in wc_lower:
+                workload_key = "povray_r"
+            elif "cactus" in wc_lower:
+                workload_key = "cactusBSSN_r"
+            elif "parest" in wc_lower:
+                workload_key = "parest_r"
+            elif "fotonik3d" in wc_lower or "fotonik" in wc_lower:
+                workload_key = "fotonik3d_r"
+
+            if workload_key is not None:
+                # SPEC_CPU_BASE_POWER_W is your dict of per-workload Watts
+                base = float(BASE_CPU_POWER_W.get(workload_key, base))
+
+        return base
+
     # --- temperature multipliers coming from DC constants ---
+    # --- temperature multipliers coming from DC constants + ITD-aware model ---
+    # --- temperature multipliers coming from DC constants + ITD-aware model ---
     def _it_power_temp_mult(self) -> float:
+        """
+        Temperature-dependent multiplier for IT (CPU/GPU) power.
+
+        For GPU / generic accelerators:
+            - Use the existing linear model from DC (it_power_temp_alpha).
+
+        For CPU workloads on Sapphire Rapids (SPEC CPU2017 right-hand plot):
+            - Use per-workload ITD curves derived from the paper.
+            - Curves are normalized so that multiplier(30°C) == 1.0.
+        """
         dc = self.dc_ref
         if not dc:
             return 1.0
-        dT = float(dc.temp_c_setpoint) - dc.temp_ref_c
-        return max(0.0, 1.0 + dc.it_power_temp_alpha * dT)  # usually 0.0 unless you enable it
+
+        # --- GPU / non-CPU path: keep behavior unchanged ---
+        if self.accel_type not in ("CPU", "cpu"):
+            dT = float(dc.temp_c_setpoint) - dc.temp_ref_c
+            return max(0.0, 1.0 + dc.it_power_temp_alpha * dT)
+
+        # ----- CPU ITD-aware model (Sapphire Rapids) -----
+        wc = getattr(self, "workload_class", "generic")
+        wc_lower = str(wc).lower()
+        temp_c = float(dc.temp_c_setpoint)
+
+        # Map workload_class to canonical SPEC key
+        workload_key: str | None = None
+        if "bwaves" in wc_lower:
+            workload_key = "bwaves_r"
+        elif "namd" in wc_lower:
+            workload_key = "namd_r"
+        elif "povray" in wc_lower:
+            workload_key = "povray_r"
+        elif "cactus" in wc_lower:
+            workload_key = "cactusBSSN_r"
+        elif "parest" in wc_lower:
+            workload_key = "parest_r"
+        elif "fotonik3d" in wc_lower or "fotonik" in wc_lower:
+            workload_key = "fotonik3d_r"
+
+        # If we have a table for this workload, use it
+        if workload_key and workload_key in SPEC_CPU_ITD_CURVES:
+            return interpolate_itd(temp_c, SPEC_CPU_ITD_CURVES[workload_key])
+
+        # Fallback: generic mild U-shaped curve if workload is unknown
+        def _generic_cpu_mult(T: float) -> float:
+            """
+            Mild U-shaped generic CPU curve:
+                - optimum near 35°C
+                - small penalties in 30–40°C band
+                - larger penalties further away
+            """
+            T_opt = 35.0
+            d = (T - T_opt) / 25.0
+            m = 1.0 + 0.04 * (d * d) + 0.08 * (d ** 4)
+            return max(0.85, min(1.20, m))
+
+        return _generic_cpu_mult(temp_c)
+
 
     def _exec_ms_temp_mult(self) -> float:
         dc = self.dc_ref
@@ -276,13 +475,24 @@ class ProcNode:
         if self.state == "OFF" or self.tdp_w <= 0.0:
             return 0.0
 
+        # For the duration of this exec window, treat the node as ON
         self.state = "ON"
-        it_frac = self.it_frac_for_state()
-        power_w = self.tdp_w * it_frac * self._it_power_temp_mult()# W
-        hours = max(0.0, float(exec_ms)) / 3_600_000.0
+        it_frac = self.it_frac_for_state()  # will be 1.0 when state == "ON"
+
+        # Use workload-specific base power for CPUs, TDP for GPUs
+        base_power_w = self._base_it_power_w()
+
+        # Apply temperature multiplier (ITD for CPUs, linear alpha for GPUs)
+        power_w = base_power_w * it_frac * self._it_power_temp_mult()  # W
+
+        hours = max(0.0, float(exec_ms)) / 3_600_000.0  # ms -> hours
         self.busy_ms_epoch += float(exec_ms)
+
+        # Return to IDLE so idle accounting can pick it up separately
         self.state = "IDLE"
-        return power_w * hours / 1000
+
+        # Convert Wh -> kWh
+        return power_w * hours / 1000.0
 
 
 
@@ -696,47 +906,82 @@ class Datacenter:
             self.battery.reset_epoch()
 
     def finalize_epoch(self):
-        # NEW: accrue idle power for all non-OFF units
+        """
+        Accrue all idle IT energy, cooling overhead, and facility loads
+        for the portion of the epoch in which each unit is not busy.
+
+        Uses:
+          - workload-specific CPU base power (SPEC curves)
+          - GPU TDP for accelerators
+          - idle_frac
+          - temperature-scaled ITD multipliers
+        """
+
         epoch_ms = max(0.0, float(self._epoch_len_s) * 1000.0)
         idle_it_kwh = 0.0
+
         for u in self.units:
-            # If the unit is truly OFF and never did work, skip
+
+            # Skip units that never turned ON and never worked
             if getattr(u, "state", "IDLE") == "OFF" and getattr(u, "busy_ms_epoch", 0.0) <= 0.0:
                 continue
 
             busy = min(epoch_ms, max(0.0, getattr(u, "busy_ms_epoch", 0.0)))
             idle_ms = max(0.0, epoch_ms - busy)
-            if idle_ms <= 0.0 or u.tdp_w <= 0.0:
+
+            if idle_ms <= 0.0:
                 continue
 
-            # IT idle power in Watts: TDP * idle_frac * temp_mult
-            it_idle_w = u.tdp_w * u.base_idle_frac * u._it_power_temp_mult()
+            # Nodes with no TDP cannot contribute to idle IT energy
+            if u.tdp_w <= 0.0:
+                continue
+
+            # --- Key fix: workload-aware idle power ---
+            # CPU SPEC workloads use per-workload base power
+            # GPUs / accelerators fall back to TDP
+            base_power_w = u._base_it_power_w()
+
+            # Idle IT power:
+            #   base_power * idle_frac * temperature_multiplier
+            it_idle_w = base_power_w * u.base_idle_frac * u._it_power_temp_mult()
+
+            # Accumulate idle IT energy (kWh)
             idle_it_kwh += (it_idle_w / 1000.0) * (idle_ms / 3_600_000.0)
 
-        if idle_it_kwh > 0.0:
-            other_kwh = idle_it_kwh * max(0.0, self.other_it_overhead_frac)
+        # --- No idle energy? Then nothing more to do this epoch ---
+        if idle_it_kwh <= 0.0:
+            if self.battery:
+                self.embodied_battery_co2_kg = self.battery.embodied_carbon_kg()
+            return
 
-            if self.cooling_mode == "MECH_COP":
-                cop = max(0.1, self._cop_for_ms(0.0))
-                cooling_kwh = idle_it_kwh / cop
-            else:
-                pue = max(1.0, self._pue_for_ms(0.0))
-                non_it_facility_kwh = idle_it_kwh * (pue - 1.0)
-                cooling_kwh = max(0.0, non_it_facility_kwh - other_kwh)
+        # "Other IT" overhead (fans, PSU losses, control systems)
+        other_kwh = idle_it_kwh * max(0.0, self.other_it_overhead_frac)
 
-            gross_idle_kwh = idle_it_kwh + other_kwh + cooling_kwh
+        # Cooling/Facility overhead
+        if self.cooling_mode == "MECH_COP":
+            # COP-based (e.g., chilled-water plant)
+            cop = max(0.1, self._cop_for_ms(0.0))
+            cooling_kwh = idle_it_kwh / cop
+        else:
+            # PUE-based model
+            pue = max(1.0, self._pue_for_ms(0.0))
+            non_it_facility_kwh = idle_it_kwh * (pue - 1.0)
+            cooling_kwh = max(0.0, non_it_facility_kwh - other_kwh)
 
-            # Accumulate components for diagnostics (same fields used elsewhere)
-            self.energy_it_kwh += idle_it_kwh
-            self.energy_other_kwh += other_kwh
-            self.energy_cooling_kwh += cooling_kwh
+        # Total facility idle energy
+        gross_idle_kwh = idle_it_kwh + other_kwh + cooling_kwh
 
-            # Route through PV/Battery -> grid, then cost at t=0 ToU (epoch-average would also be OK)
-            start_ms, end_ms = 0.0, epoch_ms
-            grid_kwh = self._apply_solar_battery_offset(gross_idle_kwh, start_ms, end_ms)
-            self.energy_grid_kwh += grid_kwh
+        # Accumulate into DC accounting fields
+        self.energy_it_kwh += idle_it_kwh
+        self.energy_other_kwh += other_kwh
+        self.energy_cooling_kwh += cooling_kwh
 
-        # Existing: accrue battery embodied CO2 (kg) based on throughput this epoch
+        # Route idle energy through PV/battery → grid mix
+        start_ms, end_ms = 0.0, epoch_ms
+        grid_kwh = self._apply_solar_battery_offset(gross_idle_kwh, start_ms, end_ms)
+        self.energy_grid_kwh += grid_kwh
+
+        # Battery embodied carbon (per epoch)
         if self.battery:
             self.embodied_battery_co2_kg = self.battery.embodied_carbon_kg()
 
@@ -750,9 +995,6 @@ class Datacenter:
             return 0.0
         epoch_ms = max(1e-9, float(epoch_len_s) * 1000.0)
         cap_ms = epoch_ms * len(self.units)
-        print(epoch_len_s)
-        print(cap_ms)
-        print(self._busy_ms)
         return max(0.0, min(1.0, self._busy_ms / cap_ms))
 
     def report_utilization(self) -> float:
@@ -803,14 +1045,6 @@ class Geo_Network:
                 # Edge weight uses latency_matrix[u][v] directly (ms)
                 w = float(self.lat[u][v])
                 self.ring_edges_cw.append(_RingEdge(u=u, v=v, w_ms=w))
-
-        if self.debug:
-            print("=== Geo_Network ===")
-            print(f"Datacenters : {self.num_dc} -> {self.dc_ids}")
-            if self.num_dc:
-                sample = ", ".join(f"{e.u}->{e.v}:{e.w_ms:.1f}ms" for e in self.ring_edges_cw[:min(6, len(self.ring_edges_cw))])
-                print(f"Ring edges  : {sample}{' ...' if len(self.ring_edges_cw)>6 else ''}")
-            print()
 
         # scratch containers (reset per epoch)
         self._last_epoch_results: List[Dict[str, Any]] = []
@@ -927,7 +1161,6 @@ class Geo_Network:
             net_ms = self._ring_path_latency_ms(src_dc, tgt_dc)
 
             tokens = int(getattr(row, "tokens", getattr(row, "tokens", 0)))
-            print(tokens)
 
             dc = self.datacenters.get(tgt_dc)
             result: Dict[str, Any] = {
@@ -1029,76 +1262,140 @@ class Geo_Network:
 
         # Store last epoch snapshot for reporting
         self._last_epoch_results = details
-        self._last_epoch_metrics = self._aggregate_epoch_metrics(details)
+        self._last_epoch_metrics = self._aggregate_epoch_metrics(tokens, details)
         return details
 
     # ------------------------------------------------------------------
     # Summarize epoch-level metrics from details
     # ------------------------------------------------------------------
-    def _aggregate_epoch_metrics(self, details: List[Dict[str, Any]]) -> Dict[str, Any]:
-        if not details:
-            return {
-                "avg_ttft": 0.0,
-                "energy_cost": 0.0,
-                "carbon_emissions": 0.0,
-                "water_usage": 0.0,
-                "total_energy": 0.0,
-            }
+    def _aggregate_epoch_metrics(self, tokens, details: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Combine:
+          - Per-request TTFT stats from 'details'
+          - Datacenter-level totals (energy, carbon, cost, water)
+        """
 
-        # Average TTFT
+        # -----------------------------
+        # 1. TTFT (per-request metric)
+        # -----------------------------
         ttft_sum = 0.0
         ttft_cnt = 0
-        energy_kwh = 0.0
-        carbon_g = 0.0
-        water_m3 = 0.0
-        energy_cost = 0.0
 
         for r in details:
-            # TTFT
-            v = r.get("ttft_s")
-            if v is None:
-                v = r.get("TTFT") or r.get("time_to_first_token_s")
+            v = r.get("ttft_s", r.get("TTFT", r.get("time_to_first_token_s")))
+            if v is not None:
+                try:
+                    ttft_sum += float(v)
+                    ttft_cnt += 1
+                except Exception:
+                    pass
+
+        avg_ttft = (ttft_sum / ttft_cnt) if ttft_cnt > 0 else 0.0
+        avg_ttft /= max(1, tokens)  # preserve existing normalization
+
+        # -------------------------------------------------------
+        # 2. Pull COMPLETE energy/carbon/water/cost from DCs
+        # -------------------------------------------------------
+        total_energy_kwh = 0.0
+        total_carbon_g = 0.0
+        total_water_m3 = 0.0
+        total_cost_usd = 0.0
+
+        for dc_id, dc in self.datacenters.items():
+
+            # IT energy includes both execution and idle (after finalize_epoch)
             try:
-                ttft_sum += float(v)
-                ttft_cnt += 1
+                total_energy_kwh += float(dc.energy_grid_kwh)
             except Exception:
                 pass
 
-            # Energy
-            try: energy_kwh += float(r.get("energy_kwh", 0.0))
-            except Exception: pass
+            # Carbon (g)
+            try:
+                total_carbon_g += float(dc.carbon_emissions_g)
+            except Exception:
+                pass
 
-            # Carbon
-            try: carbon_g += float(r.get("carbon_g", r.get("carbon_emissions", 0.0)))
-            except Exception: pass
+            # Water (m^3)
+            try:
+                total_water_m3 += float(dc.water_usage_m3)
+            except Exception:
+                pass
 
-            # Water
-            try: water_m3 += float(r.get("water_m3", r.get("water_usage", 0.0)))
-            except Exception: pass
+            # Energy cost ($)
+            try:
+                total_cost_usd += float(dc.energy_cost_usd)
+            except Exception:
+                pass
 
-            try: energy_cost += float(r.get("cost_usd", r.get("energy_cost", 0.0)))
-            except Exception: pass
-
-        avg_ttft = (ttft_sum / max(1, ttft_cnt)) if ttft_cnt > 0 else 0.0
-
-        # If you track energy_cost elsewhere (e.g., within DCs), you can fold it in here.
-        # For now, compute cost from DCs if they expose report_global_stats().
-
+        # -------------------------------------------------------
+        # 3. Return global metrics
+        # -------------------------------------------------------
         return {
             "avg_ttft": float(avg_ttft),
-            "energy_cost": float(energy_cost),
-            "carbon_emissions": float(carbon_g),
-            "water_usage": float(water_m3),
-            "total_energy": float(energy_kwh),
+            "energy_cost": float(total_cost_usd),
+            "carbon_emissions": float(total_carbon_g),
+            "water_usage": float(total_water_m3),
+            "total_energy": float(total_energy_kwh),
         }
 
     # ------------------------------------------------------------------
     # Public: epoch summary
     # ------------------------------------------------------------------
     def report_global_stats(self) -> Dict[str, Any]:
-        # Prefer DC rollups if available; otherwise return our own aggregation
-        total = dict(self._last_epoch_metrics)
-        return total
+        """
+        Return a full global rollup of:
+            - avg_ttft     (from last epoch aggregate)
+            - total_energy (kWh)
+            - energy_cost  ($)
+            - carbon_emissions (g)
+            - water_usage (m^3)
+
+        This function combines:
+            - per-request latency statistics (TTFT) from _last_epoch_metrics
+            - per-datacenter energy/cost/water/carbon totals
+        """
+
+        out = {}
+
+        # 1. Start with the per-request TTFT from _last_epoch_metrics
+        #    (already computed by _aggregate_epoch_metrics())
+        if isinstance(self._last_epoch_metrics, dict):
+            out["avg_ttft"] = float(self._last_epoch_metrics.get("avg_ttft", 0.0))
+        else:
+            out["avg_ttft"] = 0.0
+
+        # 2. Initialize global DC rollup fields
+        total_energy_kwh = 0.0
+        total_carbon_g = 0.0
+        total_water_m3 = 0.0
+        total_cost_usd = 0.0
+
+        # 3. Pull totals from each datacenter
+        for dc_id, dc in self.datacenters.items():
+            try:
+                total_energy_kwh += float(dc.energy_grid_kwh)
+            except:
+                pass
+            try:
+                total_carbon_g += float(dc.carbon_emissions_g)
+            except:
+                pass
+            try:
+                total_water_m3 += float(dc.water_usage_m3)
+            except:
+                pass
+            try:
+                total_cost_usd += float(dc.energy_cost_usd)
+            except:
+                pass
+
+        # 4. Fill remaining fields
+        out["total_energy"] = float(total_energy_kwh)
+        out["energy_cost"] = float(total_cost_usd)
+        out["carbon_emissions"] = float(total_carbon_g)
+        out["water_usage"] = float(total_water_m3)
+
+        return out
 
     # ------------------------------------------------------------------
     # Public: per-DC utilization (0..1), if DCs expose it; else we return {}
@@ -1184,6 +1481,7 @@ class LLM_Simulator:
         self.latency_csv    = latency_csv    or os.path.join(spec_dir, "Geo_Latencies.csv")
         self.a100_csv       = a100_csv       or os.path.join(spec_dir, "A100_GPU.csv")
         self.h100_csv       = h100_csv       or os.path.join(spec_dir, "H100_GPU.csv")
+        self.cpu_csv = os.path.join(spec_dir, "POVRay_CPU.csv")
 
         # Epoch length (optional exact-header loader)
         if epoch_length is not None:
@@ -1239,7 +1537,7 @@ class LLM_Simulator:
 
         # Expand nodes & perf/power using the exact-header world builder
         dc_specs, node_recs, lat_mat, gpu_tables = build_world_from_csvs_exact(
-            self.dc_specs_csv, self.node_specs_csv, self.latency_csv, self.a100_csv, self.h100_csv
+            self.dc_specs_csv, self.node_specs_csv, self.latency_csv, self.a100_csv, self.h100_csv, self.cpu_csv
         )
 
         if self.debug:
@@ -1285,6 +1583,7 @@ class LLM_Simulator:
                 tdp_kw=float(rec["tdp_kw"]),
                 idle_kw=float(rec["idle_kw"]),
                 model_perf=rec["model_perf"],  # {"Llama7b": {...}, "Llama70b": {...}}
+                workload_class=rec.get("workload_class", "generic"),
             )
             dc.add_node(unit)
             total_nodes += 1
@@ -1832,11 +2131,18 @@ def load_gpu_table_exact(gpu_csv_path: str, chip: str) -> Dict[str, Dict[str, An
         table[key] = d
     return table
 
-def build_gpu_tables_exact(a100_csv: str, h100_csv: str) -> Dict[str, Dict[str, Dict[str, Any]]]:
-    return {
+def build_gpu_tables_exact(
+    a100_csv: str,
+    h100_csv: str,
+    cpu_csv: str | None = None,
+) -> Dict[str, Dict[str, Dict[str, Any]]]:
+    tables: Dict[str, Dict[str, Dict[str, Any]]] = {
         "A100": load_gpu_table_exact(a100_csv, "A100"),
         "H100": load_gpu_table_exact(h100_csv, "H100"),
     }
+    if cpu_csv is not None and os.path.exists(cpu_csv):
+        tables["CPU"] = load_gpu_table_exact(cpu_csv, "CPU")
+    return tables
 
 
 # -------- Latency matrix --------
@@ -1858,48 +2164,51 @@ def build_world_from_csvs_exact(
     latency_csv: str,
     a100_csv: str,
     h100_csv: str,
-) -> tuple[Dict[int, Dict[str, Any]], List[Dict[str, Any]], List[List[float]], Dict[str, Dict[str, Dict[str, Any]]]]:
+    cpu_csv: str | None = None,
+) -> tuple[
+        Dict[int, Dict[str, Any]],
+        List[Dict[str, Any]],
+        List[List[float]],
+        Dict[str, Dict[str, Dict[str, Any]]]
+    ]:
     """
     Returns:
       dc_specs : dict[dc_id] -> per-DC parameters (already normalized)
-      nodes    : list of node records, each with model_perf and power fields
+      nodes    : list of node records, each with model_perf+power
       lat_mat  : NxN list of floats (ms)
-      gpu_tbls : {'A100': {...}, 'H100': {...}}
+      gpu_tbls : {'A100': {...}, 'H100': {...}, 'CPU': {...}}
     """
-    # --- small local helpers (kept here to avoid changing other files) ---
+
+    # ---------------------------
+    # Local utility functions
+    # ---------------------------
     def _parse_counts_str_to_dict(s: str) -> Dict[int, int]:
-        """
-        Accept '0:167;1:167;2:166;3:166;4:167;5:167' OR same with commas.
-        Returns {0:167, 1:167, ...}. Ignores malformed fragments.
-        """
         if not s:
             return {}
         parts = [p.strip() for p in s.replace(",", ";").split(";") if p.strip()]
         out: Dict[int, int] = {}
-        for item in parts:
-            if ":" not in item:
+        for piece in parts:
+            if ":" not in piece:
                 continue
-            k, v = item.split(":", 1)
+            k, v = piece.split(":", 1)
             try:
                 ki = int(k.strip())
                 vi = int(float(v.strip()))
                 if ki >= 0 and vi >= 0:
                     out[ki] = vi
             except Exception:
-                # ignore malformed piece
                 pass
         return out
 
     def _even_split_counts(total_nodes: int, ntypes: int) -> Dict[int, int]:
-        total = max(0, int(total_nodes or 0))
-        base, rem = divmod(total, ntypes)
-        d = {i: base for i in range(ntypes)}
+        t = max(0, int(total_nodes or 0))
+        base, rem = divmod(t, ntypes)
+        out = {i: base for i in range(ntypes)}
         for i in range(rem):
-            d[i] += 1
-        return d
+            out[i] += 1
+        return out
 
     def _num(x):
-        """Convert numeric strings to float; treat None/'None'/'nan' as None."""
         if x is None:
             return None
         if isinstance(x, (int, float)):
@@ -1912,29 +2221,39 @@ def build_world_from_csvs_exact(
         except Exception:
             return None
 
-    # --- load the four CSV-driven artifacts with your existing helpers ---
-    dc_specs = load_dc_specs_exact(dc_specs_csv)
+    # ---------------------------
+    # Load CSV-driven structures
+    # ---------------------------
+    dc_specs  = load_dc_specs_exact(dc_specs_csv)
     templates = load_node_type_templates_exact(node_specs_csv)
-    gpu_tbls = build_gpu_tables_exact(a100_csv, h100_csv)
-    lat_mat  = load_latency_matrix_exact(latency_csv)
+    gpu_tbls  = build_gpu_tables_exact(a100_csv, h100_csv, cpu_csv=cpu_csv)
+    lat_mat   = load_latency_matrix_exact(latency_csv)
 
-    # Determine number of node types from templates (expected 6: ids 0..5)
+    # ---------------------------
+    # Global overrides for node counts
+    # ---------------------------
+    global MANUAL_NODE_TYPE_COUNTS
+    overrides = MANUAL_NODE_TYPE_COUNTS or {}
+
     ntypes = len(templates)
-
-    # --- Expand nodes from counts and attach perf/power ---
     nodes: List[Dict[str, Any]] = []
 
-    for dc_id, params in dc_specs.items():
-        # Preferred field from the updated DC loader:
-        counts_str = params.get("node_type_counts_str", "")
+    FORCE_DC_ID = 0
 
-        # Backcompat: if empty, try any legacy aliases the CSV may have used
+    for dc_id, params in dc_specs.items():
+
+        # When overrides are active, skip all other DCs
+        if overrides and dc_id != FORCE_DC_ID:
+            continue
+
+        # ---------------------------------------------
+        # Load CSV-based counts (existing code)
+        # ---------------------------------------------
+        counts_str = params.get("node_type_counts_str", "")
         if not counts_str:
             counts_str = params.get("Node_Type_Counts", "") or params.get("node_types", "")
 
         counts = _parse_counts_str_to_dict(counts_str)
-
-        # If still empty, fall back to even-splitting Total_Nodes
         if not counts:
             total_nodes = params.get("Total_Nodes", params.get("total_nodes", 0))
             try:
@@ -1944,47 +2263,91 @@ def build_world_from_csvs_exact(
             if total_nodes > 0:
                 counts = _even_split_counts(total_nodes, ntypes)
 
-        # No nodes for this DC if counts still empty
+        # ---------------------------------------------
+        # APPLY OVERRIDES, but only for DC 0
+        # ---------------------------------------------
+        if overrides and dc_id in overrides:
+            # overrides replace counts for those type_ids
+            for tid, manual_count in overrides[dc_id].items():
+                if 0 <= tid < ntypes:
+                    counts[tid] = int(manual_count)
+
         if not counts:
             continue
 
-        # Build per-type
+        # ---------------------------
+        # 3) Expand nodes based on final counts
+        # ---------------------------
         next_local_node_id = 0
-        for type_id in sorted(counts):
-            num = int(counts.get(type_id, 0))
+
+        for type_id in sorted(counts.keys()):
+            num = int(counts[type_id])
             if num <= 0:
                 continue
 
             tmpl = templates[type_id]
-            accel = tmpl["accel_type"]         # "A100" or "H100"
-            cfg   = tmpl["gpu_config"]         # e.g., "8_A100"
+            accel = tmpl["accel_type"]          # "A100", "H100", or "CPU"
+            cfg   = tmpl["gpu_config"]
             procs = int(tmpl.get("processor_count", 1))
 
-            # Power metadata from GPU tables
+            # Lookup GPU/CPU power tables
             row  = gpu_tbls[accel][cfg]
             meta = row.get("_meta", {})
-            tdp_kw  = float(meta.get("tdp_kw", 0.0))
-            idle_kw = float(meta.get("idle_kw", 0.1 * tdp_kw))
 
-            # Perf per model (handle missing/None cells gracefully)
+            tdp_kw  = float(meta.get("tdp_kw", 0.0))
+            idle_kw = float(meta.get("idle_kw", 0.6 * tdp_kw))
+
+            # ---------------------------
+            # Build performance tables
+            # ---------------------------
             pre_sz = _num(row.get("prefill_token_size"))
             gen_sz = _num(row.get("gen_token_size"))
-            denom_tokens = (pre_sz or 0.0) + (gen_sz or 0.0)
-            if denom_tokens <= 0:
-                denom_tokens = 1.0  # avoid div-by-zero; not used if ms_per_request is None
+            denom  = (pre_sz or 0) + (gen_sz or 0) or 1.0
 
             ms7  = _num(row.get("Llama7b_Process"))
             ms70 = _num(row.get("Llama70b_Process"))
 
-            perf_7b = {
-                "ms_per_request": ms7,
-                "ms_per_token":   (ms7 / denom_tokens) if ms7 is not None else None,
-            }
-            perf_70b = {
-                "ms_per_request": ms70,
-                "ms_per_token":   (ms70 / denom_tokens) if ms70 is not None else None,
-            }
+            if accel in ("A100", "H100"):
+                model_perf = {
+                    "Llama7b": {
+                        "ms_per_request": ms7,
+                        "ms_per_token":   ms7 / denom if ms7 else None,
+                    },
+                    "Llama70b": {
+                        "ms_per_request": ms70,
+                        "ms_per_token":   ms70 / denom if ms70 else None,
+                    },
+                }
 
+            elif accel == "CPU":
+                # load SPEC workload ms_per_request values
+                model_perf = {}
+                for wl in SPEC_CPU_WORKLOADS:
+                    val = _num(row.get(wl))
+                    if val is not None:
+                        model_perf[wl] = {
+                            "ms_per_request": val,
+                            "ms_per_token": val,
+                        }
+
+                # fallback to POVRAY if nothing inserted yet
+                if not model_perf:
+                    if ms7 is not None:
+                        model_perf = {
+                            "povray_r": {
+                                "ms_per_request": ms7,
+                                "ms_per_token": ms7,
+                            }
+                        }
+                    else:
+                        model_perf = {}
+
+            else:
+                model_perf = {}
+
+            # ---------------------------
+            # Instantiate node entries
+            # ---------------------------
             for _ in range(num):
                 nodes.append({
                     "dc_id": int(dc_id),
@@ -1995,14 +2358,12 @@ def build_world_from_csvs_exact(
                     "processor_count": procs,
                     "tdp_kw": tdp_kw,
                     "idle_kw": idle_kw,
-                    "model_perf": {
-                        "Llama7b":  perf_7b,
-                        "Llama70b": perf_70b,
-                    },
+                    "model_perf": model_perf,
                 })
                 next_local_node_id += 1
 
     return dc_specs, nodes, lat_mat, gpu_tbls
+
 
 
 

@@ -1,386 +1,617 @@
-# NSGA2.py — Serverless NSGA-II baseline (hardened stats coercion)
+#!/usr/bin/env python3
+# NSGA2.py — NSGA-II scheduling wrapper around Rate_Flow_Sim.LLM_Simulator
 
-from typing import Dict, List, Any, Tuple
-import math, random
-from copy import deepcopy
-from simulation import LLM_Simulator
+from __future__ import annotations
+from typing import Any, Dict, List, Tuple
+import random
+import math
 
-# ---------- utils ----------
-def _normalize_node_props(node_properties) -> Dict[str, dict]:
-    norm: Dict[str, dict] = {}
-    if isinstance(node_properties, dict):
-        for nid, props in node_properties.items():
-            p = dict(props) if isinstance(props, dict) else {}
-            p.setdefault("node_id", str(nid))
-            norm[str(nid)] = p
-        return norm
-    if isinstance(node_properties, (list, tuple)):
-        for i, item in enumerate(node_properties):
-            p = dict(item) if isinstance(item, dict) else {}
-            nid = str(p.get("node_id") or p.get("id") or p.get("name") or f"node_{i}")
-            p["node_id"] = nid
-            norm[nid] = p
-        return norm
-    for nid, props in dict(node_properties).items():
-        p = dict(props) if isinstance(props, dict) else {}
-        p.setdefault("node_id", str(nid))
-        norm[str(nid)] = p
-    return norm
+import pandas as pd
 
-def _make_dc_index_maps(node_properties, epoch_summary):
-    dc_list = epoch_summary.get("datacenters")
-    if isinstance(dc_list, list) and dc_list:
-        dc_to_idx = {str(dc): i for i, dc in enumerate(dc_list)}
-        idx_to_dc = [str(dc) for dc in dc_list]
-        return dc_to_idx, idx_to_dc
-    props = _normalize_node_props(node_properties)
-    uniq = []
-    for _, p in props.items():
-        r = str(p.get("region", "0"))
-        if r not in uniq: uniq.append(r)
-    try:
-        _ = [int(r) for r in uniq]
-        dc_to_idx = {str(r): int(r) for r in uniq}
-        idx_to_dc = [str(i) for i in sorted({int(r) for r in uniq})]
-        return dc_to_idx, idx_to_dc
-    except Exception:
-        dc_to_idx = {r: i for i, r in enumerate(uniq)}
-        idx_to_dc = uniq
-        return dc_to_idx, idx_to_dc
+from Rate_Flow_Sim import LLM_Simulator
 
-def _coerce_epoch_rows(epoch_data, avg_in: int, avg_out: int) -> List[dict]:
-    rows: List[dict] = []
-    if hasattr(epoch_data, "iterrows") and hasattr(epoch_data, "columns"):
-        for _, row in epoch_data.iterrows():
-            rows.append({
-                "source_dc_id": int(row["source_dc_id"]),
-                "model_type": row["model_type"],
-                "num_tokens": int(row.get("num_tokens", row.get("prompt_tokens", avg_in))),
-                "output_tokens": int(row.get("output_tokens", avg_out)),
-                "batch_size": int(row.get("batch_size", 1)),
-                "time_index": int(row.get("time_index", 0)),
-            })
-        return rows
-    if isinstance(epoch_data, list):
-        for r in epoch_data:
-            rows.append({
-                "source_dc_id": int(r.get("source_dc_id", 0)),
-                "model_type": r.get("model_type", "Llama-7b"),
-                "num_tokens": int(r.get("num_tokens", r.get("prompt_tokens", avg_in))),
-                "output_tokens": int(r.get("output_tokens", avg_out)),
-                "batch_size": int(r.get("batch_size", 1)),
-                "time_index": int(r.get("time_index", 0)),
-            })
-        return rows
-    return rows
+# -----------------------------
+# Defaults / knobs
+# -----------------------------
+DEFAULT_EPOCH_LEN = 900
+DEFAULT_NODE_TYPES = [0, 1, 2, 3, 4, 5]  # for simple power-plan heuristic
 
-def _build_dc_caps(node_properties, alpha: float, beta: float):
-    props = _normalize_node_props(node_properties)
-    dc_to_idx, _ = _make_dc_index_maps(node_properties, {})
-    prompt_cap: Dict[int, float] = {}
-    token_cap_tps: Dict[int, float] = {}
-    token_cap_mbt: Dict[int, float] = {}
-    for _, p in props.items():
-        dc_key = str(p.get("region", "0"))
-        dc_id = dc_to_idx.get(dc_key, int(dc_key) if dc_key.isdigit() else 0)
-        tps = float(p.get("tp_tokens_per_s", 4000.0))
-        mbt = float(p.get("max_batch_tokens", 8192))
-        prompt_cap[dc_id]     = prompt_cap.get(dc_id, 0.0) + tps
-        token_cap_tps[dc_id]  = token_cap_tps.get(dc_id, 0.0) + tps
-        token_cap_mbt[dc_id]  = token_cap_mbt.get(dc_id, 0.0) + mbt
-    token_cap: Dict[int, float] = {}
-    for dc in set(list(prompt_cap.keys()) + list(token_cap_tps.keys())):
-        token_cap[dc]  = max(1e-6, alpha * token_cap_tps.get(dc, 0.0) + beta * token_cap_mbt.get(dc, 0.0))
-        prompt_cap[dc] = max(1e-6, prompt_cap.get(dc, 0.0))
-    return prompt_cap, token_cap
 
-def _build_power_plan(routed_token_share_by_dc: Dict[int, float], epoch_summary) -> Dict[int, Dict[int, str]]:
-    node_types = list(epoch_summary.get("node_types", [0,1,2,3,4,5]))
-    min_idle = int(epoch_summary.get("min_idle_types", 1))
-    max_idle = int(epoch_summary.get("max_idle_types", len(node_types)))
+# -----------------------------
+# Helpers for epoch data
+# -----------------------------
+def _ensure_epoch_columns(df: pd.DataFrame, epoch_len: int) -> pd.DataFrame:
+    """
+    Normalize common aliases to canonical columns used downstream.
+
+    Expected logical fields:
+      - source_dc_id : int
+      - model_type   : str
+      - num_tokens   : float/int
+      - arrival_ms   : float/int (optional; default 0)
+    """
+    d = df.copy()
+
+    col_map = {
+        "src_dc": "source_dc_id",
+        "src": "source_dc_id",
+        "model": "model_type",
+        "tokens": "num_tokens",
+        "n_tokens": "num_tokens",
+        "arrival_time_ms": "arrival_ms",
+        "time_ms": "arrival_ms",
+    }
+    for old, new in col_map.items():
+        if old in d.columns and new not in d.columns:
+            d = d.rename(columns={old: new})
+
+    required = ["source_dc_id", "model_type", "num_tokens"]
+    for c in required:
+        if c not in d.columns:
+            raise ValueError(f"epoch_data is missing required column '{c}'")
+
+    # Arrival time is optional – default everything to 0
+    if "arrival_ms" not in d.columns:
+        d["arrival_ms"] = 0.0
+
+    # Clamp/normalize obvious things
+    d["source_dc_id"] = d["source_dc_id"].astype(int)
+    d["model_type"] = d["model_type"].astype(str)
+    d["num_tokens"] = d["num_tokens"].astype(float).clip(lower=0.0)
+    d["arrival_ms"] = d["arrival_ms"].astype(float).clip(
+        lower=0.0, upper=float(epoch_len) * 1000.0
+    )
+
+    return d
+
+
+def _normalize_sim_output(
+    sim_out: Tuple[Dict[str, Any], List[Dict[str, Any]], Any]
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Any]:
+    """
+    Convert whatever the simulator returns into a stable, simpler shape for the frameworks.
+
+    sim_out = (metrics, details, leftovers)
+      metrics: dict with avg_ttft (s), total_energy (kWh),
+               carbon_emissions (g), water_usage (m^3), energy_cost ($)
+      details: per-request info
+      leftovers: any structure – passed through
+    """
+    if not isinstance(sim_out, tuple) or len(sim_out) != 3:
+        raise ValueError("Expected simulator output of form (metrics, details, leftovers)")
+
+    metrics, details, leftovers = sim_out
+
+    avg_ttft = float(metrics.get("avg_ttft", metrics.get("avg_ttft_sec", 0.0)))
+    total_energy = float(metrics.get("total_energy", metrics.get("energy_kwh", 0.0)))
+
+    stats: Dict[str, Any] = dict(metrics)  # start with whatever the simulator gave us
+    stats["avg_ttft"] = avg_ttft
+    stats["avg_ttft_sec"] = avg_ttft
+    stats["total_energy"] = total_energy
+    stats.setdefault("energy_kwh", total_energy)
+    stats.setdefault("carbon_emissions", 0.0)
+    stats.setdefault("water_usage", 0.0)
+    stats.setdefault("energy_cost", 0.0)
+    stats.setdefault("processed_tokens", float(metrics.get("processed_tokens", 0.0)))
+
+    if not isinstance(details, list):
+        details = []
+
+    return stats, details, leftovers
+
+
+# -----------------------------
+# Power plan heuristic
+# -----------------------------
+def _build_power_plan(
+    routed_tokens_by_dc: Dict[int, float],
+    node_types: List[int],
+    all_dcs: List[int],
+) -> Dict[int, Dict[int, str]]:
+    """
+    Simple Idle/Off power plan scaled by per-DC share of total tokens.
+
+    More work → more node types kept out of 'Off'.
+    """
+    if not node_types:
+        node_types = list(DEFAULT_NODE_TYPES)
+
+    min_idle = 1
+    max_idle = len(node_types)
     max_idle = max(1, min(max_idle, len(node_types)))
-    total = sum(max(0.0, v) for v in routed_token_share_by_dc.values()) or 1.0
-    shares = {dc: max(0.0, v) / total for dc, v in routed_token_share_by_dc.items()}
-    plan: Dict[int, Dict[int, str]] = {}
-    for dc, s in shares.items():
-        if s <= 0.0:
-            plan[dc] = {nt: "Off" for nt in node_types}
+
+    total_tokens = sum(max(0.0, v) for v in routed_tokens_by_dc.values()) or 1.0
+
+    power_plan: Dict[int, Dict[int, str]] = {}
+    for dc in all_dcs:
+        share = max(0.0, routed_tokens_by_dc.get(dc, 0.0)) / total_tokens
+
+        # More share → fewer Idle types (more kept "On")
+        idle_types = max(
+            min_idle,
+            min(max_idle, int(round((1.0 - share) * len(node_types)))),
+        )
+        idle_types = max(0, min(idle_types, len(node_types)))
+
+        dc_power: Dict[int, str] = {}
+        for idx, nt in enumerate(node_types):
+            if idx < idle_types:
+                dc_power[nt] = "Idle"
+            else:
+                dc_power[nt] = "Off"
+        power_plan[int(dc)] = dc_power
+
+    return power_plan
+
+
+# -----------------------------
+# Tiny NSGA-II implementation
+# -----------------------------
+class _Individual:
+    __slots__ = ("gene", "objs", "rank", "crowding")
+
+    def __init__(self, gene: List[float]):
+        self.gene: List[float] = gene
+        self.objs: Tuple[float, float, float, float] | None = None
+        self.rank: int | None = None
+        self.crowding: float = 0.0
+
+
+def _dominates(a: _Individual, b: _Individual) -> bool:
+    """Return True if individual a Pareto-dominates b (all objectives <= and one <)."""
+    assert a.objs is not None and b.objs is not None
+    better_or_equal = True
+    strictly_better = False
+    for av, bv in zip(a.objs, b.objs):
+        if av > bv:
+            better_or_equal = False
+            break
+        if av < bv:
+            strictly_better = True
+    return better_or_equal and strictly_better
+
+
+def _non_dominated_sort(pop: List[_Individual]) -> List[List[int]]:
+    n = len(pop)
+    S: List[List[int]] = [[] for _ in range(n)]
+    n_dom = [0] * n
+    fronts: List[List[int]] = [[]]
+
+    for i in range(n):
+        pop[i].rank = None
+        S[i] = []
+        n_dom[i] = 0
+        for j in range(n):
+            if i == j:
+                continue
+            if _dominates(pop[i], pop[j]):
+                S[i].append(j)
+            elif _dominates(pop[j], pop[i]):
+                n_dom[i] += 1
+        if n_dom[i] == 0:
+            pop[i].rank = 0
+            fronts[0].append(i)
+
+    f = 0
+    while f < len(fronts) and fronts[f]:
+        next_front: List[int] = []
+        for i in fronts[f]:
+            for j in S[i]:
+                n_dom[j] -= 1
+                if n_dom[j] == 0:
+                    pop[j].rank = f + 1
+                    next_front.append(j)
+        if not next_front:
+            break
+        fronts.append(next_front)
+        f += 1
+
+    return fronts
+
+
+def _assign_crowding(pop: List[_Individual], front: List[int]) -> None:
+    if not front:
+        return
+    m = len(pop[front[0]].objs or [])
+    for idx in front:
+        pop[idx].crowding = 0.0
+
+    for obj_idx in range(m):
+        front_sorted = sorted(front, key=lambda i: pop[i].objs[obj_idx])  # type: ignore[index]
+        min_val = pop[front_sorted[0]].objs[obj_idx]  # type: ignore[index]
+        max_val = pop[front_sorted[-1]].objs[obj_idx]  # type: ignore[index]
+        pop[front_sorted[0]].crowding = float("inf")
+        pop[front_sorted[-1]].crowding = float("inf")
+        if max_val == min_val:
             continue
-        k = min_idle + int(round((max_idle - min_idle) * s))
-        k = max(min_idle, min(max_idle, k))
-        plan[dc] = {nt: ("Idle" if i < k else "Off") for i, nt in enumerate(node_types)}
-    return plan
+        denom = max_val - min_val
+        for k in range(1, len(front_sorted) - 1):
+            prev_v = pop[front_sorted[k - 1]].objs[obj_idx]  # type: ignore[index]
+            next_v = pop[front_sorted[k + 1]].objs[obj_idx]  # type: ignore[index]
+            pop[front_sorted[k]].crowding += (next_v - prev_v) / denom
 
-# ---------- NSGA-II primitives ----------
-def _repair_theta(theta):
-    t = list(theta)
-    t[0] = max(0.5, min(3.0, float(t[0])))     # w_token
-    t[1] = max(0.0, min(0.01, float(t[1])))    # w_lat
-    t[2] = int(max(512, min(4096, float(t[2])))) # prompt cap
-    t[3] = max(0.3, min(0.95, float(t[3])))    # alpha
-    t[4] = max(0.05, min(0.7,  float(t[4])))   # beta
-    s = t[3] + t[4]
-    if s <= 1e-9: t[3], t[4] = 0.7, 0.3
-    else:         t[3], t[4] = t[3]/s, t[4]/s
-    return t
 
-def _sbx_crossover(a, b, eta_c=15.0, p_c=0.9):
-    if random.random() > p_c: return deepcopy(a), deepcopy(b)
-    c1, c2 = [], []
-    for x, y in zip(a, b):
-        if random.random() < 0.5 and abs(x-y) > 1e-14:
-            x1, x2 = min(x,y), max(x,y); u = random.random()
-            beta = 1.0 + (2.0*(x1-0.0)/(x2-x1+1e-12)); alpha = 2.0 - beta**(-(eta_c+1.0))
-            betaq = (u*alpha)**(1.0/(eta_c+1.0)) if u <= 1.0/alpha else (1.0/(2.0-u*alpha))**(1.0/(eta_c+1.0))
-            child1 = 0.5*((x1+x2) - betaq*(x2-x1))
-            beta = 1.0 + (2.0*(1.0-x2)/(x2-x1+1e-12)); alpha = 2.0 - beta**(-(eta_c+1.0))
-            betaq = (u*alpha)**(1.0/(eta_c+1.0)) if u <= 1.0/alpha else (1.0/(2.0-u*alpha))**(1.0/(eta_c+1.0))
-            child2 = 0.5*((x1+x2) + betaq*(x2-x1))
-            c1.append(child1); c2.append(child2)
-        else:
-            c1.append(x); c2.append(y)
-    return _repair_theta(c1), _repair_theta(c2)
+def _tournament_select(pop: List[_Individual]) -> _Individual:
+    i = random.randrange(len(pop))
+    j = random.randrange(len(pop))
+    a, b = pop[i], pop[j]
+    if a.rank is None or b.rank is None:
+        return a
+    if a.rank < b.rank:
+        return a
+    if b.rank < a.rank:
+        return b
+    if a.crowding > b.crowding:
+        return a
+    if b.crowding > a.crowding:
+        return b
+    return a if random.random() < 0.5 else b
 
-def _poly_mutation(x, eta_m=20.0, p_m=0.2):
-    y = list(x)
-    for i in range(len(y)):
-        if random.random() < p_m:
-            u = random.random()
-            delta = (2*u)**(1.0/(eta_m+1))-1.0 if u<0.5 else 1.0-(2*(1-u))**(1.0/(eta_m+1))
-            y[i] = y[i] + delta * 0.1 * (1.0 if i != 2 else 512.0)
-    return _repair_theta(y)
 
-def _fast_nondominated_sort(F):
-    S = [[] for _ in F]; n = [0]*len(F); fronts=[[]]; rank=[0]*len(F)
-    for p in range(len(F)):
-        Sp=[]; np=0
-        for q in range(len(F)):
-            if p==q: continue
-            pdom = all(F[p][k]<=F[q][k] for k in range(len(F[p]))) and any(F[p][k]<F[q][k] for k in range(len(F[p])))
-            qdom = all(F[q][k]<=F[p][k] for k in range(len(F[p]))) and any(F[q][k]<F[p][k] for k in range(len(F[p])))
-            if pdom: Sp.append(q)
-            elif qdom: np += 1
-        S[p]=Sp; n[p]=np
-        if np==0: rank[p]=1; fronts[0].append(p)
-    i=0
-    while fronts[i]:
-        Q=[]
-        for p in fronts[i]:
-            for q in S[p]:
-                n[q]-=1
-                if n[q]==0: rank[q]=i+2; Q.append(q)
-        i+=1; fronts.append(Q)
-    if not fronts[-1]: fronts.pop()
-    return fronts, rank
+def _crossover_and_mutate(
+    g1: List[float],
+    g2: List[float],
+    num_pairs: int,
+    num_dcs: int,
+    crossover_prob: float,
+    mutation_prob: float,
+    mutation_sigma: float,
+) -> Tuple[List[float], List[float]]:
+    L = len(g1)
+    assert L == len(g2)
+    c1 = g1[:]
+    c2 = g2[:]
 
-def _crowding_distance(front_indices, F):
-    if not front_indices: return {}
-    m=len(F[0]); dist={i:0.0 for i in front_indices}
-    for k in range(m):
-        idx=sorted(front_indices, key=lambda i:F[i][k]); fmin=F[idx[0]][k]; fmax=F[idx[-1]][k]
-        dist[idx[0]] = float("inf"); dist[idx[-1]] = float("inf")
-        if fmax - fmin < 1e-12: continue
-        for j in range(1,len(idx)-1):
-            i_prev,i_next=idx[j-1],idx[j+1]
-            dist[idx[j]] += (F[i_next][k]-F[i_prev][k])/(fmax-fmin)
-    return dist
+    # Blend crossover
+    if random.random() < crossover_prob:
+        alpha = random.random()
+        for i in range(L):
+            c1[i] = alpha * g1[i] + (1.0 - alpha) * g2[i]
+            c2[i] = alpha * g2[i] + (1.0 - alpha) * g1[i]
 
-def _crowded_tournament(a_idx,b_idx,rank,dist):
-    if rank[a_idx] < rank[b_idx]: return a_idx
-    if rank[b_idx] < rank[a_idx]: return b_idx
-    return a_idx if dist.get(a_idx,0.0) > dist.get(b_idx,0.0) else b_idx
+    # Gaussian mutation
+    def _mutate(c: List[float]) -> None:
+        for i in range(L):
+            if random.random() < mutation_prob:
+                c[i] += random.gauss(0.0, mutation_sigma)
 
-# ---------- schedule from policy ----------
-def _make_schedule_from_policy(theta, epoch_data, node_properties, epoch_summary):
-    w_token, w_lat, prompt_cap, alpha, beta = theta
-    avg_in  = int(epoch_summary.get("avg_input_tokens", 700))
-    avg_out = int(epoch_summary.get("avg_output_tokens", 250))
+    _mutate(c1)
+    _mutate(c2)
 
-    rows = _coerce_epoch_rows(epoch_data, avg_in, avg_out)
-    dc_to_idx, _ = _make_dc_index_maps(node_properties, epoch_summary)
-    prompt_cap_dc, token_cap_dc = _build_dc_caps(node_properties, alpha, beta)
+    # Enforce non-negative and per-(src,model) normalization
+    for p in range(num_pairs):
+        start = p * num_dcs
+        end = start + num_dcs
+        for child in (c1, c2):
+            block = [max(0.0, x) for x in child[start:end]]
+            s = sum(block)
+            if s <= 0.0:
+                block = [1.0 / float(num_dcs)] * num_dcs
+                s = 1.0
+            else:
+                block = [x / s for x in block]
+            child[start:end] = block
 
-    pend_p = {dc:0.0 for dc in prompt_cap_dc}
-    pend_t = {dc:0.0 for dc in token_cap_dc}
-    routed_token_by_dc = {dc:0.0 for dc in token_cap_dc}
+    return c1, c2
 
-    schedule_plan: List[dict] = []
 
-    for r in rows:
-        p_tokens = r["num_tokens"]; o_tokens = r["output_tokens"]
-
-        best_dc, best_cost = None, None
-        for dc in prompt_cap_dc.keys():
-            p_term = (pend_p[dc] + min(p_tokens, prompt_cap)) / prompt_cap_dc[dc]
-            t_term = (pend_t[dc] + o_tokens) / token_cap_dc[dc]
-            lat_ms = 0.0  # add latency table if you have one
-            cost = p_term + w_token*t_term + w_lat*lat_ms
-            if best_cost is None or cost < best_cost:
-                best_cost, best_dc = cost, dc
-
-        target_dc_id = int(best_dc)
-        pend_p[target_dc_id] += min(p_tokens, prompt_cap)
-        pend_t[target_dc_id] += o_tokens
-        routed_token_by_dc[target_dc_id] += o_tokens
-        pend_p[target_dc_id] = max(0.0, pend_p[target_dc_id]-prompt_cap_dc[target_dc_id])
-        pend_t[target_dc_id] = max(0.0, pend_t[target_dc_id]-token_cap_dc[target_dc_id])
-
-        schedule_plan.append({
-            "target_dc_id": target_dc_id,
-            "model_type": r["model_type"],
-            "num_tokens": p_tokens,
-            "batch_size": r["batch_size"],
-            "source_dc_id": r["source_dc_id"],
-            "time_index": r["time_index"],
-        })
-
-    power_plan = _build_power_plan(routed_token_by_dc, epoch_summary)
-    return schedule_plan, power_plan
-
-# ---------- robust coercion ----------
-def _force_stats_dict(stats_any) -> dict:
-    if isinstance(stats_any, dict):
-        return dict(stats_any)
-    if isinstance(stats_any, list):
-        if stats_any and isinstance(stats_any[0], dict):
-            return dict(stats_any[0])
-        if all(isinstance(x, (list, tuple)) and len(x)==2 for x in stats_any):
-            return {k:v for (k,v) in stats_any}
-    return {}
-
-def _coerce_sim_output(out):
-    stats, results, leftovers = {}, [], []
-    if isinstance(out, tuple):
-        if len(out) >= 1: stats = out[0]
-        if len(out) >= 2: results = out[1] if out[1] is not None else []
-        if len(out) >= 3: leftovers = out[2]
-    elif isinstance(out, dict):
-        stats = out.get("metrics", {})
-        results = out.get("results", [])
-        leftovers = out.get("leftover_requests", [])
-    stats = _force_stats_dict(stats)
-    if not isinstance(results, list): results = list(results) if results is not None else []
-    if leftovers is None: leftovers = []
-    return stats, results, leftovers
-
-# ---------- public API ----------
+# -----------------------------
+# NSGA2 class wrapper
+# -----------------------------
 class NSGA2:
     @staticmethod
-    def milp_optimizer(epoch_data, epoch_idx: int, node_properties, epoch_summary: Dict[str, Any]):
+    def milp_optimizer(
+        epoch_data,
+        epoch_idx: int,
+        node_properties,
+        epoch_summary: Any,
+    ):
+        """
+        Build a schedule + power plan and run the LLM_Simulator on a per-request path
+        using a small NSGA-II multi-objective search over per-(src_dc, model) routing
+        fractions.
 
-        pop_size    = int(epoch_summary.get("nsga2_pop_size", 20))
-        generations = int(epoch_summary.get("nsga2_generations", 5))
-        p_c         = float(epoch_summary.get("nsga2_crossover_prob", 0.9))
-        p_m         = float(epoch_summary.get("nsga2_mutation_prob", 0.2))
-        eta_c       = float(epoch_summary.get("nsga2_eta_c", 15.0))
-        eta_m       = float(epoch_summary.get("nsga2_eta_m", 20.0))
+        Returns: (stats, results, leftovers)
+          - stats: dict with keys avg_ttft (s), carbon_emissions (g),
+                   water_usage (m^3), total_energy (kWh), energy_cost ($)
+          - results: per-request details
+          - leftovers: simulator leftovers (e.g., per-DC utilization)
+        """
 
-        base_theta = _repair_theta([
-            epoch_summary.get("splitwise_token_weight", 1.5),
-            epoch_summary.get("latency_weight", 0.001),
-            epoch_summary.get("prompt_batch_cap_tokens", 2048),
-            epoch_summary.get("token_capacity_alpha", 0.7),
-            epoch_summary.get("token_capacity_beta",  0.3),
-        ])
+        # 0) Normalize epoch rows to ensure required columns exist
+        if hasattr(epoch_data, "iterrows") and hasattr(epoch_data, "columns"):
+            df = _ensure_epoch_columns(epoch_data, DEFAULT_EPOCH_LEN)
+        else:
+            df = pd.DataFrame(epoch_data)
+            df = _ensure_epoch_columns(df, DEFAULT_EPOCH_LEN)
 
-        pop: List[List[float]] = [base_theta]
-        while len(pop) < pop_size:
-            jitter = [
-                base_theta[0] * random.uniform(0.7, 1.3),
-                base_theta[1] * random.uniform(0.5, 1.5),
-                base_theta[2] * random.uniform(0.5, 1.5),
-                base_theta[3] * random.uniform(0.7, 1.3),
-                base_theta[4] * random.uniform(0.7, 1.3),
-            ]
-            pop.append(_repair_theta(jitter))
+        # 1) Summarize to per-(src,model) buckets
+        work_df = (
+            df.groupby(["source_dc_id", "model_type"], as_index=False)["num_tokens"]
+            .sum()
+            .rename(
+                columns={"source_dc_id": "src_dc", "num_tokens": "total_tokens"}
+            )
+        )
+        if work_df["total_tokens"].sum() <= 0:
+            empty_stats = {
+                "processed_tokens": 0.0,
+                "avg_ttft_sec": 0.0,
+                "avg_ttft": 0.0,
+                "energy_kwh": 0.0,
+                "total_energy": 0.0,
+                "carbon_emissions": 0.0,
+                "water_usage": 0.0,
+                "energy_cost": 0.0,
+            }
+            return empty_stats, [], []
 
-        cache: Dict[Tuple, Tuple] = {}
-        def eval_cached(theta):
-            key = tuple(_repair_theta(theta))
-            if key in cache: return cache[key]
-            schedule_plan, power_plan = _make_schedule_from_policy(list(key), epoch_data, node_properties, epoch_summary)
-            out = LLM_Simulator(epoch_idx, epoch_data, schedule_plan, power_plan)
-            stats, results, leftovers = _coerce_sim_output(out)
-            f1 = float(stats.get("avg_ttft", 0.0))
-            f2 = float(stats.get("energy_cost", 0.0))
-            f3 = float(stats.get("carbon_emissions", 0.0))
-            cache[key] = (f1, f2, f3, stats, results, leftovers)
-            return cache[key]
+        # Pairs we actually route
+        pairs: List[Tuple[int, str, float]] = []
+        for r in work_df.itertuples(index=False):
+            src_dc = int(getattr(r, "src_dc"))
+            model = str(getattr(r, "model_type"))
+            tokens = float(getattr(r, "total_tokens"))
+            if tokens <= 0.0:
+                continue
+            pairs.append((src_dc, model, tokens))
 
-        objs, payloads = [], []
-        for th in pop:
-            f1, f2, f3, s, r, l = eval_cached(th)
-            objs.append((f1, f2, f3)); payloads.append((s, r, l))
+        if not pairs:
+            empty_stats = {
+                "processed_tokens": 0.0,
+                "avg_ttft_sec": 0.0,
+                "avg_ttft": 0.0,
+                "energy_kwh": 0.0,
+                "total_energy": 0.0,
+                "carbon_emissions": 0.0,
+                "water_usage": 0.0,
+                "energy_cost": 0.0,
+            }
+            return empty_stats, [], []
 
-        for _ in range(generations):
-            fronts, rank = _fast_nondominated_sort(objs)
-            dist={}
-            for fr in fronts: dist.update(_crowding_distance(fr, objs))
+        num_pairs = len(pairs)
 
-            mating: List[List[float]] = []
-            while len(mating) < pop_size:
-                i, j = random.randrange(len(pop)), random.randrange(len(pop))
-                winner = _crowded_tournament(i, j, rank, dist)
-                mating.append(deepcopy(pop[winner]))
+        # 2) Build simulator and discover DCs
+        try:
+            # You can edit these defaults here if needed
+            spec_dir = "sim_specs"
+            epoch_len = DEFAULT_EPOCH_LEN
 
-            offspring: List[List[float]] = []
-            for i in range(0, pop_size, 2):
-                a = mating[i]; b = mating[(i+1) % pop_size]
-                c1, c2 = _sbx_crossover(a, b, eta_c=eta_c, p_c=p_c)
-                c1 = _poly_mutation(c1, eta_m=eta_m, p_m=p_m)
-                c2 = _poly_mutation(c2, eta_m=eta_m, p_m=p_m)
-                offspring.extend([c1, c2])
-            offspring = offspring[:pop_size]
+            sim = LLM_Simulator(
+                spec_dir=spec_dir,
+                epoch_length=epoch_len,
+                debug=False,
+            )
+            dcs = sorted(int(dc_id) for dc_id in sim.datacenters.keys())
+        except Exception:
+            # Fallback: infer DCs from epoch_data if something goes really wrong
+            dcs = sorted(df["source_dc_id"].unique().astype(int).tolist() or [0])
+            sim = LLM_Simulator(
+                spec_dir="sim_specs",
+                epoch_length=DEFAULT_EPOCH_LEN,
+                debug=False,
+            )
 
-            off_objs, off_payloads = [], []
-            for th in offspring:
-                f1, f2, f3, s, r, l = eval_cached(th)
-                off_objs.append((f1, f2, f3)); off_payloads.append((s, r, l))
+        if not dcs:
+            dcs = [0]
 
-            combined       = pop + offspring
-            combined_objs  = objs + off_objs
-            combined_payld = payloads + off_payloads
+        num_dcs = len(dcs)
+        gene_length = num_pairs * num_dcs
 
-            fronts, rank = _fast_nondominated_sort(combined_objs)
-            new_pop, new_objs, new_payld = [], [], []
-            for fr in fronts:
-                if len(new_pop) + len(fr) <= pop_size:
-                    for idx in fr:
-                        new_pop.append(combined[idx]); new_objs.append(combined_objs[idx]); new_payld.append(combined_payld[idx])
+        # 3) NSGA-II hyperparameters (tweak directly in this file if desired)
+        pop_size = 16
+        generations = 8
+        crossover_prob = 0.9
+        mutation_prob = 0.1
+        mutation_sigma = 0.1
+
+        # Deterministic seed per epoch
+        random.seed(12345 + int(epoch_idx))
+
+        # Node types for power plan
+        node_types = (
+            list(epoch_summary.get("node_types", DEFAULT_NODE_TYPES))
+            if isinstance(epoch_summary, dict)
+            else list(DEFAULT_NODE_TYPES)
+        )
+
+        # ----- Helper: gene -> (routed_tokens_by_dc, power_plan, requests_df, schedule_plan) -----
+        def build_plans_from_gene(gene: List[float]):
+            # Normalize per-pair blocks to fractions and accumulate DC loads
+            routed_tokens_by_dc: Dict[int, float] = {int(dc): 0.0 for dc in dcs}
+
+            # Per-(src,model) → {dc: frac}
+            frac_plan: Dict[Tuple[int, str], Dict[int, float]] = {}
+
+            for p_idx, (src_dc, model, tokens) in enumerate(pairs):
+                start = p_idx * num_dcs
+                end = start + num_dcs
+                block = [max(0.0, x) for x in gene[start:end]]
+                s = sum(block)
+                if s <= 0.0:
+                    block = [1.0 / float(num_dcs)] * num_dcs
+                    s = 1.0
                 else:
-                    d = _crowding_distance(fr, combined_objs)
-                    fr_sorted = sorted(fr, key=lambda i: d[i], reverse=True)
-                    for idx in fr_sorted[:pop_size - len(new_pop)]:
-                        new_pop.append(combined[idx]); new_objs.append(combined_objs[idx]); new_payld.append(combined_payld[idx])
+                    block = [x / s for x in block]
+
+                key = (src_dc, model)
+                dmap: Dict[int, float] = {}
+                for j, dc in enumerate(dcs):
+                    frac = block[j]
+                    if frac <= 0.0:
+                        continue
+                    d_id = int(dc)
+                    dmap[d_id] = frac
+                    routed_tokens_by_dc[d_id] += tokens * frac
+                frac_plan[key] = dmap
+
+            power_plan = _build_power_plan(
+                routed_tokens_by_dc=routed_tokens_by_dc,
+                node_types=node_types,
+                all_dcs=[int(dc) for dc in dcs],
+            )
+
+            # Per-request mapping: one pseudo-request per bucket, routed by argmax fraction
+            req_rows: List[Dict[str, Any]] = []
+            plan_map: Dict[int, int] = {}
+            row_idx = 0
+            for (src_dc, model, tokens) in pairs:
+                req_rows.append(
+                    {
+                        "source_dc": src_dc,
+                        "model": model,
+                        "arrival_ms": 0,
+                        "tokens": int(tokens),
+                    }
+                )
+
+                # Recompute block for this pair
+                p_idx = row_idx
+                start = p_idx * num_dcs
+                end = start + num_dcs
+                block = [max(0.0, x) for x in gene[start:end]]
+                if sum(block) <= 0.0:
+                    block = [1.0 / float(num_dcs)] * num_dcs
+
+                best_j = max(range(num_dcs), key=lambda j: block[j])
+                plan_map[row_idx] = int(dcs[best_j])
+                row_idx += 1
+
+            requests_df = pd.DataFrame(req_rows)
+            schedule_plan = {"map": plan_map}
+            return power_plan, requests_df, schedule_plan
+
+        # ----- Helper: evaluate individual (fills objs) -----
+        def evaluate(ind: _Individual) -> None:
+            if ind.objs is not None:
+                return
+            power_plan, requests_df, schedule_plan = build_plans_from_gene(ind.gene)
+            metrics, _, _ = sim.run_epoch(
+                epoch_idx, requests_df, schedule_plan, power_plan
+            )
+            avg_ttft = float(metrics.get("avg_ttft", metrics.get("avg_ttft_sec", 0.0)))
+            carbon = float(metrics.get("carbon_emissions", 0.0))
+            water = float(metrics.get("water_usage", 0.0))
+            cost = float(metrics.get("energy_cost", 0.0))
+            ind.objs = (avg_ttft, carbon, water, cost)
+
+        # ----- Initialize population -----
+        population: List[_Individual] = []
+
+        # Seed 1: uniform distribution across DCs
+        base_gene: List[float] = []
+        for _ in range(num_pairs):
+            base_gene.extend([1.0 / float(num_dcs)] * num_dcs)
+        population.append(_Individual(base_gene))
+
+        # Rest: random feasible genes
+        while len(population) < pop_size:
+            gene: List[float] = []
+            for _ in range(num_pairs):
+                raw = [random.random() for _ in range(num_dcs)]
+                s = sum(raw)
+                if s <= 0.0:
+                    raw = [1.0 / float(num_dcs)] * num_dcs
+                    s = 1.0
+                gene.extend([x / s for x in raw])
+            population.append(_Individual(gene))
+
+        # Evaluate initial population
+        for ind in population:
+            evaluate(ind)
+
+        # Compute initial ranks/crowding
+        fronts = _non_dominated_sort(population)
+        for front in fronts:
+            _assign_crowding(population, front)
+
+        # ----- Main NSGA-II loop -----
+        for _gen in range(generations):
+            # Mating pool via tournament
+            mating_pool: List[_Individual] = [
+                _tournament_select(population) for _ in range(pop_size)
+            ]
+
+            # Variation
+            children: List[_Individual] = []
+            for i in range(0, pop_size, 2):
+                p1 = mating_pool[i]
+                p2 = mating_pool[(i + 1) % pop_size]
+                c1_gene, c2_gene = _crossover_and_mutate(
+                    p1.gene,
+                    p2.gene,
+                    num_pairs,
+                    num_dcs,
+                    crossover_prob,
+                    mutation_prob,
+                    mutation_sigma,
+                )
+                children.append(_Individual(c1_gene))
+                children.append(_Individual(c2_gene))
+
+            # Evaluate children
+            for ind in children:
+                evaluate(ind)
+
+            # Combine and select next generation
+            combined = population + children
+            fronts = _non_dominated_sort(combined)
+            for front in fronts:
+                _assign_crowding(combined, front)
+
+            new_pop: List[_Individual] = []
+            for front in fronts:
+                # Sort this front by descending crowding distance
+                front_sorted = sorted(
+                    front, key=lambda idx: combined[idx].crowding, reverse=True
+                )
+                for idx in front_sorted:
+                    if len(new_pop) >= pop_size:
+                        break
+                    new_pop.append(combined[idx])
+                if len(new_pop) >= pop_size:
                     break
-            pop, objs, payloads = new_pop, new_objs, new_payld
+            population = new_pop
 
-        mins = [min(o[k] for o in objs) for k in range(3)]
-        maxs = [max(o[k] for o in objs) for k in range(3)]
-        def _score(o):
-            s=0.0
-            for k in range(3):
-                rng = max(1e-9, maxs[k]-mins[k])
-                s += (o[k]-mins[k]) / rng
-            return s
-        fronts, _ = _fast_nondominated_sort(objs)
-        best_idx = min(fronts[0], key=lambda i: _score(objs[i]))
-        best_theta = pop[best_idx]
-        best_stats, best_results, best_leftovers = payloads[best_idx]
+        # ----- Final selection from first front -----
+        fronts = _non_dominated_sort(population)
+        for front in fronts:
+            _assign_crowding(population, front)
+        first_front = fronts[0] if fronts else list(range(len(population)))
 
-        # FINAL guard: force dict before returning
-        best_stats = _force_stats_dict(best_stats)
-        best_stats.setdefault("avg_ttft", best_stats.get("avg_ttft", 0.0))
-        best_stats.setdefault("energy_cost", best_stats.get("energy_cost", 0.0))
-        best_stats.setdefault("carbon_emissions", best_stats.get("carbon_emissions", 0.0))
-        best_stats.setdefault("water_usage", best_stats.get("water_usage", 0.0))
-        best_stats["nsga2_meta"] = {
-            "best_theta": list(map(float, best_theta)),
-            "population_size": pop_size,
-            "generations": generations,
-            "pareto_size": len(fronts[0]),
-        }
+        # Equal weights for now; adjust in file if you want different trade-offs
+        weights = [1.0, 1.0, 1.0, 1.0]
 
-        return best_stats, best_results, best_leftovers
+        best_idx = first_front[0]
+        if len(first_front) > 1:
+            obj_matrix = [population[i].objs for i in first_front]  # type: ignore[index]
+            mins = [min(col) for col in zip(*obj_matrix)]  # type: ignore[arg-type]
+            maxs = [max(col) for col in zip(*obj_matrix)]  # type: ignore[arg-type]
+
+            def score(ind_idx: int) -> float:
+                objs = population[ind_idx].objs  # type: ignore[index]
+                total = 0.0
+                for v, mn, mx, w in zip(objs, mins, maxs, weights):
+                    if mx == mn:
+                        continue
+                    total += w * (v - mn) / (mx - mn)
+                return total
+
+            best_idx = min(first_front, key=score)
+
+        best = population[best_idx]
+
+        # ----- Rebuild plans for the best individual and run once more to collect details -----
+        power_plan, requests_df, schedule_plan = build_plans_from_gene(best.gene)
+        metrics, details, leftovers = sim.run_epoch(
+            epoch_idx, requests_df, schedule_plan, power_plan
+        )
+
+        stats, results, leftovers_norm = _normalize_sim_output(
+            (metrics, details, leftovers)
+        )
+        return stats, results, leftovers_norm
+
 
 
