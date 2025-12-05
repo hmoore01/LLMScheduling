@@ -68,6 +68,25 @@ class ResourceEnv(ParallelEnv):
             )
         self.profile: Dict[str, Any] = self.agent_specs[self.active_agent_profile]
 
+        self.profile: Dict[str, Any] = self.agent_specs[self.active_agent_profile]
+
+        # ------------------------------------------------------------------
+        # Debug flag: config["debug"]=True or MARL_DEBUG=1 in env
+        # ------------------------------------------------------------------
+        cfg_debug = bool(config.get("debug", False))
+        env_debug = str(os.environ.get("MARL_DEBUG", "0")).strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "y",
+        )
+        self.debug: bool = bool(cfg_debug or env_debug)
+        if self.debug:
+            print(
+                f"[ResourceEnv INIT] Debug enabled for profile '{self.active_agent_profile}', "
+                f"NUM_DATACENTERS={self.NUM_DATACENTERS}"
+            )
+
         # Reward weights (metrics -> scalar reward)
         self.reward_weights: Dict[str, float] = self._normalize_weights(
             self.profile.get("weights", {"ttft": 1.0})
@@ -79,6 +98,10 @@ class ResourceEnv(ParallelEnv):
         else:
             self.primary_metric = "ttft"
 
+        if self.debug:
+            print(f"[ResourceEnv INIT] reward_weights={self.reward_weights}")
+            print(f"[ResourceEnv INIT] primary_metric={self.primary_metric!r}")
+
         # Constraints / duals
         self.constraints: Dict[str, Dict[str, Any]] = self.profile.get("constraints", {})
         self.include_duals_in_obs: bool = bool(self.profile.get("include_duals_in_obs", True))
@@ -87,6 +110,10 @@ class ResourceEnv(ParallelEnv):
         lambda_init = self.profile.get("lambda_init", {})
         for cname in self.constraints.keys():
             self.duals[cname] = float(lambda_init.get(cname, 0.0))
+
+        if self.debug and self.constraints:
+            print(f"[ResourceEnv INIT] constraints={self.constraints}")
+            print(f"[ResourceEnv INIT] lambda_lr={self.lambda_lr}")
 
         # Basic workload snapshot (used for observations)
         self.llama7b_total: float = float(self.epoch_summary.get("llama7b_total", 0.0))
@@ -105,6 +132,21 @@ class ResourceEnv(ParallelEnv):
             "total_energy": 1e-6,
             "network_load": 1e-6,
         }
+
+        self.metric_scales: Dict[str, float] = {
+            "ttft": 0.0,
+            "carbon": 0.0,
+            "water": 0.0,
+            "cost": 0.0,
+            "total_energy": 0.0,
+            "network_load": 0.0,
+        }
+        # How fast we adapt the metric scales (like a running "typical" value)
+        self.metric_scale_alpha: float = float(self.profile.get("metric_scale_alpha", 0.01))
+
+        # Global weight on constraint penalties for this profile
+        # (e.g. set penalty_weight ~ 1–5 in agent_specs for constrained profiles)
+        self.penalty_weight: float = float(self.profile.get("penalty_weight", 1.0))
 
         # Moving reward scaling (adaptive normalization)
         # Exponential moving average of |reward| so we can rescale to O(1)
@@ -129,6 +171,11 @@ class ResourceEnv(ParallelEnv):
         # Per-DC metric profiles and scheme-specific bias
         self._init_dc_metric_profiles()
         self._metric_bias: np.ndarray = self._build_metric_bias_vector()
+
+        self._rate_sim = None
+        self._baseline_sim = None
+        self._baseline_cache: Dict[int, Dict[str, float]] = {}
+        self.baseline_metrics: Dict[str, float] = {}
 
         self.render_mode = "human"
 
@@ -174,7 +221,7 @@ class ResourceEnv(ParallelEnv):
         # Observation: [workload features, last metrics, duals, agent one-hot]
         #   workload: llama7b share, llama70b share
         #   last metrics: 4 (ttft, carbon, water, cost) + total_energy + network_load
-        base_obs_dim = 2 + 6
+        base_obs_dim = 2 + 6 + 3
 
         dual_dim = len(self.constraints) if self.include_duals_in_obs else 0
         agent_id_dim = self.NUM_DATACENTERS
@@ -264,8 +311,175 @@ class ResourceEnv(ParallelEnv):
         # Normalize so that average bias is ~1.0 (keeps behavior well-scaled)
         mean = float(bias.mean()) if bias.size > 0 else 1.0
         if mean <= 0.0 or not np.isfinite(mean):
-            return ones
-        return (bias / mean).astype(np.float32)
+            out = ones
+        else:
+            out = (bias / mean).astype(np.float32)
+
+        if getattr(self, "debug", False):
+            print(
+                f"[ResourceEnv INIT] metric bias for primary_metric='{metric}': "
+                f"{np.round(out, 3)}"
+            )
+        return out
+
+    # ------------------------------------------------------------------
+    # Baseline plan for each epoch: local-only routing + simple power plan
+    # ------------------------------------------------------------------
+    def _compute_baseline_for_current_epoch(self) -> None:
+        """
+        For the current epoch_idx / epoch_df, compute metrics for a very basic
+        plan and cache them. The reward later is shaped as improvement vs these
+        baseline metrics.
+
+        Baseline plan:
+          - Routing: send all tokens to their *source* datacenter (local-only).
+          - Power: all node types ON in every DC (simple, overprovisioned).
+        """
+        eid = int(self.epoch_idx)
+
+        # If we've already computed a baseline for this epoch, just reuse it
+        if eid in self._baseline_cache:
+            self.baseline_metrics = dict(self._baseline_cache[eid])
+            if getattr(self, "debug", False):
+                print(f"[ResourceEnv BASELINE] Using cached baseline for epoch {eid}: {self.baseline_metrics}")
+            return
+
+        df = self.epoch_df
+
+        # --- Robust column detection (same as step) ---
+        if "source_dc_id" in df.columns:
+            src_col = "source_dc_id"
+        elif "source_dc" in df.columns:
+            src_col = "source_dc"
+        elif "src_dc" in df.columns:
+            src_col = "src_dc"
+        else:
+            raise KeyError(
+                "epoch_df must have one of ['source_dc_id', 'source_dc', 'src_dc'] for baseline"
+            )
+
+        if "model_type" in df.columns:
+            model_col = "model_type"
+        elif "model" in df.columns:
+            model_col = "model"
+        else:
+            raise KeyError(
+                "epoch_df must have one of ['model_type', 'model'] for baseline"
+            )
+
+        if "num_tokens" in df.columns:
+            tok_col = "num_tokens"
+        elif "total_tokens" in df.columns:
+            tok_col = "total_tokens"
+        elif "tokens" in df.columns:
+            tok_col = "tokens"
+        else:
+            raise KeyError(
+                "epoch_df must have one of ['num_tokens', 'total_tokens', 'tokens'] for baseline"
+            )
+
+        # Aggregate tokens per (src_dc, model_type) for this epoch
+        work_df = (
+            df.groupby([src_col, model_col], as_index=False)[tok_col]
+            .sum()
+            .rename(
+                columns={
+                    src_col: "src_dc",
+                    model_col: "model_type",
+                    tok_col: "total_tokens",
+                }
+            )
+        )
+
+        # Build a baseline workload: each (src_dc, model) stays local
+        req_rows: List[Dict[str, Any]] = []
+        plan_map: Dict[int, int] = {}
+        row_idx = 0
+
+        for r in work_df.itertuples(index=False):
+            src_dc = int(getattr(r, "src_dc"))
+            model = str(getattr(r, "model_type"))
+            tokens = float(getattr(r, "total_tokens"))
+            if tokens <= 0.0:
+                continue
+
+            req_rows.append(
+                {
+                    "source_dc": src_dc,
+                    "model": model,
+                    "arrival_ms": 0,
+                    "tokens": tokens,
+                }
+            )
+            plan_map[row_idx] = src_dc
+            row_idx += 1
+
+        # Failsafe: if something went wrong and we have no rows
+        if not req_rows:
+            if getattr(self, "debug", False):
+                print(f"[ResourceEnv BASELINE] No workload rows for epoch {eid}; using empty baseline.")
+            self.baseline_metrics = {
+                "ttft": 0.0,
+                "carbon": 0.0,
+                "water": 0.0,
+                "cost": 0.0,
+                "total_energy": 0.0,
+                "network_load": 0.0,
+            }
+            self._baseline_cache[eid] = dict(self.baseline_metrics)
+            return
+
+        workload_df = pd.DataFrame(req_rows)
+        schedule_plan = {"map": plan_map}
+
+        # Power plan: simple "everything ON" per DC
+        power_plan = {}
+        for dc_id in range(self.NUM_DATACENTERS):
+            power_plan[dc_id] = {
+                "unit": {node_type: "ON" for node_type in range(6)}
+            }
+
+        # Instantiate a separate baseline simulator if needed
+        if self._baseline_sim is None:
+            spec_dir = self.epoch_summary.get("spec_dir", "sim_specs")
+            epoch_len = int(self.epoch_summary.get("epoch_length", 900))
+            self._baseline_sim = LLM_Simulator(
+                spec_dir=spec_dir,
+                epoch_length=epoch_len,
+                debug=False,  # baseline usually doesn't need debug spam
+            )
+
+        if getattr(self, "debug", False):
+            print(f"[ResourceEnv BASELINE] Running baseline for epoch {eid} with local-only routing.")
+
+        metrics, _, _ = self._baseline_sim.run_epoch(
+            eid,
+            workload_df,
+            schedule_plan,
+            power_plan,
+        )
+
+        # Extract metrics into a simple dict
+        ttft = float(metrics.get("avg_ttft_sec", metrics.get("avg_ttft", 0.0)))
+        carbon = float(metrics.get("carbon_emissions", 0.0))
+        water = float(metrics.get("water_usage", 0.0))
+        cost = float(metrics.get("energy_cost", 0.0))
+        total_energy = float(metrics.get("total_energy", metrics.get("energy_kwh", 0.0)))
+        network_load = float(metrics.get("avg_net_latency_ms", 0.0))
+
+        self.baseline_metrics = {
+            "ttft": ttft,
+            "carbon": carbon,
+            "water": water,
+            "cost": cost,
+            "total_energy": total_energy,
+            "network_load": network_load,
+        }
+        self._baseline_cache[eid] = dict(self.baseline_metrics)
+
+        if getattr(self, "debug", False):
+            print(f"[ResourceEnv BASELINE] baseline_metrics[{eid}] = {self.baseline_metrics}")
+
 
     # ------------------------------------------------------------------
     # Reset
@@ -312,6 +526,8 @@ class ResourceEnv(ParallelEnv):
         self._init_dc_metric_profiles()
         self._metric_bias = self._build_metric_bias_vector()
 
+        self._compute_baseline_for_current_epoch()
+
         # Initial observation after choosing the epoch
         obs = self._get_obs_dict()
         infos = {agent: {} for agent in self.agents}
@@ -319,6 +535,12 @@ class ResourceEnv(ParallelEnv):
             f"[ResourceEnv] Starting episode with epoch_idx={self.epoch_idx}, "
             f"total rows={len(self.epoch_df)}"
         )
+        if getattr(self, "debug", False):
+            print(
+                f"[ResourceEnv RESET] epoch_idx={self.epoch_idx}, "
+                f"llama7b_total={self.llama7b_total:.1f}, "
+                f"llama70b_total={self.llama70b_total:.1f}"
+            )
         return obs, infos
 
     def _softmax_across_dcs(self, logits_per_agent: Dict[str, float]) -> np.ndarray:
@@ -344,6 +566,34 @@ class ResourceEnv(ParallelEnv):
     # ------------------------------------------------------------------
     # Moving reward scaling helper
     # ------------------------------------------------------------------
+    def _update_metric_scale(self, key: str, value: float) -> None:
+        """Exponential moving average of each metric's typical scale."""
+        value = float(max(value, 0.0))
+        if value <= 0.0:
+            return
+
+        cur = float(self.metric_scales.get(key, 0.0))
+        if cur <= 0.0:
+            # First observation: use it as initial scale
+            self.metric_scales[key] = value
+        else:
+            alpha = self.metric_scale_alpha
+            self.metric_scales[key] = (1.0 - alpha) * cur + alpha * value
+
+    def _metric_score(self, key: str, value: float) -> float:
+        """
+        Convert a raw metric into a reward-style score in (0, 1], where
+        smaller metric -> larger score. Uses a soft inverse:
+
+            score = 1 / (1 + value / scale)
+
+        with scale given by a running EMA of that metric.
+        """
+        self._update_metric_scale(key, value)
+        scale = max(self.metric_scales.get(key, 1.0), 1e-6)
+        v = max(float(value), 0.0)
+        return float(1.0 / (1.0 + (v / scale)))
+
     def _scale_reward(self, raw_reward: float) -> float:
         """Apply exponential moving scaling + optional clipping."""
         alpha = self.reward_scale_alpha
@@ -481,9 +731,8 @@ class ResourceEnv(ParallelEnv):
                 closeness = 1.0 - 0.5 * (dist_idx / max_dc_distance)
                 closeness = max(closeness, 0.0)
                 weights[dc_id] = (
-                    base_dist[dc_id]
-                    * closeness
-                    * float(self._metric_bias[dc_id])
+                        base_dist[dc_id]
+                        * closeness
                 )
 
             total_w = float(weights.sum())
@@ -536,10 +785,25 @@ class ResourceEnv(ParallelEnv):
         workload_df = pd.DataFrame(req_rows)
         self.schedule_plan = {"map": plan_map}
 
+        # Optional debug: aggregate token routing per target DC
+        if getattr(self, "debug", False):
+            tgt_tokens = np.zeros(self.NUM_DATACENTERS, dtype=np.float64)
+            for row, dc_id in self.schedule_plan["map"].items():
+                try:
+                    tok = float(workload_df.iloc[row]["tokens"])
+                except Exception:
+                    tok = 0.0
+                tgt_tokens[dc_id] += tok
+            total_tok = float(tgt_tokens.sum())
+            frac = tgt_tokens / total_tok if total_tok > 0.0 else tgt_tokens
+            print(
+                f"[ResourceEnv STEP] epoch={self.epoch_idx}, step={self.current_step}, "
+                f"token routing fractions per DC={np.round(frac, 3)}"
+            )
+
         # ------------------------------------------------------------------
         # 4) Build power_plan from projected power scalars
         # ------------------------------------------------------------------
-        # Patterns over node types (indexes must match DC node_ids)
         power_patterns = [
             [0, 0, 0, 0, 0, 0],  # all off
             [1, 0, 0, 0, 0, 0],  # 8_A100s
@@ -552,22 +816,16 @@ class ResourceEnv(ParallelEnv):
         ]
         num_patterns = len(power_patterns)
 
-        # Translate pattern into per-DC plan slice compatible with Datacenter.apply_power_plan
-        self.power_plan: Dict[int, Dict[str, Dict[int, str]]] = {}
+        self.power_plan = {}
         for agent in self.agents:
             dc_id = int(agent.split("_")[1])
             lever_val = float(np.clip(power_scalars[agent], 0.0, 1.0))
 
-            # Scheme-specific skew on power lever:
-            #  - ttft-like schemes push toward higher patterns
-            #  - carbon/water/cost-like schemes push toward lower patterns
             metric = getattr(self, "primary_metric", "ttft")
             if metric == "ttft":
-                # push toward higher patterns
-                lever_val = 0.5 + 0.5 * lever_val
+                lever_val = 0.5 + 0.5 * lever_val  # push toward higher patterns
             elif metric in ("carbon", "water", "cost", "energy_cost", "price"):
-                # push toward lower patterns
-                lever_val = 0.5 * lever_val
+                lever_val = 0.5 * lever_val  # push toward lower patterns
 
             lever_val = float(np.clip(lever_val, 0.0, 1.0))
             idx = min(int(lever_val * num_patterns), num_patterns - 1)
@@ -580,17 +838,26 @@ class ResourceEnv(ParallelEnv):
                 }
             }
 
+        if getattr(self, "debug", False):
+            print(f"[ResourceEnv STEP] epoch={self.epoch_idx}, step={self.current_step}, power patterns:")
+            for dc_id in sorted(self.power_plan.keys()):
+                units = self.power_plan[dc_id]["unit"]
+                pattern_vec = [
+                    1 if units.get(nt, "OFF") == "ON" else 0
+                    for nt in sorted(units.keys())
+                ]
+                print(f"  DC {dc_id}: {pattern_vec}")
+
         # ------------------------------------------------------------------
         # 5) Call rate-based LLM_Simulator for this epoch
         # ------------------------------------------------------------------
         if self._rate_sim is None:
-            # epoch_summary should carry these; fall back to sensible defaults
             spec_dir = self.epoch_summary.get("spec_dir", "sim_specs")
             epoch_len = int(self.epoch_summary.get("epoch_length", 900))
             self._rate_sim = LLM_Simulator(
                 spec_dir=spec_dir,
                 epoch_length=epoch_len,
-                debug=False,
+                debug=getattr(self, "debug", False),
             )
 
         metrics, results, dc_usage = self._rate_sim.run_epoch(
@@ -604,8 +871,9 @@ class ResourceEnv(ParallelEnv):
         self._last_leftovers = dc_usage
 
         # ------------------------------------------------------------------
-        # 6) Turn metrics into normalized reward + constraint penalty
+        # 6) Turn metrics into shaped reward + constraint penalty
         # ------------------------------------------------------------------
+        # Raw metrics from the simulator
         ttft = float(metrics.get("avg_ttft_sec", metrics.get("avg_ttft", 0.0)))
         carbon = float(metrics.get("carbon_emissions", 0.0))
         water = float(metrics.get("water_usage", 0.0))
@@ -613,7 +881,7 @@ class ResourceEnv(ParallelEnv):
         total_energy = float(metrics.get("total_energy", metrics.get("energy_kwh", 0.0)))
         network_load = float(metrics.get("avg_net_latency_ms", 0.0))
 
-        # Update max trackers for moving normalization
+        # Track global max for debugging if desired
         self.metric_max_tracker["ttft"] = max(self.metric_max_tracker["ttft"], ttft)
         self.metric_max_tracker["carbon"] = max(self.metric_max_tracker["carbon"], carbon)
         self.metric_max_tracker["water"] = max(self.metric_max_tracker["water"], water)
@@ -625,27 +893,15 @@ class ResourceEnv(ParallelEnv):
             self.metric_max_tracker["network_load"], network_load
         )
 
-        def inv_norm(x: float, key: str) -> float:
-            denom = max(self.metric_max_tracker[key], 1e-12)
-            # larger x -> smaller normalized score in [0,1]
-            return float(np.clip(1.0 - (x / denom), 0.0, 1.0))
+        if getattr(self, "debug", False):
+            print(
+                f"[ResourceEnv STEP] metrics: ttft={ttft:.6f}, carbon={carbon:.6f}, "
+                f"water={water:.6f}, cost={cost:.6f}, total_energy={total_energy:.6f}, "
+                f"network_load={network_load:.6f}"
+            )
 
-        global_norm = {
-            "ttft": inv_norm(ttft, "ttft"),
-            "carbon": inv_norm(carbon, "carbon"),
-            "water": inv_norm(water, "water"),
-            "cost": inv_norm(cost, "cost"),
-            "total_energy": inv_norm(total_energy, "total_energy"),
-            "network_load": inv_norm(network_load, "network_load"),
-        }
-
-        # Base reward from weights
-        base_rw = 0.0
-        for m, w in self.reward_weights.items():
-            base_rw += float(w) * float(global_norm.get(m, 0.0))
-
-        # Constraints: Lagrangian penalty
-        constraint_costs = {
+        # Build raw metric dict
+        metric_raw = {
             "ttft": ttft,
             "carbon": carbon,
             "water": water,
@@ -653,24 +909,113 @@ class ResourceEnv(ParallelEnv):
             "total_energy": total_energy,
             "network_load": network_load,
         }
+
+        # 6a) Baseline-based improvements (relative to our simple baseline plan)
+        # baseline_metrics was computed in reset() for this epoch
+        baseline_vals: Dict[str, Optional[float]] = {}
+        improvements: Dict[str, float] = {}
+        for m, v in metric_raw.items():
+            b_val = None
+            if hasattr(self, "baseline_metrics"):
+                b_val = self.baseline_metrics.get(m, None)
+            baseline_vals[m] = b_val
+
+            if b_val is not None and b_val > 0.0 and np.isfinite(b_val):
+                # Positive if we beat baseline (lower is better), negative if worse
+                improvements[m] = (b_val - v) / b_val
+            else:
+                improvements[m] = 0.0
+
+        # 6b) Scale-based scores in (0,1], smaller metric -> higher score
+        metric_scores: Dict[str, float] = {}
+        for k, v in metric_raw.items():
+            metric_scores[k] = self._metric_score(k, v)
+
+        # 6c) Blend absolute quality with relative improvement
+        alpha_improve = float(self.profile.get("alpha_improve", 0.5))
+        alpha_improve = float(np.clip(alpha_improve, 0.0, 1.0))
+
+        global_scores: Dict[str, float] = {}
+        for k in metric_raw.keys():
+            base_score = float(metric_scores[k])  # in (0,1]
+            # improvements[k] is unbounded, so squash to (-1,1) then map to (0,1)
+            imp = float(np.tanh(improvements[k]))  # (-1,1)
+            imp_score = 0.5 * (1.0 + imp)  # (0,1)
+            global_scores[k] = (1.0 - alpha_improve) * base_score + alpha_improve * imp_score
+
+        if getattr(self, "debug", False):
+            disp_scores = {k: f"{v:.3f}" for k, v in global_scores.items()}
+            disp_scales = {k: f"{self.metric_scales.get(k, 0.0):.3f}" for k in metric_raw.keys()}
+            print(f"[ResourceEnv STEP] metric_scales={disp_scales}")
+            print(f"[ResourceEnv STEP] metric_scores_abs={ {k: f'{v:.3f}' for k, v in metric_scores.items()} }")
+            print(f"[ResourceEnv STEP] metric_improvements={ {k: f'{v:.3f}' for k, v in improvements.items()} }")
+            print(f"[ResourceEnv STEP] metric_scores_blend={disp_scores}")
+
+        # 6d) Weighted scalar reward from metrics (all components ~[0,1])
+        base_rw = 0.0
+        contribs: Dict[str, Tuple[float, float, float]] = {}
+        for m, w in self.reward_weights.items():
+            val = float(global_scores.get(m, 0.0))
+            contrib = float(w) * val
+            base_rw += contrib
+            contribs[m] = (w, val, contrib)
+
+        if getattr(self, "debug", False):
+            print("[ResourceEnv STEP] reward contributions per metric:")
+            for m, (w, val, contrib) in contribs.items():
+                print(f"  {m}: weight={w:.4f}, score={val:.4f}, contrib={contrib:.4f}")
+
+        # 6e) Constraints: Lagrangian penalty on *squared* fractional violations
+        constraint_costs = metric_raw
         total_penalty = 0.0
+        if getattr(self, "debug", False) and self.constraints:
+            print("[ResourceEnv STEP] constraint evaluation:")
+
         for cname, rule in self.constraints.items():
             val = float(constraint_costs.get(cname, 0.0))
             bound = float(rule.get("bound", rule.get("budget", 0.0)))
-            ctype = rule.get("type", "upper_bound")
-            if ctype == "upper_bound":
-                viol = max(0.0, val - bound)
-            elif ctype == "lower_bound":
-                viol = max(0.0, bound - val)
-            else:
-                viol = 0.0
-            lr = float(self.lambda_lr.get(cname, 0.0))
-            self.duals[cname] = max(0.0, self.duals.get(cname, 0.0) + lr * viol)
-            total_penalty += self.duals.get(cname, 0.0) * viol
+            ctype = str(rule.get("type", "upper_bound"))
 
-        # Moving reward scaling
-        raw_reward = float(base_rw - total_penalty)
-        final_reward = self._scale_reward(raw_reward)
+            if bound <= 0.0 or not np.isfinite(bound):
+                viol_frac = 0.0
+            else:
+                if ctype == "upper_bound":
+                    # val <= bound is OK; penalize relative excess
+                    viol_frac = max(0.0, (val / bound) - 1.0)
+                elif ctype == "lower_bound":
+                    # val >= bound is OK; penalize relative shortfall
+                    viol_frac = max(0.0, 1.0 - (val / bound))
+                else:
+                    viol_frac = 0.0
+
+            lr = float(self.lambda_lr.get(cname, 0.0))
+            old_lambda = float(self.duals.get(cname, 0.0))
+            new_lambda = max(0.0, old_lambda + lr * viol_frac)
+            self.duals[cname] = new_lambda
+
+            # use squared violation for a smoother, stronger signal
+            penalty_contrib = new_lambda * (viol_frac ** 2)
+            total_penalty += penalty_contrib
+
+            if getattr(self, "debug", False):
+                print(
+                    f"  {cname}: val={val:.6f}, bound={bound:.6f}, type={ctype}, "
+                    f"viol_frac={viol_frac:.6f}, lambda(old)={old_lambda:.6f}, "
+                    f"lambda(new)={new_lambda:.6f}, lr={lr:.4f}, "
+                    f"penalty_contrib={penalty_contrib:.6f}"
+                )
+
+        # 6f) Final reward: base minus penalties, with mild adaptive scaling
+        raw_reward = float(base_rw - self.penalty_weight * total_penalty)
+        final_reward = self._scale_reward(raw_reward)  # no extra * 10
+
+        if getattr(self, "debug", False):
+            print(
+                f"[ResourceEnv STEP] reward summary: base={base_rw:.6f}, "
+                f"penalty={total_penalty:.6f} (weight={self.penalty_weight:.3f}), "
+                f"raw={raw_reward:.6f}, scaled={final_reward:.6f}, "
+                f"scale={self.reward_scale:.6f}"
+            )
 
         # ------------------------------------------------------------------
         # 7) Build outputs for all agents (single-step episode)
@@ -689,7 +1034,10 @@ class ResourceEnv(ParallelEnv):
                     "total_energy": total_energy,
                     "network_load": network_load,
                 },
-                "metrics_normalized": global_norm,
+                "metrics_normalized": global_scores,
+                "metric_raw": metric_raw,
+                "metric_improvements": improvements,
+                "metric_baselines": baseline_vals,
                 "schedule_plan": self.schedule_plan,
                 "power_plan": self.power_plan,
                 "projected": bool(projection_flags.get(agent, False)),
@@ -710,12 +1058,12 @@ class ResourceEnv(ParallelEnv):
     # ------------------------------------------------------------------
     def _get_obs_dict(self) -> Dict[str, np.ndarray]:
         obs: Dict[str, np.ndarray] = {}
-        # Basic workload snapshot, normalized to something reasonable
+        # Basic workload snapshot, normalized
         total_tokens = self.llama7b_total + self.llama70b_total
         norm_7b = float(self.llama7b_total / (total_tokens + 1e-9))
         norm_70b = float(self.llama70b_total / (total_tokens + 1e-9))
 
-        # Last metrics normalized (or zeros if none yet)
+        # Last metrics
         if self._last_metrics is None:
             last_ttft = last_carbon = last_water = last_cost = 0.0
             last_total_energy = last_network_load = 0.0
@@ -754,10 +1102,21 @@ class ResourceEnv(ParallelEnv):
             agent_one_hot = np.zeros(self.NUM_DATACENTERS, dtype=np.float32)
             agent_one_hot[dc_idx] = 1.0
 
+            # Per-DC profile features (carbon / water / price for THIS DC)
+            dc_profile = np.array(
+                [
+                    float(self._dc_carbon[dc_idx]),
+                    float(self._dc_water[dc_idx]),
+                    float(self._dc_price[dc_idx]),
+                ],
+                dtype=np.float32,
+            )
+
             vec = np.concatenate(
                 [
                     np.array([norm_7b, norm_70b], dtype=np.float32),
                     last_features,
+                    dc_profile,
                     dual_vec,
                     agent_one_hot,
                 ],

@@ -245,57 +245,110 @@ def build_agent_specs(num_datacenters: int):
 
     agent_specs = {
         # ---- Single-objective (no constraints) ----
-        "time_agent":   {"weights": {"ttft": 10}, "constraints": {}, "include_duals_in_obs": False},
-        "carbon_agent": {"weights": {"carbon": 10}, "constraints": {}, "include_duals_in_obs": False},
-        "water_agent":  {"weights": {"water": 10},  "constraints": {}, "include_duals_in_obs": False},
-        "cost_agent":   {"weights": {"cost": 10},   "constraints": {}, "include_duals_in_obs": False},
+        # These are fine: only 'ttft', 'carbon', 'water', 'cost' which match the env.
+        "time_agent": {
+            "weights": {"ttft": 10},
+            "constraints": {},
+            "include_duals_in_obs": False,
+        },
+        "carbon_agent": {
+            "weights": {"carbon": 10},
+            "constraints": {},
+            "include_duals_in_obs": False,
+        },
+        "water_agent": {
+            "weights": {"water": 10},
+            "constraints": {},
+            "include_duals_in_obs": False,
+        },
+        "cost_agent": {
+            "weights": {"cost": 10},
+            "constraints": {},
+            "include_duals_in_obs": False,
+        },
 
         # ---- Practical, constrained profiles ----
 
         # 1) Green performance: prefer low latency, keep carbon under budget (episode window)
-        #    (unchanged; this is always-on under the old schema)
         "green_perf": {
             "weights": {"ttft": 6, "carbon": 3, "cost": 1},
             "constraints": {
-                "carbon": {"budget": 300000, "scope": "global", "window": "episode", "hard": False, "budget_units": "raw"}
+                # This already matches the 'carbon' metric used in the env
+                "carbon": {
+                    "budget": 300000,
+                    "scope": "global",
+                    "window": "episode",
+                    "hard": False,
+                    "budget_units": "raw",
+                    # Optional: make the constraint type explicit
+                    "type": "upper_bound",
+                }
             },
             "lambda_lr": {"carbon": 5e-4},
-            "include_duals_in_obs": True
+            "include_duals_in_obs": True,
         },
 
-        # 2) Cost guard: fast service but constrained by energy cost budget (episode window)
+        # 2) Cost guard: fast service but constrained by *energy cost* budget.
+        #    Use 'cost' here, because the env exposes the metric as 'cost',
+        #    derived from metrics['energy_cost'].
         "cost_guard": {
             "weights": {"ttft": 7, "cost": 3},
             "constraints": {
-                "energy_cost": {"budget": 100000, "scope": "global", "window": "episode", "hard": False, "budget_units": "raw"}
+                "cost": {
+                    "budget": 100000,
+                    "scope": "global",
+                    "window": "episode",
+                    "hard": False,
+                    "budget_units": "raw",
+                    "type": "upper_bound",
+                }
             },
-            "lambda_lr": {"energy_cost": 5e-4},
-            "include_duals_in_obs": True
+            "lambda_lr": {"cost": 5e-4},
+            "include_duals_in_obs": True,
         },
 
-        # 3) Water saver: prioritize performance with a water cap (episode window)
+        # 3) Water saver: prioritize performance with a water cap (episode window).
+        #    Use 'water', because the env exposes 'water' (from metrics['water_usage']).
         "water_saver": {
             "weights": {"ttft": 7, "water": 3},
             "constraints": {
-                "water_usage": {"budget": 3000000, "scope": "global", "window": "episode", "hard": False, "budget_units": "raw"}
+                "water": {
+                    "budget": 3000000,
+                    "scope": "global",
+                    "window": "episode",
+                    "hard": False,
+                    "budget_units": "raw",
+                    "type": "upper_bound",
+                }
             },
-            "lambda_lr": {"water_usage": 5e-4},
-            "include_duals_in_obs": True
+            "lambda_lr": {"water": 5e-4},
+            "include_duals_in_obs": True,
         },
 
-        # 4) Peak power guard (step window): enforce instantaneous power guardrails (hard)
-        #    Base rule (always): hard per-step caps (unchanged)
-        #    Plus: epoch-aware modifiers below (examples)
+        # 4) Peak power guard: use total_energy as a proxy for power.
+        #    The previous 'power' weight never did anything because the env
+        #    doesn't have a 'power' metric in the reward code.
         "peak_power_guard": {
-            "weights": {"ttft": 7, "power": 3},
+            "weights": {"ttft": 7, "total_energy": 3},
             "constraints": {
-                "total_energy": {"budget": 100000, "scope": "global", "window": "episode", "hard": False, "budget_units": "raw"}
+                "total_energy": {
+                    "budget": 100000,
+                    "scope": "global",
+                    "window": "episode",
+                    "hard": False,
+                    "budget_units": "raw",
+                    "type": "upper_bound",
+                },
+                # You could later add step-level "peak" constraints based on
+                # global_power_cap / per_dc_power_cap if/when you expose a
+                # per-step power metric from the simulator.
             },
             "lambda_lr": {"total_energy": 5e-4},
-            "include_duals_in_obs": True
+            "include_duals_in_obs": True,
         },
     }
     return agent_specs
+
 
 def _unwrap_to_resource_env(env):
     # Reuse the robust unwrap you already have in the logger

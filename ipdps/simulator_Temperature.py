@@ -246,6 +246,8 @@ def sweep_temperatures(
                 "Water_L": float(metrics.get("water_usage", 0.0)),
                 "Energy_Cost_USD": float(metrics.get("energy_cost", 0.0)),
                 "Total_Energy_kWh": float(metrics.get("total_energy", 0.0)),
+                "Total_IT_Energy_kWh": float(metrics.get("total_it_energy_kwh", 0.0)),
+                "Total_Cooling_Energy_kWh": float(metrics.get("total_cooling_energy_kwh", 0.0)),
             }
         )
 
@@ -363,6 +365,7 @@ def main():
             "cactusBSSN_r",
             "parest_r",
             "fotonik3d_r",
+            "perlbench_r", "gcc_r", "mcf_r", "deepsjeng_r", "exchange2_r",
         ],
         help="SPEC workload label to use for synthetic generation and as the default model.",
     )
