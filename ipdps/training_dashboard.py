@@ -48,6 +48,7 @@ class ProfileMetrics:
     profile_id: str
     timesteps: List[int] = field(default_factory=list)
     rewards: List[float] = field(default_factory=list)
+    rewards_smoothed: List[float] = field(default_factory=list)  # EMA smoothed
     ttft: List[float] = field(default_factory=list)
     carbon: List[float] = field(default_factory=list)
     water: List[float] = field(default_factory=list)
@@ -59,6 +60,7 @@ class ProfileMetrics:
     reward_count: int = 0
     reward_min: float = float('inf')
     reward_max: float = float('-inf')
+    reward_ema: float = 0.0  # Exponential moving average
     best_ttft: float = float('inf')
     best_carbon: float = float('inf')
     best_water: float = float('inf')
@@ -83,6 +85,13 @@ class ProfileMetrics:
         self.reward_count += 1
         self.reward_min = min(self.reward_min, r)
         self.reward_max = max(self.reward_max, r)
+        # Update EMA with alpha=0.05 for smooth display
+        alpha = 0.05
+        if self.reward_count == 1:
+            self.reward_ema = r
+        else:
+            self.reward_ema = (1 - alpha) * self.reward_ema + alpha * r
+        self.rewards_smoothed.append(self.reward_ema)
 
     def update_best(self, **kw):
         for k, v in kw.items():
@@ -119,11 +128,14 @@ class ProfileMetrics:
         inf = float('inf')
         return {
             "profile_id": self.profile_id,
-            "timesteps": trim(self.timesteps), "rewards": trim(self.rewards),
+            "timesteps": trim(self.timesteps),
+            "rewards": trim(self.rewards),
+            "rewards_smoothed": trim(self.rewards_smoothed),  # Add smoothed
             "ttft": trim(self.ttft), "carbon": trim(self.carbon),
             "water": trim(self.water), "cost": trim(self.cost),
             "current": {
                 "reward": self.rewards[-1] if self.rewards else 0,
+                "reward_smoothed": self.reward_ema,  # Add smoothed current
                 "ttft": self.ttft[-1] if self.ttft else 0,
                 "carbon": self.carbon[-1] if self.carbon else 0,
                 "water": self.water[-1] if self.water else 0,
@@ -397,7 +409,7 @@ return`<div class="card ${st}" id="c-${p.profile_id}"><div class="card-hd"><div 
 <div class="met-i"><div class="lbl">Carbon</div><div class="val carbon" id="m-carbon-${p.profile_id}">${fmtM(p.current?.carbon)}</div><div class="bst">best: ${fmtM(p.best?.carbon)}</div></div>
 <div class="met-i"><div class="lbl">Water</div><div class="val water" id="m-water-${p.profile_id}">${fmtM(p.current?.water)}</div><div class="bst">best: ${fmtM(p.best?.water)}</div></div>
 <div class="met-i"><div class="lbl">Cost</div><div class="val cost" id="m-cost-${p.profile_id}">${fmtM(p.current?.cost,'cost')}</div><div class="bst">best: ${fmtM(p.best?.cost,'cost')}</div></div></div>
-<div class="ch-row"><div class="ch-box"><div class="ch-ti">Reward</div><div class="ch-wrap"><canvas id="ch-r-${p.profile_id}"></canvas></div></div>
+<div class="ch-row"><div class="ch-box"><div class="ch-ti">Reward (smoothed)</div><div class="ch-wrap"><canvas id="ch-r-${p.profile_id}"></canvas></div></div>
 <div class="ch-box"><div class="ch-ti">${p.primary_metric||'Metric'}</div><div class="ch-wrap"><canvas id="ch-m-${p.profile_id}"></canvas></div></div></div>
 <div class="pl-row"><div class="pl-box"><div class="pl-ti">Power</div><div class="pw-grid" id="pw-${p.profile_id}">${[...Array(12)].map((_,i)=>`<div class="pw-c off"><span class="dc">DC${i}</span><span>-</span></div>`).join('')}</div></div>
 <div class="pl-box"><div class="pl-ti">Routing</div><div class="rt-bar" id="rt-${p.profile_id}">${[...Array(12)].map((_,i)=>`<div class="rt-seg" style="width:0;background:${DC_COL[i]}"></div>`).join('')}</div></div></div></div>
@@ -417,7 +429,7 @@ ps.forEach(p=>{let c=document.getElementById('c-'+p.profile_id);if(!c){g.querySe
 charts['r-'+p.profile_id]=mkCh('ch-r-'+p.profile_id,'#58a6ff');const mc=p.primary_metric==='ttft'?'#58a6ff':p.primary_metric==='carbon'?'#3fb950':p.primary_metric==='water'?'#39c5cf':'#d29922';charts['m-'+p.profile_id]=mkCh('ch-m-'+p.profile_id,mc);c=document.getElementById('c-'+p.profile_id)}
 c.className='card '+(p.is_training?'training':p.is_completed?'done':'');const pf=document.getElementById('pf-'+p.profile_id);if(pf)pf.style.width=p.progress_pct+'%';
 ['ttft','carbon','water','cost'].forEach(m=>{const e=document.getElementById('m-'+m+'-'+p.profile_id);if(e)e.textContent=fmtM(p.current?.[m],m)});
-const rc=charts['r-'+p.profile_id];if(rc&&p.timesteps?.length){rc.data.labels=p.timesteps;rc.data.datasets[0].data=p.rewards;rc.update('none')}
+const rc=charts['r-'+p.profile_id];if(rc&&p.timesteps?.length){rc.data.labels=p.timesteps;rc.data.datasets[0].data=p.rewards_smoothed||p.rewards;rc.update('none')}
 const mc=charts['m-'+p.profile_id];if(mc&&p.timesteps?.length){const md=p.primary_metric==='ttft'?p.ttft:p.primary_metric==='carbon'?p.carbon:p.primary_metric==='water'?p.water:p.cost;if(md?.length){mc.data.labels=p.timesteps.slice(-md.length);mc.data.datasets[0].data=md;mc.update('none')}}
 updPw(p.profile_id,p.power_plan);updRt(p.profile_id,p.routing_dist);const btn=c.querySelector('.btn-stop');if(btn)btn.disabled=!p.is_training})}catch(e){console.error(e)}}
 refresh();setInterval(refresh,1000);

@@ -313,72 +313,14 @@ class ResourceEnv(ParallelEnv):
             self._dc_price = 1.0 + (idxs / max(1, num_dc - 1))
 
     def _build_metric_bias_vector(self) -> np.ndarray:
-        """Return a per-DC multiplicative bias based on reward_weights.
+        """Return uniform bias - agents learn entirely from reward signal.
 
-        For hybrid profiles (e.g., green_perf with ttft:6, carbon:3, cost:1),
-        this blends biases from all metrics proportionally to their weights.
-        This allows hybrid profiles to balance multiple objectives.
+        The metric bias has been removed as a crutch. PPO agents should
+        discover optimal routing through exploration and reward feedback,
+        not through hardcoded heuristics.
         """
         num_dc = int(self.NUM_DATACENTERS)
-        ones = np.ones(num_dc, dtype=np.float32)
-
-        # Get individual biases for each metric
-        def get_bias_for_metric(metric: str) -> np.ndarray:
-            if metric == "carbon":
-                ci = np.maximum(self._dc_carbon, 1e-3)
-                return 1.0 / ci
-            elif metric == "water":
-                w = np.maximum(self._dc_water, 1e-3)
-                return 1.0 / w
-            elif metric in ("cost", "energy_cost", "price"):
-                p = np.maximum(self._dc_price, 1e-3)
-                return 1.0 / p
-            elif metric == "ttft":
-                # For TTFT: Use UNIFORM bias - let proximity bias handle latency
-                # Load balancing is handled dynamically in step() based on actual traffic
-                # Previously this favored DC 0 which caused severe overloading
-                return ones.copy()
-            elif metric == "total_energy":
-                p = np.maximum(self._dc_price, 1e-3)
-                return 1.0 / p
-            else:
-                return ones.copy()
-
-        # Blend biases based on reward weights
-        weights = getattr(self, "reward_weights", {})
-        if not weights:
-            # Fallback to primary_metric if no weights
-            metric = getattr(self, "primary_metric", "ttft")
-            bias = get_bias_for_metric(metric)
-        else:
-            # Weighted blend of all metric biases
-            total_weight = sum(weights.values())
-            if total_weight <= 0:
-                total_weight = 1.0
-
-            blended_bias = np.zeros(num_dc, dtype=np.float32)
-            for metric, weight in weights.items():
-                if weight > 0:
-                    metric_bias = get_bias_for_metric(metric)
-                    # Normalize each bias to mean=1 before blending
-                    metric_bias = metric_bias / max(metric_bias.mean(), 1e-6)
-                    blended_bias += (weight / total_weight) * metric_bias
-
-            bias = blended_bias if blended_bias.sum() > 0 else ones
-
-        # Normalize so that average bias is ~1.0 (keeps behavior well-scaled)
-        mean = float(bias.mean()) if bias.size > 0 else 1.0
-        if mean <= 0.0 or not np.isfinite(mean):
-            out = ones
-        else:
-            out = (bias / mean).astype(np.float32)
-
-        if getattr(self, "debug", False):
-            print(
-                f"[ResourceEnv INIT] metric bias for weights={weights}: "
-                f"{np.round(out, 3)}"
-            )
-        return out
+        return np.ones(num_dc, dtype=np.float32)
 
     # ------------------------------------------------------------------
     # Baseline plan for each epoch: local-only routing + simple power plan
@@ -551,10 +493,11 @@ class ResourceEnv(ParallelEnv):
         self._last_results = None
         self._last_leftovers = None
 
-        # Reset Lagrange multipliers and reward scale each episode
+        # Reset Lagrange multipliers each episode (but NOT reward_scale!)
         for cname in self.duals.keys():
             self.duals[cname] = 0.0
-        self.reward_scale = 1.0
+        # NOTE: reward_scale is NOT reset - it persists across episodes
+        # This provides stable normalization across training
 
         # ------------------------------------------------------
         # Randomly select an epoch from the pool (if >1 available)
@@ -600,11 +543,28 @@ class ResourceEnv(ParallelEnv):
             )
         return obs, infos
 
-    def _softmax_across_dcs(self, logits_per_agent: Dict[str, float]) -> np.ndarray:
-        """Softmax over DC agents for a single model."""
+    def _softmax_across_dcs(self, logits_per_agent: Dict[str, float], temperature: float = 0.5) -> np.ndarray:
+        """
+        Temperature-scaled softmax over DC agents for a single model.
+
+        Lower temperature (< 1.0) makes the distribution MORE peaked,
+        making it easier for the agent to achieve single-DC concentration.
+
+        With temperature=0.5:
+        - logit difference of 2.0 → ~88% to winner
+        - logit difference of 3.0 → ~95% to winner
+        - logit difference of 4.0 → ~98% to winner
+
+        This allows the agent to achieve near-single-DC routing when desired,
+        while still supporting distributed routing when logits are similar.
+        """
         vals = np.array([logits_per_agent[a] for a in self.agents], dtype=np.float64)
         vals = np.clip(vals, -50.0, 50.0)
-        vals -= np.max(vals)
+
+        # Apply temperature scaling (lower = more peaked)
+        vals = vals / temperature
+
+        vals -= np.max(vals)  # Numerical stability
         ex = np.exp(vals)
         s = ex.sum()
         if s <= 0 or not np.isfinite(s):
@@ -624,7 +584,11 @@ class ResourceEnv(ParallelEnv):
     # Moving reward scaling helper
     # ------------------------------------------------------------------
     def _update_metric_scale(self, key: str, value: float) -> None:
-        """Exponential moving average of each metric's typical scale."""
+        """
+        Exponential moving average of each metric's typical scale.
+
+        Uses slow adaptation (alpha=0.01) for training stability.
+        """
         value = float(max(value, 0.0))
         if value <= 0.0:
             return
@@ -634,7 +598,8 @@ class ResourceEnv(ParallelEnv):
             # First observation: use it as initial scale
             self.metric_scales[key] = value
         else:
-            alpha = self.metric_scale_alpha
+            # Use slow alpha for stability across epochs
+            alpha = 0.01  # Much slower than default
             self.metric_scales[key] = (1.0 - alpha) * cur + alpha * value
 
     def _metric_score(self, key: str, value: float) -> float:
@@ -665,22 +630,35 @@ class ResourceEnv(ParallelEnv):
         return float(np.clip(score, 1e-6, 1.0))
 
     def _scale_reward(self, raw_reward: float) -> float:
-        """Apply exponential moving scaling + optional clipping."""
-        alpha = self.reward_scale_alpha
-        abs_r = abs(raw_reward)
+        """
+        Apply stable reward normalization.
 
-        # Initialize scale sensibly if very small
+        Key changes for stability:
+        1. Use slower EMA (alpha=0.01) for scale updates
+        2. Don't let scale drop too low (min 0.1)
+        3. Clip final reward to reasonable range
+        """
+        # Use slower adaptation for more stable training
+        alpha = 0.01  # Much slower than before (was self.reward_scale_alpha)
+        abs_r = abs(raw_reward) + 1e-6
+
+        # Initialize scale if needed
         if self.reward_scale <= 1e-6:
             self.reward_scale = max(abs_r, 1.0)
         else:
-            self.reward_scale = (1.0 - alpha) * self.reward_scale + alpha * max(abs_r, 1.0)
+            # Slow exponential moving average
+            self.reward_scale = (1.0 - alpha) * self.reward_scale + alpha * abs_r
 
-        scaled = raw_reward / max(self.reward_scale, 1e-6)
+        # Ensure scale doesn't get too small (prevents explosion)
+        self.reward_scale = max(self.reward_scale, 0.1)
 
-        if self.reward_clip > 0.0:
-            scaled = float(np.clip(scaled, -self.reward_clip, self.reward_clip))
+        # Normalize
+        scaled = raw_reward / self.reward_scale
 
-        return float(scaled)
+        # Clip to stable range for PPO
+        scaled = float(np.clip(scaled, -10.0, 10.0))
+
+        return scaled
 
     def step(self, actions: Dict[str, np.ndarray]):
         assert set(actions.keys()) == set(self.agents), (
@@ -793,43 +771,14 @@ class ResourceEnv(ParallelEnv):
             else:
                 base_dist = np.asarray(dist_70b, dtype=np.float64).copy()
 
-            # Apply proximity bias + scheme-specific metric bias.
+            # Agent's policy output directly becomes the routing weights
+            # No metric bias, no proximity bias - pure learned policy
             weights = np.zeros_like(base_dist)
 
-            # Determine if we should use proximity bias
-            # For TTFT, proximity matters (network latency)
-            # For carbon/water/cost, we want to route to best DC regardless of distance
-            metric = getattr(self, "primary_metric", "ttft")
-            use_proximity_bias = (metric == "ttft")
-
             for dc_id in range(num_dc):
-                if use_proximity_bias:
-                    dist_idx = abs(dc_id - src_dc)
-                    # closeness in [0.5, 1.0]; tweak 0.5 for stronger/weaker bias
-                    closeness = 1.0 - 0.5 * (dist_idx / max_dc_distance)
-                    closeness = max(closeness, 0.0)
-                else:
-                    # No proximity bias for non-TTFT metrics
-                    closeness = 1.0
-
-                # Apply metric bias with exponent to amplify differences
-                # For TTFT: metric_bias is uniform (1.0), so exponent doesn't matter much
-                #           - proximity (closeness) is the main differentiator
-                # For carbon/water/cost: need strong exponent to route to best DC
-                if use_proximity_bias:
-                    # TTFT: Lower exponent since proximity is the main factor
-                    metric_bias_strength = 1.0
-                else:
-                    # Carbon/water/cost: Higher exponent for stronger differentiation
-                    metric_bias_strength = 4.0
-
-                amplified_bias = self._metric_bias[dc_id] ** metric_bias_strength
-
-                weights[dc_id] = (
-                        base_dist[dc_id]
-                        * closeness
-                        * amplified_bias
-                )
+                # NO BIAS AT ALL - agent's softmax output IS the routing decision
+                # The agent will learn optimal routing purely from reward signal
+                weights[dc_id] = base_dist[dc_id]
 
             # --- Apply DC mask: zero out weights for disabled DCs ---
             if hasattr(self, 'dc_mask'):
@@ -851,17 +800,21 @@ class ResourceEnv(ParallelEnv):
             else:
                 weights /= total_w
 
-            # Routing strategy depends on metric:
-            # - TTFT: Route to SINGLE best DC (argmax) to minimize latency
-            #         Fractional routing adds overhead and can hurt TTFT
-            # - Carbon/Water/Cost: Fractional routing is fine, focuses on best DC anyway
+            # UNIFIED ROUTING: Use fractional routing for ALL metrics
+            # Agent's policy network outputs the distribution directly
 
-            if use_proximity_bias:
-                # TTFT: Single-DC routing - pick the DC with highest weight
-                best_dc = int(np.argmax(weights))
+            for dc_id in range(num_dc):
+                share = float(weights[dc_id])
+                if share < 0.01:  # Skip tiny shares
+                    continue
+
+                token_share = tokens * share
+                if token_share <= 0.0:
+                    continue
 
                 # Add model variant suffix for proper simulator lookup
-                model_suffix = "_FP16 (Base)_B16"
+                # Use B16 for larger batches when consolidating
+                model_suffix = "_FP16 (Base)_B16" if share > 0.5 else "_FP16 (Base)_B1"
                 full_model_str = f"{model}{model_suffix}"
 
                 req_rows.append(
@@ -869,36 +822,11 @@ class ResourceEnv(ParallelEnv):
                         "source_dc": src_dc,
                         "model": full_model_str,
                         "arrival_ms": 0,
-                        "tokens": tokens,
+                        "tokens": token_share,
                     }
                 )
-                plan_map[row_idx] = best_dc
+                plan_map[row_idx] = int(dc_id)
                 row_idx += 1
-            else:
-                # Carbon/Water/Cost: Split workload across DCs based on weights
-                for dc_id in range(num_dc):
-                    share = float(weights[dc_id])
-                    if share <= 0.0:
-                        continue
-
-                    token_share = tokens * share
-                    if token_share <= 0.0:
-                        continue
-
-                    # Add model variant suffix for proper simulator lookup
-                    model_suffix = "_FP16 (Base)_B1"
-                    full_model_str = f"{model}{model_suffix}"
-
-                    req_rows.append(
-                        {
-                            "source_dc": src_dc,
-                            "model": full_model_str,
-                            "arrival_ms": 0,
-                            "tokens": token_share,
-                        }
-                    )
-                    plan_map[row_idx] = int(dc_id)
-                    row_idx += 1
 
         # Failsafe: if no rows were generated, fall back to src->src
         if not req_rows:
@@ -1158,14 +1086,37 @@ class ResourceEnv(ParallelEnv):
             print(f"[ResourceEnv STEP] metric_improvements={ {k: f'{v:.3f}' for k, v in improvements.items()} }")
             print(f"[ResourceEnv STEP] metric_scores_blend={disp_scores}")
 
-        # 6d) Weighted scalar reward from metrics (all components ~[0,1])
+        # 6d) Weighted scalar reward from metrics
+        # SIMPLIFIED: For single-metric agents, just use the metric score directly
+        # For multi-metric agents, use weighted combination
         base_rw = 0.0
         contribs: Dict[str, Tuple[float, float, float]] = {}
-        for m, w in self.reward_weights.items():
-            val = float(global_scores.get(m, 0.0))
-            contrib = float(w) * val
-            base_rw += contrib
-            contribs[m] = (w, val, contrib)
+
+        # Check if this is a single-metric agent
+        is_single_metric = len(self.reward_weights) == 1 and not self.constraints
+
+        if is_single_metric:
+            # SIMPLIFIED REWARD for single-metric agents
+            # Directly use metric value with clear gradient signal
+            metric_name = list(self.reward_weights.keys())[0]
+            metric_val = metric_raw.get(metric_name, 0.0)
+            metric_scale = max(self.metric_scales.get(metric_name, 1.0), 1e-6)
+
+            # Normalized metric (lower is better for all our metrics)
+            normalized = metric_val / metric_scale
+
+            # Simple reward: negative of normalized metric
+            # This gives clear gradient: lower metric = higher reward
+            base_rw = -normalized + 1.0  # Shift so good performance is positive
+
+            contribs[metric_name] = (1.0, normalized, base_rw)
+        else:
+            # Multi-metric: use weighted combination of scores
+            for m, w in self.reward_weights.items():
+                val = float(global_scores.get(m, 0.0))
+                contrib = float(w) * val
+                base_rw += contrib
+                contribs[m] = (w, val, contrib)
 
         if getattr(self, "debug", False):
             print("[ResourceEnv STEP] reward contributions per metric:")
@@ -1255,32 +1206,17 @@ class ResourceEnv(ParallelEnv):
         # Store constraint violations for external access
         self._constraint_violations = constraint_violations
 
-        # 6f) Action diversity bonus: encourage non-uniform routing distributions
-        # This helps PPO learn that different actions lead to different outcomes
+        # 6f) NO diversity bonus/penalty - let agent learn naturally
+        # The reward signal from the metric itself should guide exploration
+        # Adding artificial bonuses for concentration or diversity interferes with learning
         action_diversity_bonus = 0.0
-        if hasattr(self, '_dc_token_fractions') and self._dc_token_fractions is not None:
-            fracs = np.array(self._dc_token_fractions)
-            # Measure concentration: high when tokens go to few DCs
-            # Use Gini coefficient or similar
-            sorted_fracs = np.sort(fracs)[::-1]  # Descending
-            top_dc_share = sorted_fracs[0] if len(sorted_fracs) > 0 else 0
 
-            # Bonus for concentrated routing (helps single-objective agents)
-            # Penalty for too-uniform routing (prevents lazy uniform policy)
-            if top_dc_share > 0.5:
-                # Good: tokens concentrated to optimal DC
-                action_diversity_bonus = 0.1 * (top_dc_share - 0.5)
-            elif top_dc_share < 0.15:
-                # Bad: too uniform, not making meaningful decisions
-                action_diversity_bonus = -0.05
-
-        # 6g) Final reward: base minus penalties plus diversity bonus
-        # For hard constraints, the penalty weight is increased significantly
+        # 6g) Final reward: base minus penalties
         effective_penalty_weight = self.penalty_weight
         if any(v["violated"] for v in constraint_violations.values()):
-            effective_penalty_weight = max(self.penalty_weight, 5.0)  # Minimum 5x penalty weight when violated
+            effective_penalty_weight = max(self.penalty_weight, 5.0)
 
-        raw_reward = float(base_rw - effective_penalty_weight * total_penalty + action_diversity_bonus)
+        raw_reward = float(base_rw - effective_penalty_weight * total_penalty)
         final_reward = self._scale_reward(raw_reward)
 
         if getattr(self, "debug", False):
@@ -2118,7 +2054,7 @@ class DashboardTrainingCallback(BaseCallback):
 
             dashboard.register_profile(
                 self.profile_id,
-                total_timesteps
+                total_timesteps,
             )
             dashboard.start_training(self.profile_id)
             if self.verbose > 0:
@@ -2291,6 +2227,95 @@ def make_training_vec_env(
 
 
 # ======================================================================
+# Policy Warm Start - Initialize with sensible starting point
+# ======================================================================
+
+def _initialize_policy_warm_start(model, num_datacenters: int = 12):
+    """
+    Initialize the PPO policy with a sensible starting point.
+
+    This gives the agent a head start by:
+    1. Reducing initial weight magnitudes for more stable gradients
+    2. Setting biases to produce reasonable initial actions
+
+    IMPORTANT: We do NOT reduce log_std too much - the agent needs
+    exploration variance to discover concentrated routing strategies.
+
+    Action space per agent: [logit_7b, logit_70b, power_scalar]
+    - logits in [-5, 5] → softmax over 12 DCs (with temperature=0.5)
+    - power_scalar in [0, 1]
+
+    With temperature=0.5 softmax, the agent can achieve:
+    - Logit diff of 2 → 88% concentration
+    - Logit diff of 3 → 95% concentration
+    - Logit diff of 4 → 98% concentration
+
+    So the agent needs to explore logit values across the full [-5, 5] range
+    to discover optimal concentration levels.
+    """
+    import torch as th
+
+    try:
+        policy = model.policy
+
+        with th.no_grad():
+            # Initialize action network with moderate weights
+            if hasattr(policy, 'action_net'):
+                nn_module = policy.action_net
+                if hasattr(nn_module, 'weight'):
+                    # Use standard Xavier but not too small
+                    fan_in = nn_module.weight.shape[1]
+                    std = 1.0 / (fan_in ** 0.5)
+                    nn_module.weight.normal_(0, std)
+
+                if hasattr(nn_module, 'bias'):
+                    # Zero bias → uniform starting distribution
+                    nn_module.bias.zero_()
+
+            # Initialize policy MLP with moderate weights
+            if hasattr(policy, 'mlp_extractor') and hasattr(policy.mlp_extractor, 'policy_net'):
+                for layer in policy.mlp_extractor.policy_net:
+                    if isinstance(layer, th.nn.Linear):
+                        fan_in = layer.weight.shape[1]
+                        std = 1.0 / (fan_in ** 0.5)
+                        layer.weight.normal_(0, std)
+                        if layer.bias is not None:
+                            layer.bias.zero_()
+
+            # Value network
+            if hasattr(policy, 'value_net'):
+                nn_module = policy.value_net
+                if hasattr(nn_module, 'weight'):
+                    fan_in = nn_module.weight.shape[1]
+                    std = 1.0 / (fan_in ** 0.5)
+                    nn_module.weight.normal_(0, std)
+                if hasattr(nn_module, 'bias'):
+                    nn_module.bias.fill_(0.5)
+
+            if hasattr(policy, 'mlp_extractor') and hasattr(policy.mlp_extractor, 'value_net'):
+                for layer in policy.mlp_extractor.value_net:
+                    if isinstance(layer, th.nn.Linear):
+                        fan_in = layer.weight.shape[1]
+                        std = 1.0 / (fan_in ** 0.5)
+                        layer.weight.normal_(0, std)
+                        if layer.bias is not None:
+                            layer.bias.zero_()
+
+        # Keep log_std at default (0) for adequate exploration
+        # The agent needs to explore the full action range to find
+        # both distributed AND concentrated routing strategies
+        if hasattr(policy, 'log_std'):
+            with th.no_grad():
+                # log_std = 0 → std = 1.0 (good exploration range)
+                policy.log_std.fill_(0.0)
+
+        print(f"[WARM START] Policy initialized: balanced start, full exploration range")
+
+    except Exception as e:
+        print(f"[WARM START] Using default initialization: {e}")
+
+
+# ======================================================================
 # PPO training helpers (used by simulator_LLM.train_marl_constrained_profiles)
 # ======================================================================
 
@@ -2342,42 +2367,61 @@ def train_reward_scheme(
         num_envs=num_envs,
     )
 
-    # IMPROVED PPO HYPERPARAMETERS for better learning
-    # These settings help PPO learn stronger, more differentiated policies
+    # IMPROVED PPO HYPERPARAMETERS for STABLE learning
+    # Key changes:
+    # - Lower learning rate for stability
+    # - More steps per update for better gradient estimates
+    # - Higher entropy for single-metric agents (more exploration)
+    # - Normalize advantages for consistent updates
+
+    # Determine if single-metric agent
+    agent_config = agent_specs.get(profile_id, {})
+    weights = agent_config.get("weights", {})
+    constraints = agent_config.get("constraints", {})
+    is_single_metric = len(weights) == 1 and not constraints
+
+    # Adjust hyperparameters based on agent type
+    # Need enough exploration to discover both distributed AND concentrated strategies
+    if is_single_metric:
+        # Single-metric: needs exploration to find optimal concentration
+        ent_coef = 0.1  # Higher entropy to explore concentration vs distribution
+        lr = 3e-4
+        n_steps = 1024
+    else:
+        # Constrained: moderate exploration
+        ent_coef = 0.05
+        lr = 3e-4
+        n_steps = 2048
+
     model = PPO(
         policy="MlpPolicy",
         env=vec_env,
         verbose=1,
-        # Learning rate: slightly higher for faster initial learning
-        learning_rate=3e-4,
-        # Number of steps to run per update (larger = more stable gradients)
-        n_steps=2048,
-        # Batch size for updates
+        learning_rate=lr,
+        n_steps=n_steps,
         batch_size=64,
-        # Number of epochs when optimizing the surrogate loss
         n_epochs=10,
-        # Discount factor (slightly lower to focus on immediate rewards)
-        gamma=0.95,
-        # GAE lambda (generalized advantage estimation)
-        gae_lambda=0.9,
-        # Clipping parameter (slightly tighter for more conservative updates)
+        gamma=0.99,  # Higher gamma for longer-term thinking
+        gae_lambda=0.95,  # Standard GAE
         clip_range=0.2,
-        # Entropy coefficient (higher = more exploration)
-        ent_coef=0.01,
-        # Value function coefficient
+        ent_coef=ent_coef,
         vf_coef=0.5,
-        # Max gradient norm for clipping
         max_grad_norm=0.5,
-        # Policy network architecture: deeper network for more capacity
+        normalize_advantage=True,  # CRITICAL: normalize advantages for stability
         policy_kwargs={
             "net_arch": {
-                "pi": [128, 128, 64],  # Policy network: 3 layers
-                "vf": [128, 128, 64],  # Value network: 3 layers
+                "pi": [128, 128],  # Simpler network
+                "vf": [128, 128],
             },
-            # Use tanh activation for bounded outputs
             "activation_fn": th.nn.Tanh,
         },
     )
+
+    # =========================================================================
+    # WARM START: Initialize policy with a sensible starting point
+    # This gives the agent a head start without circumventing learning
+    # =========================================================================
+    _initialize_policy_warm_start(model, num_datacenters)
 
     # Get agent config for dashboard display
     agent_config = agent_specs.get(profile_id, {})
@@ -2420,15 +2464,15 @@ def train_all_schemes(
         num_envs: int = 1,
         overwrite_existing: bool = False,
         model_dir: str = "trained_models/sb3_agents",
-        parallel: bool = False,
-        max_workers: int = None,
+        parallel: bool = True,  # DEFAULT TO PARALLEL
+        max_workers: int = 8,  # DEFAULT TO 8 WORKERS
 ) -> None:
     """
     Train PPO for *all* provided profiles in agent_specs.
 
     Args:
-        parallel: If True, train profiles in parallel using multiprocessing
-        max_workers: Max parallel processes (default: min(num_profiles, cpu_count))
+        parallel: If True, train profiles in parallel (default: True)
+        max_workers: Max parallel processes (default: 8)
     """
     if not isinstance(epoch_df, pd.DataFrame):
         epoch_df = pd.DataFrame(epoch_df)
@@ -2452,7 +2496,7 @@ def train_all_schemes(
             max_workers=max_workers,
         )
     else:
-        # Original sequential training
+        # Sequential training (only if explicitly requested)
         for pid in profile_ids:
             train_reward_scheme(
                 profile_id=pid,
@@ -2500,6 +2544,19 @@ def _train_single_profile_worker(args: tuple) -> str:
         import os
         os.environ["CUDA_VISIBLE_DEVICES"] = ""  # Force CPU to avoid GPU contention
 
+        # Signal start via IPC
+        try:
+            from training_dashboard import _write_profile_state
+            _write_profile_state(profile_id, {
+                "profile_id": profile_id,
+                "is_training": True,
+                "is_completed": False,
+                "current_timesteps": 0,
+                "total_timesteps": total_timesteps,
+            })
+        except Exception:
+            pass
+
         train_reward_scheme(
             profile_id=profile_id,
             epoch_df=epoch_df,
@@ -2513,9 +2570,34 @@ def _train_single_profile_worker(args: tuple) -> str:
             overwrite_existing=overwrite_existing,
             model_dir=model_dir,
         )
+
+        # Signal completion via IPC
+        try:
+            from training_dashboard import _write_profile_state
+            _write_profile_state(profile_id, {
+                "profile_id": profile_id,
+                "is_training": False,
+                "is_completed": True,
+                "current_timesteps": total_timesteps,
+                "total_timesteps": total_timesteps,
+            })
+        except Exception:
+            pass
+
         return f"SUCCESS: {profile_id}"
     except Exception as e:
         import traceback
+        # Signal failure via IPC
+        try:
+            from training_dashboard import _write_profile_state
+            _write_profile_state(profile_id, {
+                "profile_id": profile_id,
+                "is_training": False,
+                "is_completed": True,
+                "error": str(e),
+            })
+        except Exception:
+            pass
         return f"FAILED: {profile_id} - {str(e)}\n{traceback.format_exc()}"
 
 
@@ -2531,7 +2613,7 @@ def train_all_schemes_parallel(
         num_envs: int = 1,
         overwrite_existing: bool = False,
         model_dir: str = "trained_models/sb3_agents",
-        max_workers: int = 8,
+        max_workers: int = None,
 ) -> Dict[str, str]:
     """
     Train all profiles in PARALLEL using multiprocessing.
@@ -2625,7 +2707,7 @@ def train_with_multi_epoch_parallel(
         model_dir: str = "trained_models/sb3_agents",
         spec_dir: str = "sim_specs",
         epoch_length: int = 900,
-        max_workers: int = 8,
+        max_workers: int = None,
         **kwargs,
 ) -> None:
     """
@@ -2679,8 +2761,8 @@ def train_with_multi_epoch_parallel(
         dc_df = pd.read_csv(dc_specs_path)
         if "DC_Num" in dc_df.columns:
             dc_df = dc_df.sort_values("DC_Num")
-        real_ci = dc_df[
-            "Carbon_Intensity"].tolist() if "Carbon_Intensity" in dc_df.columns else [400.0] * num_datacenters
+        real_ci = dc_df["Carbon_Intensity"].tolist() if "Carbon_Intensity" in dc_df.columns else [
+                                                                                                     400.0] * num_datacenters
     else:
         real_ci = [400.0] * num_datacenters
 
@@ -2753,7 +2835,8 @@ def train_with_multi_epoch_parallel(
 
     # Train in parallel
     print(f"[MARL PARALLEL] Starting parallel training...")
-    start_time = time.time() if 'time' in dir() else 0
+    import time as time_module
+    start_time = time_module.time()
 
     results = {}
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
@@ -2776,7 +2859,7 @@ def train_with_multi_epoch_parallel(
                 results[profile_id] = f"EXCEPTION: {str(e)}"
                 print(f"[MARL PARALLEL] EXCEPTION for {profile_id}: {e}")
 
-    elapsed = time.time() - start_time if 'time' in dir() and start_time else 0
+    elapsed = time_module.time() - start_time
     successes = sum(1 for r in results.values() if "SUCCESS" in r)
 
     print(f"\n[MARL PARALLEL] ==========================================")
@@ -2905,8 +2988,8 @@ def train_with_multi_epoch(
         model_dir: str = "trained_models/sb3_agents",
         spec_dir: str = "sim_specs",
         epoch_length: int = 900,
-        parallel: bool = True,
-        max_workers: int = 8,
+        parallel: bool = True,  # DEFAULT TO PARALLEL
+        max_workers: int = 8,  # DEFAULT TO 8 WORKERS
         **kwargs,
 ) -> None:
     """
@@ -2928,10 +3011,10 @@ def train_with_multi_epoch(
         model_dir: Directory to save trained models
         spec_dir: Directory containing simulation specs
         epoch_length: Length of each epoch in seconds
-        parallel: If True, train all profiles in parallel (faster!)
-        max_workers: Max parallel processes (default: cpu_count - 1)
+        parallel: If True, train all profiles in parallel (default: True)
+        max_workers: Max parallel processes (default: 8)
     """
-    # If parallel requested, use the parallel implementation
+    # ALWAYS use parallel implementation (default behavior)
     if parallel:
         return train_with_multi_epoch_parallel(
             trace_path=trace_path,
