@@ -16,104 +16,87 @@ from typing import Dict, Any, List, Optional, Callable, Union, Literal
 
 
 def train_marl_constrained_profiles(
-    epoch_data: pd.DataFrame,
-    epoch_idx: int,
-    num_datacenters: int,
-    node_properties,
-    total_timesteps: int = 100_000,
-    num_envs: int = 1,             # kept for compatibility, passed through
-    overwrite_existing: bool = False,
-    model_dir: str = "trained_models/sb3_agents",
-    spec_dir: str = "sim_specs",
-    epoch_length: int = 900,
+        epoch_data: pd.DataFrame,
+        epoch_idx: int,
+        num_datacenters: int,
+        node_properties,
+        total_timesteps: int = 100_000,
+        num_envs: int = 1,
+        overwrite_existing: bool = False,
+        model_dir: str = "trained_models/sb3_agents",
+        # Add new args to match call in __main__
+        spec_dir: str = "sim_specs",
+        epoch_length: int = 900,
 ):
     """
-    Train MARL profiles using the multi-agent infrastructure in MultiAgentRL.py.
-
-    We include:
-      - All *constrained* profiles (non-empty `constraints` dict), and
-      - All *single-metric, unconstrained* profiles
-        (no constraints, exactly one metric in `weights`), e.g.:
-          * pure time (latency)
-          * pure carbon
-          * pure water
-          * pure cost
-
-    This keeps the environment truly multi-agent (PettingZoo + Supersuit)
-    and lets each profile use its own PPO policy.
+    Train MARL profiles using the multi-agent infrastructure in MultiAgentRL_Broken.py.
     """
     import MultiAgentRL
 
     # 1) Build full agent_specs from this file's helper
     agent_specs = build_agent_specs(num_datacenters=num_datacenters)
 
-    # 2) Split into constrained + single-metric unconstrained profiles
-    constrained_specs = {
-        pid: spec
-        for pid, spec in agent_specs.items()
-        if spec.get("constraints")  # non-empty dict
-    }
-
-    single_metric_specs = {
-        pid: spec
-        for pid, spec in agent_specs.items()
-        if not spec.get("constraints")                  # no hard constraints
-        and len(spec.get("weights", {})) == 1           # exactly one metric
-    }
+    # ... (Selection logic remains same) ...
+    constrained_specs = {k: v for k, v in agent_specs.items() if v.get("constraints")}
+    single_metric_specs = {k: v for k, v in agent_specs.items() if
+                           not v.get("constraints") and len(v.get("weights", {})) == 1}
 
     if not constrained_specs and not single_metric_specs:
-        print("[MARL TRAIN] No profiles (constrained or single-metric) found in build_agent_specs; nothing to train.")
         return
 
-    constrained_ids = list(constrained_specs.keys())
-    single_ids = list(single_metric_specs.keys())
-
-    if constrained_ids:
-        print(f"[MARL TRAIN] Constrained profiles to train: {constrained_ids}")
-    if single_ids:
-        print(f"[MARL TRAIN] Single-metric (unconstrained) profiles to train: {single_ids}")
-
-    # 2.5) Combine into one dict for training
     training_specs = {}
     training_specs.update(single_metric_specs)
     training_specs.update(constrained_specs)
 
-    print(f"[MARL TRAIN] Using epoch {epoch_idx} for training data")
-
     # 3) Build a minimal epoch_summary for ResourceEnv / MultiAgentRL
-    llama7b_total = float(
-        epoch_data[epoch_data["model_type"] == "Llama7b"]["num_tokens"].sum()
-    )
-    llama70b_total = float(
-        epoch_data[epoch_data["model_type"] == "Llama70b"]["num_tokens"].sum()
-    )
+    # UPDATE: Calculate totals robustly
+    is_7b = epoch_data["model_type"].astype(str).str.lower().str.contains("7b")
+    is_70b = epoch_data["model_type"].astype(str).str.lower().str.contains("70b")
+
+    llama7b_total = float(epoch_data[is_7b]["num_tokens"].sum())
+    llama70b_total = float(epoch_data[is_70b]["num_tokens"].sum())
+
+    # --- [NEW] Load Real Carbon Intensity from Specs ---
+    # We need the agents to know the REAL carbon values, not the 1.0 fallback.
+    import os
+    dc_specs_path = os.path.join(spec_dir, "Datacenter_specs.csv")
+    if os.path.exists(dc_specs_path):
+        dc_df = pd.read_csv(dc_specs_path)
+        # Sort by DC_Num to ensure alignment
+        if "DC_Num" in dc_df.columns:
+            dc_df = dc_df.sort_values("DC_Num")
+        # Extract Carbon Intensity column
+        # Matches the CSV header from Rate_Flow_Sim.py (usually 'Carbon_Intensity')
+        if "Carbon_Intensity" in dc_df.columns:
+            real_ci = dc_df["Carbon_Intensity"].astype(float).tolist()
+        else:
+            print("[WARNING] 'Carbon_Intensity' column not found in specs. Using default.")
+            real_ci = [400.0] * num_datacenters  # Safer default than 1.0
+    else:
+        print("[WARNING] Datacenter_specs.csv not found. Using default 400.0.")
+        real_ci = [400.0] * num_datacenters
 
     epoch_summary = {
         "llama7b_total": llama7b_total,
         "llama70b_total": llama70b_total,
         "num_datacenters": num_datacenters,
-        # Pass through simulator-related settings so ResourceEnv / LLM_Simulator
-        # can use them if needed.
         "spec_dir": spec_dir,
         "epoch_length": epoch_length,
+        # Pass the loaded values to the Env
+        "dc_carbon_intensity": real_ci,
     }
 
     # 4) Delegate to the multi-agent trainer
-    MultiAgentRL.train_all_schemes(
-        epoch_df=epoch_data,
-        epoch_summary=epoch_summary,
-        epoch_idx=epoch_idx,
+    MultiAgentRL.train_with_multi_epoch(
+        trace_path="simulator_ready_trace.csv",
+        num_datacenters=12,
+        agent_specs=build_agent_specs(12),
         node_properties=node_properties,
-        agent_specs=training_specs,
-        num_datacenters=num_datacenters,
-        total_timesteps=total_timesteps,
-        num_envs=num_envs,
-        overwrite_existing=overwrite_existing,
-        model_dir=model_dir,
+        total_timesteps=2_000_000,
+        sampling_strategy="stratified",  # or "uniform", "curriculum"
+        use_domain_randomization=True,
     )
-
-    print("[MARL TRAIN] Finished training all selected MARL profiles (constrained + single-metric).")
-
+    print("[MARL TRAIN] Finished training all selected MARL profiles.")
 
 
 def write_epoch_stats(tag: str, epoch_index: int, stats_dict: dict, tag2: Optional[str] = None) -> None:
@@ -131,10 +114,11 @@ def get_deterministic_perturbation(epoch_idx, error_rate):
     hash_bytes = hashlib.sha256(key.encode()).digest()
     raw = int.from_bytes(hash_bytes[:4], 'big')  # first 4 bytes
 
-    frac = (raw % 10**6) / 10**6  # → [0, 1)
+    frac = (raw % 10 ** 6) / 10 ** 6  # → [0, 1)
     perturbation = 1.0 + (2 * frac - 1.0) * error_rate  # → [1 - e, 1 + e]
 
     return perturbation
+
 
 def apply_rate_error(summary, epoch_idx, error_rate):
     if error_rate == 0.0:
@@ -152,25 +136,32 @@ def apply_rate_error(summary, epoch_idx, error_rate):
 
     return summary
 
+
 Number = Union[int, float]
 MergePolicy = Literal["min", "max", "sum", "override"]
 
+
 def _always() -> Callable[[int], bool]:
     return lambda _: True
+
 
 def schedule_only_epochs(epochs: List[int]) -> Callable[[int], bool]:
     S = set(int(e) for e in epochs)
     return lambda e: e in S
 
+
 def schedule_in_range(start_incl: int, end_incl: int) -> Callable[[int], bool]:
     s, t = int(start_incl), int(end_incl)
     return lambda e: s <= e <= t
 
+
 def schedule_every_k(k: int, phase: int = 0, active_residue: Optional[List[int]] = None) -> Callable[[int], bool]:
     """Looping: active when (epoch - phase) % k is in residues (default {0})."""
-    k = int(k); phase = int(phase)
+    k = int(k);
+    phase = int(phase)
     residues = {0} if not active_residue else set(int(r) for r in active_residue)
     return lambda e: ((e - phase) % k) in residues
+
 
 def _merge_constraints(dst: Dict[str, Any], src: Dict[str, Any], policy: MergePolicy = "override", priority: int = 0):
     """
@@ -192,6 +183,7 @@ def _merge_constraints(dst: Dict[str, Any], src: Dict[str, Any], policy: MergePo
             dst[k] = (dst[k] + v)
         else:
             raise ValueError(f"Unknown merge policy: {policy}")
+
 
 def resolve_epoch_constraints(agent_spec: Dict[str, Any], epoch_idx: int) -> Dict[str, Any]:
     """
@@ -238,116 +230,79 @@ def resolve_epoch_constraints(agent_spec: Dict[str, Any], epoch_idx: int) -> Dic
 
     return out
 
-def build_agent_specs(num_datacenters: int):
-    # Helper caps for power-based hard constraints (same meaning as before)
-    global_power_cap = 0.6 * float(num_datacenters)  # sum of power scalars across DCs per step
-    per_dc_power_cap = 0.85
 
-    agent_specs = {
-        # ---- Single-objective (no constraints) ----
-        # These are fine: only 'ttft', 'carbon', 'water', 'cost' which match the env.
+def build_agent_specs(num_datacenters: int = 12) -> Dict[str, Dict[str, Any]]:
+    """
+    Build agent specifications with tuned constraints.
+
+    Budget level: moderate
+    Based on baseline metrics:
+      Carbon: 8,000 kg
+      Water: 5,000 L
+      Cost: $2,800
+      Energy: 22,774 kWh
+    """
+    return {
+        # Single-objective agents (no constraints, pure optimization)
         "time_agent": {
             "weights": {"ttft": 10},
             "constraints": {},
-            "include_duals_in_obs": False,
         },
         "carbon_agent": {
             "weights": {"carbon": 10},
             "constraints": {},
-            "include_duals_in_obs": False,
         },
         "water_agent": {
             "weights": {"water": 10},
             "constraints": {},
-            "include_duals_in_obs": False,
         },
         "cost_agent": {
             "weights": {"cost": 10},
             "constraints": {},
-            "include_duals_in_obs": False,
         },
 
-        # ---- Practical, constrained profiles ----
-
-        # 1) Green performance: prefer low latency, keep carbon under budget (episode window)
+        # Hybrid agents (balanced objectives with constraints)
         "green_perf": {
             "weights": {"ttft": 6, "carbon": 3, "cost": 1},
             "constraints": {
-                # This already matches the 'carbon' metric used in the env
                 "carbon": {
-                    "budget": 300000,
+                    "budget": 4000,  # 50% of baseline
                     "scope": "global",
-                    "window": "episode",
-                    "hard": False,
-                    "budget_units": "raw",
-                    # Optional: make the constraint type explicit
-                    "type": "upper_bound",
-                }
+                    "penalty": 0.5,
+                },
             },
-            "lambda_lr": {"carbon": 5e-4},
-            "include_duals_in_obs": True,
         },
-
-        # 2) Cost guard: fast service but constrained by *energy cost* budget.
-        #    Use 'cost' here, because the env exposes the metric as 'cost',
-        #    derived from metrics['energy_cost'].
         "cost_guard": {
             "weights": {"ttft": 7, "cost": 3},
             "constraints": {
                 "cost": {
-                    "budget": 100000,
+                    "budget": 2800,  # 100% of baseline
                     "scope": "global",
-                    "window": "episode",
-                    "hard": False,
-                    "budget_units": "raw",
-                    "type": "upper_bound",
-                }
+                    "penalty": 0.5,
+                },
             },
-            "lambda_lr": {"cost": 5e-4},
-            "include_duals_in_obs": True,
         },
-
-        # 3) Water saver: prioritize performance with a water cap (episode window).
-        #    Use 'water', because the env exposes 'water' (from metrics['water_usage']).
         "water_saver": {
             "weights": {"ttft": 7, "water": 3},
             "constraints": {
                 "water": {
-                    "budget": 3000000,
+                    "budget": 2500,  # 50% of baseline
                     "scope": "global",
-                    "window": "episode",
-                    "hard": False,
-                    "budget_units": "raw",
-                    "type": "upper_bound",
-                }
+                    "penalty": 0.5,
+                },
             },
-            "lambda_lr": {"water": 5e-4},
-            "include_duals_in_obs": True,
         },
-
-        # 4) Peak power guard: use total_energy as a proxy for power.
-        #    The previous 'power' weight never did anything because the env
-        #    doesn't have a 'power' metric in the reward code.
         "peak_power_guard": {
-            "weights": {"ttft": 7, "total_energy": 3},
+            "weights": {"ttft": 8, "total_energy": 2},
             "constraints": {
                 "total_energy": {
-                    "budget": 100000,
+                    "budget": 25051,  # 110% of baseline
                     "scope": "global",
-                    "window": "episode",
-                    "hard": False,
-                    "budget_units": "raw",
-                    "type": "upper_bound",
+                    "penalty": 0.3,
                 },
-                # You could later add step-level "peak" constraints based on
-                # global_power_cap / per_dc_power_cap if/when you expose a
-                # per-step power metric from the simulator.
             },
-            "lambda_lr": {"total_energy": 5e-4},
-            "include_duals_in_obs": True,
         },
     }
-    return agent_specs
 
 
 def _unwrap_to_resource_env(env):
@@ -374,7 +329,9 @@ def _unwrap_to_resource_env(env):
                 except Exception:
                     continue
         return None
+
     return recursive_find(env)
+
 
 def rollout_once_collect_leftovers(env_config, model_dir, profile_name):
     import supersuit
@@ -419,7 +376,6 @@ def rollout_once_collect_leftovers(env_config, model_dir, profile_name):
     return leftovers or []
 
 
-
 if __name__ == "__main__":
     import argparse, os
     import pandas as pd
@@ -436,7 +392,7 @@ if __name__ == "__main__":
     parser.add_argument('-d', '--duration', type=int, default=22)
     parser.add_argument('-r', '--request', type=int, default=1)
     parser.add_argument('-f', '--framework', type=str, default='Helix',
-                        choices=['Helix','NSGA2','PerLLM','Splitwise','Hybrid','MARL'])
+                        choices=['Helix', 'NSGA2', 'PerLLM', 'Splitwise', 'Hybrid', 'MARL'])
 
     # Scaling
     parser.add_argument('--freq-scale', type=float, default=1.0)
@@ -468,7 +424,50 @@ if __name__ == "__main__":
         action='store_true',
         help='Retrain and overwrite existing MARL models if they already exist.'
     )
+
+    # Distribution mode for request origins
+    parser.add_argument(
+        '--distribution',
+        type=str,
+        default='even',
+        choices=['even', 'population', 'time'],
+        help='Request origin distribution mode: even (round-robin), population (weighted by region), or time (diurnal pattern following activity hours)'
+    )
+
+    # Population weights can be specified as JSON or use defaults
+    parser.add_argument(
+        '--population-weights',
+        type=str,
+        default=None,
+        help='JSON string of population weights per DC (e.g., \'{"0":0.15,"1":0.10,...}\')'
+    )
+
+    # Time zone offsets for time-based distribution
+    parser.add_argument(
+        '--timezone-offsets',
+        type=str,
+        default=None,
+        help='JSON string of UTC offset hours per DC (e.g., \'{"0":-5,"1":-8,...}\') for time-based distribution'
+    )
+
+    # Spec directory override
+    parser.add_argument(
+        '--spec-dir',
+        type=str,
+        default='sim_specs',
+        help='Directory containing simulation spec CSV files'
+    )
+
+    # Custom node type counts (for scalability experiments)
+    parser.add_argument(
+        '--node-type-counts',
+        type=str,
+        default=None,
+        help='JSON string of node type counts per type (e.g., \'{"0":167,"1":167,...}\')'
+    )
+
     args = parser.parse_args()
+
 
     # ---------- Helpers ----------
     def _map_model_to_llama(m: str) -> str:
@@ -483,6 +482,58 @@ if __name__ == "__main__":
             return "Llama7b"
         # fallback: pass-through
         return str(m)
+
+
+    # Default population weights for major regions (normalized)
+    # Based on approximate global internet user distribution
+    DEFAULT_POPULATION_WEIGHTS = {
+        0: 0.12,  # US East
+        1: 0.10,  # US West
+        2: 0.08,  # US Central
+        3: 0.15,  # Europe West
+        4: 0.10,  # Europe Central
+        5: 0.05,  # Europe North
+        6: 0.18,  # Asia Pacific (China region)
+        7: 0.08,  # Asia Pacific (Japan/Korea)
+        8: 0.06,  # Asia Pacific (Southeast)
+        9: 0.04,  # South America
+        10: 0.02,  # Middle East
+        11: 0.02,  # Africa
+    }
+
+    # Default timezone offsets (UTC hours) for time-based distribution
+    # Maps DC regions to their approximate UTC offsets
+    DEFAULT_TIMEZONE_OFFSETS = {
+        0: -5,  # US East (EST/EDT)
+        1: -8,  # US West (PST/PDT)
+        2: -6,  # US Central (CST/CDT)
+        3: 0,  # Europe West (GMT/WET)
+        4: 1,  # Europe Central (CET)
+        5: 2,  # Europe North (EET)
+        6: 8,  # Asia Pacific - China (CST)
+        7: 9,  # Asia Pacific - Japan/Korea (JST/KST)
+        8: 7,  # Asia Pacific - Southeast (ICT)
+        9: -3,  # South America (BRT)
+        10: 3,  # Middle East (AST)
+        11: 2,  # Africa (CAT)
+    }
+
+    # Base population for time-weighted distribution (used as multiplier)
+    DEFAULT_BASE_POPULATION = {
+        0: 0.12,  # US East
+        1: 0.10,  # US West
+        2: 0.08,  # US Central
+        3: 0.15,  # Europe West
+        4: 0.10,  # Europe Central
+        5: 0.05,  # Europe North
+        6: 0.18,  # Asia Pacific (China region)
+        7: 0.08,  # Asia Pacific (Japan/Korea)
+        8: 0.06,  # Asia Pacific (Southeast)
+        9: 0.04,  # South America
+        10: 0.02,  # Middle East
+        11: 0.02,  # Africa
+    }
+
 
     def _even_src_dc(df: pd.DataFrame, num_dcs: int) -> pd.Series:
         """Round-robin assign source DC if missing; per-epoch so distribution is even each epoch."""
@@ -500,6 +551,191 @@ if __name__ == "__main__":
             out[idx] = np.arange(n) % max(1, num_dcs)
         return pd.Series(out, index=df.index, dtype=int)
 
+
+    def _population_weighted_src_dc(df: pd.DataFrame, num_dcs: int, weights: dict = None) -> pd.Series:
+        """Assign source DC based on population weights; per-epoch for reproducibility."""
+        if weights is None:
+            weights = DEFAULT_POPULATION_WEIGHTS
+
+        # Normalize weights to available DCs
+        available_weights = {k: v for k, v in weights.items() if k < num_dcs}
+        total = sum(available_weights.values())
+        if total > 0:
+            available_weights = {k: v / total for k, v in available_weights.items()}
+        else:
+            # Fallback to even distribution
+            available_weights = {i: 1.0 / num_dcs for i in range(num_dcs)}
+
+        dc_ids = list(available_weights.keys())
+        dc_probs = list(available_weights.values())
+
+        out = np.zeros(len(df), dtype=int)
+        if "epoch" not in df.columns:
+            out = np.random.choice(dc_ids, size=len(df), p=dc_probs)
+            return pd.Series(out, index=df.index, dtype=int)
+
+        # Per-epoch assignment with fixed seed for reproducibility
+        for ep, idx in df.groupby("epoch").indices.items():
+            np.random.seed(int(ep) * 42)  # Deterministic per epoch
+            n = len(idx)
+            out[idx] = np.random.choice(dc_ids, size=n, p=dc_probs)
+
+        return pd.Series(out, index=df.index, dtype=int)
+
+
+    def _time_based_src_dc(
+            df: pd.DataFrame,
+            num_dcs: int,
+            timezone_offsets: dict = None,
+            base_population: dict = None,
+            epoch_length_sec: int = 900,
+            simulation_start_hour: int = 0
+    ) -> pd.Series:
+        """
+        Assign source DC based on time-of-day activity patterns.
+
+        This simulates realistic diurnal traffic patterns where request origins
+        shift based on local time at each DC's region. Traffic follows the sun,
+        with more requests originating from regions during their active hours.
+
+        Activity model:
+        - Peak activity: 9 AM - 9 PM local time (business + evening hours)
+        - Low activity: 12 AM - 6 AM local time (night hours)
+        - Medium activity: 6 AM - 9 AM and 9 PM - 12 AM (transition periods)
+
+        Args:
+            df: DataFrame with 'epoch' column
+            num_dcs: Number of datacenters
+            timezone_offsets: Dict mapping DC ID to UTC offset in hours
+            base_population: Dict mapping DC ID to base population weight
+            epoch_length_sec: Duration of each epoch in seconds (default 900 = 15 min)
+            simulation_start_hour: Starting hour of simulation in UTC (default 0 = midnight)
+
+        Returns:
+            Series of source DC IDs
+        """
+        if timezone_offsets is None:
+            timezone_offsets = DEFAULT_TIMEZONE_OFFSETS
+        if base_population is None:
+            base_population = DEFAULT_BASE_POPULATION
+
+        def get_activity_multiplier(local_hour: float) -> float:
+            """
+            Return activity multiplier based on local hour (0-24).
+            Models typical human activity patterns:
+            - Night (0-6): Very low activity (0.1-0.3)
+            - Morning transition (6-9): Rising activity (0.3-0.8)
+            - Day/Evening peak (9-21): High activity (0.8-1.0)
+            - Night transition (21-24): Declining activity (0.5-0.3)
+            """
+            hour = local_hour % 24
+
+            if 0 <= hour < 6:
+                # Night: very low, slight increase toward morning
+                return 0.1 + 0.03 * hour  # 0.1 to 0.28
+            elif 6 <= hour < 9:
+                # Morning ramp-up
+                return 0.3 + 0.23 * (hour - 6)  # 0.3 to 0.99
+            elif 9 <= hour < 12:
+                # Morning peak
+                return 0.9 + 0.03 * (hour - 9)  # 0.9 to 0.99
+            elif 12 <= hour < 14:
+                # Lunch dip
+                return 0.85
+            elif 14 <= hour < 18:
+                # Afternoon peak
+                return 0.95
+            elif 18 <= hour < 21:
+                # Evening peak (often highest for consumer services)
+                return 1.0
+            elif 21 <= hour < 23:
+                # Evening decline
+                return 0.8 - 0.2 * (hour - 21)  # 0.8 to 0.4
+            else:  # 23-24
+                # Late night
+                return 0.3
+
+        def compute_epoch_weights(epoch: int, num_dcs: int) -> dict:
+            """Compute DC weights for a specific epoch based on local time activity."""
+            # Calculate UTC hour for this epoch
+            # Each epoch is epoch_length_sec seconds, starting from simulation_start_hour
+            hours_elapsed = (epoch * epoch_length_sec) / 3600.0
+            utc_hour = (simulation_start_hour + hours_elapsed) % 24
+
+            weights = {}
+            for dc_id in range(num_dcs):
+                # Get timezone offset for this DC
+                tz_offset = timezone_offsets.get(dc_id, 0)
+
+                # Calculate local hour at this DC
+                local_hour = (utc_hour + tz_offset) % 24
+
+                # Get activity multiplier based on local time
+                activity = get_activity_multiplier(local_hour)
+
+                # Get base population weight for this DC
+                base_pop = base_population.get(dc_id, 1.0 / num_dcs)
+
+                # Final weight = base_population * activity_multiplier
+                weights[dc_id] = base_pop * activity
+
+            # Normalize weights to sum to 1
+            total = sum(weights.values())
+            if total > 0:
+                weights = {k: v / total for k, v in weights.items()}
+            else:
+                weights = {i: 1.0 / num_dcs for i in range(num_dcs)}
+
+            return weights
+
+        out = np.zeros(len(df), dtype=int)
+
+        if "epoch" not in df.columns:
+            # Single epoch, use epoch 0
+            weights = compute_epoch_weights(0, num_dcs)
+            dc_ids = list(weights.keys())
+            dc_probs = list(weights.values())
+            out = np.random.choice(dc_ids, size=len(df), p=dc_probs)
+            return pd.Series(out, index=df.index, dtype=int)
+
+        # Per-epoch assignment based on time-of-day
+        for ep, idx in df.groupby("epoch").indices.items():
+            np.random.seed(int(ep) * 42)  # Deterministic per epoch
+
+            # Compute weights for this epoch
+            weights = compute_epoch_weights(int(ep), num_dcs)
+            dc_ids = list(weights.keys())
+            dc_probs = list(weights.values())
+
+            n = len(idx)
+            out[idx] = np.random.choice(dc_ids, size=n, p=dc_probs)
+
+        return pd.Series(out, index=df.index, dtype=int)
+
+
+    def _assign_src_dc(
+            df: pd.DataFrame,
+            num_dcs: int,
+            distribution: str,
+            weights: dict = None,
+            timezone_offsets: dict = None
+    ) -> pd.Series:
+        """Unified source DC assignment based on distribution mode."""
+        if "source_dc_id" in df.columns:
+            # Already has source_dc_id, but may need to apply distribution
+            existing = pd.to_numeric(df["source_dc_id"], errors="coerce").fillna(0).astype(int)
+            # If trace already has valid assignments, respect them unless forcing redistribution
+            if existing.max() > 0:
+                return existing
+
+        if distribution == "population":
+            return _population_weighted_src_dc(df, num_dcs, weights)
+        elif distribution == "time":
+            return _time_based_src_dc(df, num_dcs, timezone_offsets, weights)
+        else:  # 'even' or default
+            return _even_src_dc(df, num_dcs)
+
+
     def _ensure_num_tokens(df: pd.DataFrame, default_tokens: int = 400) -> pd.Series:
         if "num_tokens" in df.columns:
             return pd.to_numeric(df["num_tokens"], errors="coerce").fillna(0).astype(int)
@@ -515,11 +751,13 @@ if __name__ == "__main__":
             return pd.to_numeric(df["prompt_tokens"], errors="coerce").fillna(0).astype(int)
         return pd.Series(default_tokens, index=df.index, dtype=int)
 
+
     def summarize_epoch_rate(df: pd.DataFrame):
         """Simple summary printout for visibility (not used by simulator)."""
         grp = df.groupby(["source_dc_id", "model_type"], as_index=False)["num_tokens"].sum()
         grp.rename(columns={"num_tokens": "tokens"}, inplace=True)
         return grp
+
 
     # ---------- Load workload ----------
     workload_path = "simulator_ready_trace.csv"
@@ -533,10 +771,53 @@ if __name__ == "__main__":
         trace["epoch"] = 0
     trace["epoch"] = pd.to_numeric(trace["epoch"], errors="coerce").fillna(0).astype(int)
 
-    # Source DC: even distribution if missing
+    # Parse population weights if provided
+    population_weights = None
+    if args.population_weights:
+        import json as _json
+
+        try:
+            population_weights = {int(k): float(v) for k, v in _json.loads(args.population_weights).items()}
+        except Exception as e:
+            print(f"[WARNING] Failed to parse population weights: {e}. Using defaults.")
+            population_weights = None
+
+    # Parse timezone offsets if provided (for time-based distribution)
+    timezone_offsets = None
+    if hasattr(args, 'timezone_offsets') and args.timezone_offsets:
+        import json as _json
+
+        try:
+            timezone_offsets = {int(k): float(v) for k, v in _json.loads(args.timezone_offsets).items()}
+        except Exception as e:
+            print(f"[WARNING] Failed to parse timezone offsets: {e}. Using defaults.")
+            timezone_offsets = None
+
+    # Source DC assignment based on distribution mode
     if "src_dc" in trace.columns and "source_dc_id" not in trace.columns:
         trace = trace.rename(columns={"src_dc": "source_dc_id"})
-    trace["source_dc_id"] = _even_src_dc(trace, args.num_dcs)
+
+    # Use unified distribution function
+    trace["source_dc_id"] = _assign_src_dc(
+        trace,
+        args.num_dcs,
+        distribution=args.distribution,
+        weights=population_weights,
+        timezone_offsets=timezone_offsets
+    )
+
+    print(f"[INIT] Distribution mode: {args.distribution}")
+    if args.distribution == "population":
+        dist_summary = trace.groupby("source_dc_id").size()
+        print(f"[INIT] Request distribution:\n{dist_summary}")
+    elif args.distribution == "time":
+        # Show distribution summary for a few sample epochs
+        sample_epochs = [0, 24, 48, 72]  # ~0h, 6h, 12h, 18h if 15-min epochs
+        print(f"[INIT] Time-based distribution (request counts by source DC):")
+        for ep in sample_epochs:
+            if ep <= trace["epoch"].max():
+                ep_dist = trace[trace["epoch"] == ep].groupby("source_dc_id").size()
+                print(f"  Epoch {ep}: {dict(ep_dist)}")
 
     # Model mapping (ChatGPT/GPT-4 → Llama7b/Llama70b)
     if "model_type" not in trace.columns:
@@ -560,7 +841,7 @@ if __name__ == "__main__":
     # Group by epoch
     grouped_trace = trace.groupby("epoch")
     max_epoch = int(trace["epoch"].max())
-    print(f"[INIT] Loaded workload with {len(trace)} entries across {max_epoch+1} epochs")
+    print(f"[INIT] Loaded workload with {len(trace)} entries across {max_epoch + 1} epochs")
 
     framework = args.framework
     number_of_epoch = args.epoch
@@ -643,23 +924,31 @@ if __name__ == "__main__":
         print("[MARL TRAIN] Completed training; exiting without running evaluation.")
         exit(0)
 
+
     # ---------- Framework Import ----------
     def get_framework(framework):
         fw = framework.lower()
         if fw == 'helix':
-            from Helix import Helix; return Helix
+            from Helix import Helix;
+            return Helix
         elif fw == 'nsga2':
-            from NSGA2 import NSGA2; return NSGA2
+            from NSGA2 import NSGA2;
+            return NSGA2
         elif fw == 'perllm':
-            from PerLLM import PerLLM; return PerLLM
+            from PerLLM import PerLLM;
+            return PerLLM
         elif fw == 'splitwise':
-            from Splitwise import Splitwise; return Splitwise
+            from Splitwise import Splitwise;
+            return Splitwise
         elif fw == 'hybrid':
-            from Hybrid_Scheduler_LLM import Hybrid_Scheduler_LLM; return Hybrid_Scheduler_LLM
+            from Hybrid_Scheduler_LLM import Hybrid_Scheduler_LLM;
+            return Hybrid_Scheduler_LLM
         elif fw == 'marl':
-            import MultiAgentRL; return MultiAgentRL
+            import MultiAgentRL;
+            return MultiAgentRL
         else:
             raise ValueError(f"Framework '{framework}' not found")
+
 
     FW = get_framework(framework)
 
@@ -696,19 +985,42 @@ if __name__ == "__main__":
             epoch_data=epoch_data,
             epoch_idx=epoch_idx,
             node_properties=node_properties,
-            epoch_summary={"node_types": [0, 1, 2, 3, 4, 5],
+            epoch_summary={
+                "node_types": [0, 1, 2, 3, 4, 5],
                 # Datacenter ids used by the Splitwise algorithm to build DC index maps
                 "datacenters": list(range(args.num_dcs)),
                 # Rough token split used by Splitwise for prompt vs generation;
                 # frameworks that do not use these fields will ignore them.
                 "avg_input_tokens": int(max(1, epoch_data["num_tokens"].mean() * 0.7)),
-                "avg_output_tokens": int(max(1, epoch_data["num_tokens"].mean() * 0.3)),}  # lightweight hints; safe default
+                "avg_output_tokens": int(max(1, epoch_data["num_tokens"].mean() * 0.3)),
+                # Spec directory for simulator initialization (used by all frameworks)
+                "spec_dir": args.spec_dir,
+                "epoch_length": 900,
+                # Input/output fraction for Splitwise phase splitting
+                "in_frac": 0.7,
+                "out_frac": 0.3,
+            }
         )
+
+        print(f"\n--- Epoch {epoch_idx} Dispatched Requests (First 5) ---")
+        if results and isinstance(results, list):
+            # Convert to DF for pretty printing
+            disp_df = pd.DataFrame(results)
+            if "model" in disp_df.columns:
+                # Group by the compound key to see the variants
+                summary = disp_df.groupby("model")["tokens"].count().reset_index(name="count")
+                print(summary)
+            else:
+                print(disp_df[["model", "target_dc", "tokens"]].head())
+        elif results and isinstance(results, dict):
+            # Handle MARL return format if it's a dict of profiles
+            first_key = next(iter(results))
+            print(f"Stats for profile '{first_key}': {results[first_key]}")
 
         # --- Aggregate results ---
         cumulative_ttft += float(stats.get("avg_ttft", stats.get("avg_ttft_sec", 0.0)))
-        cumulative_carbon += float(stats.get("carbon_emissions", 0.0))  / 1000.0
-        cumulative_water += float(stats.get("water_usage", 0.0)) / 100       # m³→L
+        cumulative_carbon += float(stats.get("carbon_emissions", 0.0)) / 1000.0
+        cumulative_water += float(stats.get("water_usage", 0.0)) / 100  # m³→L
         cumulative_energy += float(stats.get("energy_cost", 0.0))
         cumulative_total_energy += float(stats.get('total_energy', 0.0))
 
@@ -792,9 +1104,3 @@ if __name__ == "__main__":
                 print(f"[DONE] Wrote per-scheme summary for {scheme_name} to {scheme_path}")
 
     print(f"[DONE] Results written to {out}")
-
-
-
-
-
-

@@ -374,9 +374,13 @@ class NSGA2:
 
         # 2) Build simulator and discover DCs
         try:
-            # You can edit these defaults here if needed
-            spec_dir = "sim_specs"
-            epoch_len = DEFAULT_EPOCH_LEN
+            # Read spec_dir from epoch_summary if available
+            if isinstance(epoch_summary, dict):
+                spec_dir = epoch_summary.get("spec_dir", "sim_specs")
+                epoch_len = int(epoch_summary.get("epoch_length", DEFAULT_EPOCH_LEN))
+            else:
+                spec_dir = "sim_specs"
+                epoch_len = DEFAULT_EPOCH_LEN
 
             sim = LLM_Simulator(
                 spec_dir=spec_dir,
@@ -456,11 +460,14 @@ class NSGA2:
             req_rows: List[Dict[str, Any]] = []
             plan_map: Dict[int, int] = {}
             row_idx = 0
+            FIXED_VARIANT = "_FP16 (Base)_B16"
             for (src_dc, model, tokens) in pairs:
+
+                full_model = f"{model}{FIXED_VARIANT}"
                 req_rows.append(
                     {
                         "source_dc": src_dc,
-                        "model": model,
+                        "model": full_model,
                         "arrival_ms": 0,
                         "tokens": int(tokens),
                     }
@@ -612,6 +619,3 @@ class NSGA2:
             (metrics, details, leftovers)
         )
         return stats, results, leftovers_norm
-
-
-

@@ -1,30 +1,3 @@
-"""
-Rate-Flow LLM Scheduling Simulator (Epoch Aggregated)
-----------------------------------------------------
-This module reworks the simulator to a *fluid / rate-based* flow. Instead of
-routing individual requests, we aggregate total work (e.g., tokens) per epoch
-and drain that work through datacenter capacities. The design preserves your
-power/energy/carbon/water accounting while drastically speeding up simulation.
-
-Key Ideas
-~~~~~~~~~
-- Work unit: tokens (or any scalar work unit) per model_type per source DC.
-- Schedule plan: For each (src_dc, model_type), a mapping to {tgt_dc: fraction}
-  or absolute tokens. Fractions are normalized per (src_dc, model_type).
-- Power plan: Per-DC instructions setting node or processor power states.
-- Capacity: Each DC exposes tokens/sec by model, derived from GPU perf tables.
-- Drain: In one step per epoch, each DC consumes up to capacity*E tokens, the
-  remainder becomes leftover carried to the next epoch.
-- TTFT surrogate: queueing-style function of utilization + network latency.
-
-Integration
-~~~~~~~~~~~
-- Replace your old per-request entry with LLM_Simulator(..., mode="rate").
-- Provide epoch_work_df with columns [src_dc, model_type, total_tokens].
-- Keep your existing CSV readers; populate Processor.model_perf fields.
-
-This file defines: Processor, Node, Datacenter, GeoNetwork, LLM_Simulator
-"""
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Optional, Iterable
@@ -42,20 +15,20 @@ import os
 
 CONSTANTS = {
     # --- Temperature / cooling ---
-    "TEMP_REF_C": 20.0,          # reference temperature baseline (°C)
-    "TEMP_SETPOINT_C": 29.0,     # supply temperature setpoint (°C)
+    "TEMP_REF_C": 20.0,  # reference temperature baseline (°C)
+    "TEMP_SETPOINT_C": 29.0,  # supply temperature setpoint (°C)
     "IT_POWER_TEMP_ALPHA": 0.0,  # IT power flat vs. temperature
-    "EXEC_MS_TEMP_ALPHA": 0.0,   # no perf degradation (can set +0.005 per °C if needed)
+    "EXEC_MS_TEMP_ALPHA": 0.0,  # no perf degradation (can set +0.005 per °C if needed)
     "COP_TEMP_ALPHA_PER_C": 0.16,  # +4% COP per °C above ref
-    "PUE_TEMP_ALPHA_PER_C": -0.04, # -0.01 PUE per °C above ref
+    "PUE_TEMP_ALPHA_PER_C": -0.04,  # -0.01 PUE per °C above ref
 
     # --- Cooling defaults ---
-    "DEFAULT_COP": 3.0,          # mechanical cooling COP baseline
-    "DEFAULT_PUE": 1.18,         # for liquid/oil systems
+    "DEFAULT_COP": 3.0,  # mechanical cooling COP baseline
+    "DEFAULT_PUE": 1.18,  # for liquid/oil systems
     "OTHER_IT_OVERHEAD_FRAC": 0.13,  # non-CPU IT overhead fraction
 
     # --- Solar / battery defaults ---
-    "SOLAR_KW_CAPACITY": 0.0,   # typical DC-scale PV array
+    "SOLAR_KW_CAPACITY": 0.0,  # typical DC-scale PV array
     "SOLAR_PROFILE_24H": [0.0, 0.0, 0.0, 0.0, 0.05, 0.15, 0.35, 0.55,
                           0.75, 0.9, 1.0, 0.9, 0.75, 0.55, 0.35, 0.15,
                           0.05, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],  # normalized day curve
@@ -89,32 +62,32 @@ SPEC_CPU_WORKLOADS = [
 ]
 
 SPECINT_POWER_DATA = {
-    "perlbench_r":  {"Temp": [30, 36, 39, 45, 48], "Power": [260, 256, 258, 260, 261]},
-    "gcc_r":        {"Temp": [28, 35, 38, 49, 58], "Power": [256, 253, 254, 256, 260]},
-    "mcf_r":        {"Temp": [28, 36, 39, 50, 60], "Power": [275, 270, 271, 274, 278]},
-    "omnetpp_r":    {"Temp": [28, 34, 37, 49, 59], "Power": [246, 241, 241, 246, 251]},
-    "xalancbmk_r":  {"Temp": [31, 37, 40, 50, 60], "Power": [289, 285, 282, 286, 291]},
-    "x264_r":       {"Temp": [30, 35, 39, 49, 58], "Power": [258, 255, 255, 258, 262]},
-    "deepsjeng_r":  {"Temp": [30, 35, 39, 50, 59], "Power": [248, 247, 248, 248, 253]},
-    "leela_r":      {"Temp": [29, 34, 38, 49, 57], "Power": [232, 231, 231, 232, 236]},
-    "exchange2_r":  {"Temp": [29, 34, 38, 49, 58], "Power": [238, 237, 237, 238, 242]},
-    "xz_r":         {"Temp": [28, 33, 37, 48, 57], "Power": [229, 228, 228, 230, 234]},
+    "perlbench_r": {"Temp": [30, 36, 39, 45, 48], "Power": [260, 256, 258, 260, 261]},
+    "gcc_r": {"Temp": [28, 35, 38, 49, 58], "Power": [256, 253, 254, 256, 260]},
+    "mcf_r": {"Temp": [28, 36, 39, 50, 60], "Power": [275, 270, 271, 274, 278]},
+    "omnetpp_r": {"Temp": [28, 34, 37, 49, 59], "Power": [246, 241, 241, 246, 251]},
+    "xalancbmk_r": {"Temp": [31, 37, 40, 50, 60], "Power": [289, 285, 282, 286, 291]},
+    "x264_r": {"Temp": [30, 35, 39, 49, 58], "Power": [258, 255, 255, 258, 262]},
+    "deepsjeng_r": {"Temp": [30, 35, 39, 50, 59], "Power": [248, 247, 248, 248, 253]},
+    "leela_r": {"Temp": [29, 34, 38, 49, 57], "Power": [232, 231, 231, 232, 236]},
+    "exchange2_r": {"Temp": [29, 34, 38, 49, 58], "Power": [238, 237, 237, 238, 242]},
+    "xz_r": {"Temp": [28, 33, 37, 48, 57], "Power": [229, 228, 228, 230, 234]},
 }
 
 SPECFP_POWER_DATA = {
-    "bwaves_r":     {"Temp": [32, 38, 44, 50, 60], "Power": [310, 307, 307, 308, 312]},
-    "cactuBSSN_r":  {"Temp": [30, 36, 42, 50, 60], "Power": [281, 278, 279, 281, 286]},
-    "namd_r":       {"Temp": [30, 36, 42, 50, 60], "Power": [273, 271, 270, 271, 277]},
-    "parest_r":     {"Temp": [28, 34, 40, 49, 59], "Power": [256, 253, 254, 257, 262]},
-    "povray_r":     {"Temp": [32, 38, 44, 50, 60], "Power": [293, 291, 290, 291, 295]},
-    "lbm_r":        {"Temp": [27, 33, 38, 49, 56], "Power": [239, 236, 237, 240, 244]},
-    "wrf_r":        {"Temp": [28, 33, 40, 50, 59], "Power": [252, 250, 250, 252, 258]},
-    "blender_r":    {"Temp": [30, 35, 42, 50, 60], "Power": [273, 270, 269, 271, 276]},
-    "cam4_r":       {"Temp": [30, 36, 43, 50, 60], "Power": [296, 293, 293, 294, 299]},
-    "imagick_r":    {"Temp": [29, 35, 42, 50, 60], "Power": [258, 256, 255, 256, 261]},
-    "nab_r":        {"Temp": [29, 35, 42, 50, 60], "Power": [281, 278, 278, 279, 283]},
-    "fotonik3d_r":  {"Temp": [26, 31, 38, 48, 56], "Power": [228, 226, 226, 228, 232]},
-    "roms_r":       {"Temp": [27, 32, 40, 49, 58], "Power": [246, 244, 244, 247, 252]},
+    "bwaves_r": {"Temp": [32, 38, 44, 50, 60], "Power": [310, 307, 307, 308, 312]},
+    "cactuBSSN_r": {"Temp": [30, 36, 42, 50, 60], "Power": [281, 278, 279, 281, 286]},
+    "namd_r": {"Temp": [30, 36, 42, 50, 60], "Power": [273, 271, 270, 271, 277]},
+    "parest_r": {"Temp": [28, 34, 40, 49, 59], "Power": [256, 253, 254, 257, 262]},
+    "povray_r": {"Temp": [32, 38, 44, 50, 60], "Power": [293, 291, 290, 291, 295]},
+    "lbm_r": {"Temp": [27, 33, 38, 49, 56], "Power": [239, 236, 237, 240, 244]},
+    "wrf_r": {"Temp": [28, 33, 40, 50, 59], "Power": [252, 250, 250, 252, 258]},
+    "blender_r": {"Temp": [30, 35, 42, 50, 60], "Power": [273, 270, 269, 271, 276]},
+    "cam4_r": {"Temp": [30, 36, 43, 50, 60], "Power": [296, 293, 293, 294, 299]},
+    "imagick_r": {"Temp": [29, 35, 42, 50, 60], "Power": [258, 256, 255, 256, 261]},
+    "nab_r": {"Temp": [29, 35, 42, 50, 60], "Power": [281, 278, 278, 279, 283]},
+    "fotonik3d_r": {"Temp": [26, 31, 38, 48, 56], "Power": [228, 226, 226, 228, 232]},
+    "roms_r": {"Temp": [27, 32, 40, 49, 58], "Power": [246, 244, 244, 247, 252]},
 }
 
 # Merge int + fp tables for easy lookup
@@ -128,9 +101,9 @@ def interp_piecewise_linear(x, xs, ys):
     if x >= xs[-1]:
         return ys[-1]
     for i in range(len(xs) - 1):
-        if xs[i] <= x <= xs[i+1]:
-            x0, x1 = xs[i], xs[i+1]
-            y0, y1 = ys[i], ys[i+1]
+        if xs[i] <= x <= xs[i + 1]:
+            x0, x1 = xs[i], xs[i + 1]
+            y0, y1 = ys[i], ys[i + 1]
             t = (x - x0) / (x1 - x0)
             return y0 + t * (y1 - y0)
     return ys[-1]
@@ -158,15 +131,46 @@ def spec_cpu_temp_multiplier(workload, temp_c):
     return raw / ref
 
 
-
 MANUAL_NODE_TYPE_COUNTS: Optional[Dict[int, Dict[int, int]]] = None
+
+
+def set_manual_node_type_counts(counts_json: Optional[str] = None, num_dcs: int = 12) -> None:
+    """
+    Set MANUAL_NODE_TYPE_COUNTS from a JSON string.
+
+    Args:
+        counts_json: JSON string like '{"0":167,"1":167,"2":167,"3":167,"4":166,"5":166}'
+                     representing node type counts.
+        num_dcs: Number of DCs to apply the counts to (all DCs get same config)
+
+    The global MANUAL_NODE_TYPE_COUNTS is set to {dc_id: {type_id: count, ...}, ...}
+    """
+    global MANUAL_NODE_TYPE_COUNTS
+
+    if counts_json is None:
+        MANUAL_NODE_TYPE_COUNTS = None
+        return
+
+    import json
+    try:
+        raw_counts = {int(k): int(v) for k, v in json.loads(counts_json).items()}
+    except Exception as e:
+        print(f"[WARNING] Failed to parse node type counts: {e}")
+        MANUAL_NODE_TYPE_COUNTS = None
+        return
+
+    # Apply same counts to all DCs
+    MANUAL_NODE_TYPE_COUNTS = {dc_id: dict(raw_counts) for dc_id in range(num_dcs)}
+    print(f"[CONFIG] Manual node type counts set: {raw_counts} for {num_dcs} DCs")
 
 
 RFS_DEBUG = os.environ.get("RFS_DEBUG", "").strip().lower() not in ("", "0", "false", "no")
 
+
 def _dprint(*args, force=False):
     if RFS_DEBUG or force:
         passthrough = args
+
 
 def _norm_model_name(name: str) -> str:
     s = str(name).strip().lower().replace("-", "").replace("_", "")
@@ -174,8 +178,10 @@ def _norm_model_name(name: str) -> str:
         return "Llama70b"
     return "Llama7b"
 
+
 # Sensible defaults used when only request-level ms exists
 _DEFAULT_AVG_TOKENS = {"Llama7b": 512.0, "Llama70b": 256.0}
+
 
 def _safe_float(x):
     if x in (None, "", "None", "NA", "NaN"):
@@ -185,14 +191,15 @@ def _safe_float(x):
     except Exception:
         return None
 
+
 def _finalize_perf_entry(ms_per_token=None, ms_per_request=None, avg_tokens_per_request=None, model_key=None):
     """
     Build a per-model perf dict, deriving ms_per_token from request-level data when needed.
     Accepts positional or keyword args; 'model_key' used only for selecting defaults.
     """
-    mspt  = _safe_float(ms_per_token)
+    mspt = _safe_float(ms_per_token)
     mspre = _safe_float(ms_per_request)
-    avgt  = _safe_float(avg_tokens_per_request)
+    avgt = _safe_float(avg_tokens_per_request)
 
     # If only request-level data is present, derive ms/token
     if mspt is None and mspre is not None:
@@ -201,7 +208,8 @@ def _finalize_perf_entry(ms_per_token=None, ms_per_request=None, avg_tokens_per_
             _dprint(f"[PERF] Deriving avg_tokens for {model_key} via default -> {avgt}")
         if avgt is not None and avgt > 0:
             mspt = mspre / avgt
-            _dprint(f"[PERF] Derived ms_per_token for {model_key}: {mspt:.6f} from ms_per_request={mspre} / avg_tokens={avgt}")
+            _dprint(
+                f"[PERF] Derived ms_per_token for {model_key}: {mspt:.6f} from ms_per_request={mspre} / avg_tokens={avgt}")
 
     out = {}
     if mspt is not None and mspt > 0:
@@ -232,10 +240,10 @@ class Battery:
 
     def can_use(self) -> bool:
         return (
-            self.cap_kwh > 0.0
-            and self.max_charge_kw > 0.0
-            and self.max_discharge_kw > 0.0
-            and self.roundtrip_eff > 0.0
+                self.cap_kwh > 0.0
+                and self.max_charge_kw > 0.0
+                and self.max_discharge_kw > 0.0
+                and self.roundtrip_eff > 0.0
         )
 
     def charge(self, want_kwh: float, hours: float) -> float:
@@ -271,25 +279,24 @@ class Battery:
         return throughput * max(0.0, self.embodied_co2_per_kwh_throughput)
 
 
-
 @dataclass
 class ProcNode:
     def __init__(
-        self,
-        node_id: int,
-        model_perf: dict,
-        *,
-        # old/builder-style args:
-        type_id: int | None = None,
-        accel_type: str | None = None,
-        gpu_config: str | None = None,
-        tdp_kw: float | None = None,
-        idle_kw: float | None = None,
-        # optional modern args:
-        tdp_w: float | None = None,
-        idle_w: float | None = None,
-        base_idle_frac: float | None = None,
-        workload_class: str = "generic",
+            self,
+            node_id: int,
+            model_perf: dict,
+            *,
+            # old/builder-style args:
+            type_id: int | None = None,
+            accel_type: str | None = None,
+            gpu_config: str | None = None,
+            tdp_kw: float | None = None,
+            idle_kw: float | None = None,
+            # optional modern args:
+            tdp_w: float | None = None,
+            idle_w: float | None = None,
+            base_idle_frac: float | None = None,
+            workload_class: str = "generic",
     ):
         self.node_id = int(node_id)
         self.type_id = type_id
@@ -316,7 +323,7 @@ class ProcNode:
             self.base_idle_frac = 0.13
 
         self.model_perf = dict(model_perf)  # {"Llama7b": {...}, "Llama70b": {...}}
-        self.state = "IDLE"                 # "ON" | "IDLE" | "OFF"
+        self.state = "IDLE"  # "ON" | "IDLE" | "OFF"
         self.available_at_ms = 0.0
         self.dc_ref = None
         self.busy_ms_epoch = 0.0
@@ -416,24 +423,52 @@ class ProcNode:
 
         return _generic_cpu_mult(temp_c)
 
-
     def _exec_ms_temp_mult(self) -> float:
         dc = self.dc_ref
         if not dc:
             return 1.0
         dT = float(dc.temp_c_setpoint) - dc.temp_ref_c
-        return max(0.0, 1.0 + dc.exec_ms_temp_alpha * dT)   # usually 0.0 unless you enable it
+        return max(0.0, 1.0 + dc.exec_ms_temp_alpha * dT)  # usually 0.0 unless you enable it
 
     # --- performance model ---
     def estimate_exec_ms(self, tokens, model: str, kwargs) -> float:
-        rec = self.model_perf.get(model, {})
-        base_ms = float(rec.get("ms_per_request") or 0.0)
-        base_ms  = base_ms * tokens
-        if base_ms <= 0.0:
-            ms_per_tok = float(rec.get("ms_per_token") or 0.0)
-            toks = float(kwargs.get("tokens") or kwargs.get("avg_tokens") or 0.0)
-            base_ms = ms_per_tok * toks
-        return base_ms * self._exec_ms_temp_mult()
+        """
+        Calculates execution time.
+        """
+        rec = self.model_perf.get(model)
+
+        # 1. Exact Match Failed
+        if not rec:
+            # 2. Try adding default suffix if it looks like a base model name
+            if model in ["Llama7b", "Llama70b"]:
+                # Try finding the standard FP16 B1 config
+                # Keys are like: "Llama7b_Standard_FP16 (Base)_B1" or "Llama7b_FP16 (Base)_B1"
+                for k in self.model_perf:
+                    if model in k and "FP16" in k and "B1" in k:
+                        rec = self.model_perf[k]
+                        break
+
+            # 3. Fuzzy fallback (broad search)
+            if not rec:
+                for k, v in self.model_perf.items():
+                    if k in model or model in k:
+                        rec = v
+                        break
+
+        if not rec:
+            return 0.0
+
+        # Calculation
+        # Priority 1: ms_per_token (Linear scaling)
+        if "ms_per_token" in rec and rec["ms_per_token"] > 0:
+            val = float(rec["ms_per_token"]) * float(tokens)
+            return val * self._exec_ms_temp_mult()
+
+        # Priority 2: ms_per_request (Constant overhead)
+        if "ms_per_request" in rec:
+            return float(rec["ms_per_request"]) * self._exec_ms_temp_mult()
+
+        return 0.0
 
     # --- IT energy for execution window (kWh) ---
     def it_energy_kwh_for_exec(self, exec_ms: float) -> float:
@@ -458,9 +493,6 @@ class ProcNode:
 
         # Convert Wh -> kWh
         return power_w * hours / 1000.0
-
-
-
 
 
 # -----------------------------
@@ -590,14 +622,50 @@ class Datacenter:
 
     # ---------- power plan ----------
     def apply_power_plan(self, plan_slice: dict | None):
+        """
+        Apply power plan to this datacenter's units.
+
+        Supports two formats:
+        1. {"unit": {node_id: state, ...}} - set state by individual node ID
+        2. {"unit": {type_id: state, ...}} - set state by node TYPE (0-6)
+           This is detected when keys are small integers (0-6) matching type_ids
+        3. {"all": state} - set all units to the same state
+        """
         if not plan_slice:
             return
+
+        # Handle "all" mode
         mode_all = plan_slice.get("all")
         if mode_all in ("ON", "IDLE", "OFF"):
             for u in self.units:
                 u.state = mode_all
+            return
+
         unit_modes = plan_slice.get("unit") or {}
-        if unit_modes:
+        if not unit_modes:
+            return
+
+        # Determine if this is a type-based plan (keys are 0-6) or node-id based
+        # Type-based plans have small integer keys (0-6) that match type_ids
+        keys = list(unit_modes.keys())
+        max_key = max(int(k) for k in keys) if keys else 0
+
+        # If max key is small (<=6) and we have <=7 keys, assume it's a type-based plan
+        # This is the format used by MultiAgentRL: {0: "ON", 1: "OFF", ...}
+        if max_key <= 6 and len(keys) <= 7:
+            # Type-based plan: apply state to all nodes of each type
+            for u in self.units:
+                type_id = getattr(u, "type_id", None)
+                if type_id is not None and type_id in unit_modes:
+                    state = unit_modes[type_id]
+                    if state in ("ON", "IDLE", "OFF"):
+                        u.state = state
+                elif type_id is not None and str(type_id) in unit_modes:
+                    state = unit_modes[str(type_id)]
+                    if state in ("ON", "IDLE", "OFF"):
+                        u.state = state
+        else:
+            # Node-id based plan: apply state to specific nodes by ID
             id_map = {u.node_id: u for u in self.units}
             for node_id, state in unit_modes.items():
                 uid = int(node_id)
@@ -762,7 +830,6 @@ class Datacenter:
 
         return max(0.0, remaining)  # grid draw
 
-
     def _account_water_from_it(self, it_kwh: float, start_ms: float, cop: float) -> float:
         """
         Returns makeup water (m^3) for this execution and updates epoch-level water counters.
@@ -859,9 +926,9 @@ class Datacenter:
         self.cost_usd += cost_usd
 
         return {
-            "energy_kwh": gross_kwh,   # facility kWh (before PV/battery)
-            "carbon_g": carbon_g,      # per-exec grid carbon only
-            "cost_usd": cost_usd,      # per-exec energy cost
+            "energy_kwh": gross_kwh,  # facility kWh (before PV/battery)
+            "carbon_g": carbon_g,  # per-exec grid carbon only
+            "cost_usd": cost_usd,  # per-exec energy cost
             "water_m3": water_m3,
         }
 
@@ -901,61 +968,42 @@ class Datacenter:
 
     def finalize_epoch(self):
         """
-        Accrue all idle IT energy, cooling overhead, and facility loads
-        for the portion of the epoch in which each unit is not busy.
-
-        Uses:
-          - workload-specific CPU base power (SPEC curves)
-          - GPU TDP for accelerators
-          - idle_frac
-          - temperature-scaled ITD multipliers
+        Accrue all idle IT energy, cooling overhead, and facility loads.
+        Now includes WATER usage for idle energy (if MECH_COP).
         """
-
         epoch_ms = max(0.0, float(self._epoch_len_s) * 1000.0)
         idle_it_kwh = 0.0
 
         for u in self.units:
-
-            # Skip units that never turned ON and never worked
+            # ... (Existing idle calculation logic) ...
             if getattr(u, "state", "IDLE") == "OFF" and getattr(u, "busy_ms_epoch", 0.0) <= 0.0:
                 continue
 
             busy = min(epoch_ms, max(0.0, getattr(u, "busy_ms_epoch", 0.0)))
             idle_ms = max(0.0, epoch_ms - busy)
+            if idle_ms <= 0.0: continue
+            if u.tdp_w <= 0.0: continue
 
-            if idle_ms <= 0.0:
-                continue
-
-            # Nodes with no TDP cannot contribute to idle IT energy
-            if u.tdp_w <= 0.0:
-                continue
-
-            # --- Key fix: workload-aware idle power ---
-            # CPU SPEC workloads use per-workload base power
-            # GPUs / accelerators fall back to TDP
             base_power_w = u._base_it_power_w()
-
-            # Idle IT power:
-            #   base_power * idle_frac * temperature_multiplier
             it_idle_w = base_power_w * u.base_idle_frac * u._it_power_temp_mult()
-
-            # Accumulate idle IT energy (kWh)
             idle_it_kwh += (it_idle_w / 1000.0) * (idle_ms / 3_600_000.0)
 
-        # --- No idle energy? Then nothing more to do this epoch ---
         if idle_it_kwh <= 0.0:
-            if self.battery:
-                self.embodied_battery_co2_kg = self.battery.embodied_carbon_kg()
+            if self.battery: self.embodied_battery_co2_kg = self.battery.embodied_carbon_kg()
             return
 
-        # "Other IT" overhead (fans, PSU losses, control systems)
         other_kwh = idle_it_kwh * max(0.0, self.other_it_overhead_frac)
 
-        # Cooling/Facility overhead
         if self.cooling_mode == "MECH_COP":
             # COP-based (e.g., chilled-water plant)
+            # Use avg COP (t=0 approximation for idle block)
             cop = max(0.1, self._cop_for_ms(0.0))
             cooling_kwh = idle_it_kwh / cop
+
+            # --- NEW: Water Accounting for Idle Energy ---
+            # Idle heat rejection handled same as active
+            self._account_water_from_it(idle_it_kwh, 0.0, cop)
+
         else:
             # PUE-based model
             pue = max(1.0, self._pue_for_ms(0.0))
@@ -965,17 +1013,15 @@ class Datacenter:
         # Total facility idle energy
         gross_idle_kwh = idle_it_kwh + other_kwh + cooling_kwh
 
-        # Accumulate into DC accounting fields
+        # ... (Rest of finalize_epoch) ...
         self.energy_it_kwh += idle_it_kwh
         self.energy_other_kwh += other_kwh
         self.energy_cooling_kwh += cooling_kwh
 
-        # Route idle energy through PV/battery → grid mix
         start_ms, end_ms = 0.0, epoch_ms
         grid_kwh = self._apply_solar_battery_offset(gross_idle_kwh, start_ms, end_ms)
         self.energy_grid_kwh += grid_kwh
 
-        # Battery embodied carbon (per epoch)
         if self.battery:
             self.embodied_battery_co2_kg = self.battery.embodied_carbon_kg()
 
@@ -993,8 +1039,6 @@ class Datacenter:
 
     def report_utilization(self) -> float:
         return self.utilization(self._epoch_len_s)
-
-
 
 
 # -----------------------------
@@ -1053,7 +1097,8 @@ class Geo_Network:
 
         # Map dc_id -> position in ring order
         pos = {dc_id: i for i, dc_id in enumerate(self.dc_ids)}
-        i_src = pos[src_dc]; i_dst = pos[dst_dc]
+        i_src = pos[src_dc];
+        i_dst = pos[dst_dc]
 
         # Clockwise: sum edges from i_src -> i_dst moving +1 each step
         cw_ms = 0.0
@@ -1097,11 +1142,11 @@ class Geo_Network:
     # Returns a list of per-request dicts (detailed results)
     # ------------------------------------------------------------------
     def apply_schedule_plan(
-        self,
-        epoch_idx: int,
-        workload_df,                         # pd.DataFrame
-        schedule_plan: Dict[str, Any],
-        power_plan: Dict[str, Any] | None,
+            self,
+            epoch_idx: int,
+            workload_df,  # pd.DataFrame
+            schedule_plan: Dict[str, Any],
+            power_plan: Dict[str, Any] | None,
     ) -> List[Dict[str, Any]]:
         """
         Workload columns expected (rename below to your actual columns if different):
@@ -1267,14 +1312,9 @@ class Geo_Network:
         Combine:
           - Per-request TTFT stats from 'details'
           - Datacenter-level totals (energy, carbon, cost, water)
-
-        'tokens' arg is kept for backward compatibility but is no longer used;
-        we compute normalization from the details themselves.
         """
 
-        # -----------------------------
         # 1. TTFT (per-request metric)
-        # -----------------------------
         ttft_sum = 0.0
         ttft_cnt = 0
         token_sum = 0
@@ -1288,24 +1328,19 @@ class Geo_Network:
                 except Exception:
                     pass
 
-            # Try to accumulate tokens for per-token normalization if present
+            # Track tokens for other stats
             t = r.get("tokens", r.get("total_tokens", None))
             if t is not None:
-                try:
-                    token_sum += max(0, int(t))
-                except Exception:
-                    pass
+                token_sum += max(0, int(t))
 
-        if token_sum > 0:
-            avg_ttft = ttft_sum / float(token_sum)
-        elif ttft_cnt > 0:
+        # UPDATED: Report Average Latency per Request (not per token)
+        # "TTFT" in this simulator context acts as "Total Response Latency"
+        if ttft_cnt > 0:
             avg_ttft = ttft_sum / float(ttft_cnt)
         else:
             avg_ttft = 0.0
 
-        # -------------------------------------------------------
         # 2. Pull COMPLETE energy/carbon/water/cost from DCs
-        # -------------------------------------------------------
         total_energy_kwh = 0.0
         total_it_energy_kwh = 0.0
         total_cooling_energy_kwh = 0.0
@@ -1314,7 +1349,6 @@ class Geo_Network:
         total_cost_usd = 0.0
 
         for dc_id, dc in self.datacenters.items():
-            # Energy terms
             grid_kwh = float(getattr(dc, "energy_grid_kwh", 0.0))
             it_kwh = float(getattr(dc, "energy_it_kwh", 0.0))
             cool_kwh = float(getattr(dc, "energy_cooling_kwh", 0.0))
@@ -1323,38 +1357,19 @@ class Geo_Network:
             total_it_energy_kwh += it_kwh
             total_cooling_energy_kwh += cool_kwh
 
-            # Water usage (we treat makeup as "usage")
             water_m3 = float(getattr(dc, "water_makeup_m3", 0.0))
             total_water_m3 += water_m3
 
-            # Cost (busy + idle)
             cost_usd = float(getattr(dc, "cost_usd", 0.0))
             total_cost_usd += cost_usd
 
-            # Carbon:
-            #  - energy-based: grid_kwh * CI
-            #  - plus water_processing carbon tracked separately
-            #  - plus battery embodied carbon (kg → g)
             ci = float(getattr(dc, "carbon_intensity_g_per_kwh", 0.0))
             water_carbon = float(getattr(dc, "water_carbon_g", 0.0))
             batt_emb_kg = float(getattr(dc, "embodied_battery_co2_kg", 0.0))
 
-            energy_carbon = grid_kwh * ci
-            carbon_total_dc = energy_carbon + water_carbon + batt_emb_kg * 1000.0
-
+            carbon_total_dc = (grid_kwh * ci) + water_carbon + (batt_emb_kg * 1000.0)
             total_carbon_g += carbon_total_dc
 
-            # Backwards-compat aliases on the DC itself
-            try:
-                dc.energy_cost_usd = cost_usd
-                dc.water_usage_m3 = water_m3
-                dc.carbon_g = carbon_total_dc
-            except Exception:
-                pass
-
-        # -------------------------------------------------------
-        # 3. Return global metrics
-        # -------------------------------------------------------
         return {
             "avg_ttft": float(avg_ttft),
             "energy_cost": float(total_cost_usd),
@@ -1363,6 +1378,7 @@ class Geo_Network:
             "total_energy": float(total_energy_kwh),
             "total_it_energy_kwh": float(total_it_energy_kwh),
             "total_cooling_energy_kwh": float(total_cooling_energy_kwh),
+            "processed_tokens": float(token_sum)
         }
 
     # ------------------------------------------------------------------
@@ -1419,7 +1435,6 @@ class Geo_Network:
         return util
 
 
-
 # -----------------------------
 # Public entry point + CSV builders
 # -----------------------------
@@ -1467,25 +1482,25 @@ class LLM_Simulator:
     """
 
     def __init__(
-        self,
-        spec_dir: str = "sim_specs",
-        dc_specs_csv: Optional[str] = None,
-        node_specs_csv: Optional[str] = None,
-        latency_csv: Optional[str] = None,
-        a100_csv: Optional[str] = None,
-        h100_csv: Optional[str] = None,
-        epoch_length: Optional[int] = None,
-        debug: bool = True,          # default True to print verification
+            self,
+            spec_dir: str = "sim_specs",
+            dc_specs_csv: Optional[str] = None,
+            node_specs_csv: Optional[str] = None,
+            latency_csv: Optional[str] = None,
+            a100_csv: Optional[str] = None,
+            h100_csv: Optional[str] = None,
+            epoch_length: Optional[int] = None,
+            debug: bool = True,  # default True to print verification
     ) -> None:
         self.debug = debug
         self.spec_dir = spec_dir
 
         # Resolve file paths (exact header CSVs)
-        self.dc_specs_csv   = dc_specs_csv   or os.path.join(spec_dir, "Datacenter_specs.csv")
+        self.dc_specs_csv = dc_specs_csv or os.path.join(spec_dir, "Datacenter_specs.csv")
         self.node_specs_csv = node_specs_csv or os.path.join(spec_dir, "Node_Specs.csv")
-        self.latency_csv    = latency_csv    or os.path.join(spec_dir, "Geo_Latencies.csv")
-        self.a100_csv       = a100_csv       or os.path.join(spec_dir, "A100_GPU.csv")
-        self.h100_csv       = h100_csv       or os.path.join(spec_dir, "H100_GPU.csv")
+        self.latency_csv = latency_csv or os.path.join(spec_dir, "Geo_Latencies.csv")
+        self.a100_csv = a100_csv or os.path.join(spec_dir, "A100_GPU.csv")
+        self.h100_csv = h100_csv or os.path.join(spec_dir, "H100_GPU.csv")
         self.cpu_csv = os.path.join(spec_dir, "POVRay_CPU.csv")
 
         # Epoch length (optional exact-header loader)
@@ -1510,23 +1525,23 @@ class LLM_Simulator:
 
         # === Load CSVs (exact headers) & Build world ===
         # If you prefer a single call, you can use build_world_from_csvs_exact(...)
-        dc_specs   = load_dc_specs_exact(self.dc_specs_csv)
-        templates  = load_node_type_templates_exact(self.node_specs_csv)
+        dc_specs = load_dc_specs_exact(self.dc_specs_csv)
+        templates = load_node_type_templates_exact(self.node_specs_csv)
         gpu_tables = build_gpu_tables_exact(self.a100_csv, self.h100_csv)
-        lat_mat    = load_latency_matrix_exact(self.latency_csv)
+        lat_mat = load_latency_matrix_exact(self.latency_csv)
 
         if self.debug:
             # Datacenter overview
             print(f"\n[VERIFY] DC specs loaded: {len(dc_specs)} datacenters")
             for dc_id, p in list(dc_specs.items())[:5]:  # show a few
                 print(f"  DC {dc_id}: CI={p['carbon_intensity_g_per_kwh']:.2f} g/kWh "
-                      f"Nodes={p['Total_Nodes']} counts={p['node_type_counts_str'][:60]}{'...' if len(p['node_type_counts_str'])>60 else ''}")
+                      f"Nodes={p['Total_Nodes']} counts={p['node_type_counts_str'][:60]}{'...' if len(p['node_type_counts_str']) > 60 else ''}")
 
             # Node templates overview
             print(f"[VERIFY] Node type templates: {len(templates)} types")
             for tid, t in sorted(templates.items())[:6]:
-                print(f"  Type {tid}: accel={t['accel_type']} cfg={t['gpu_config']} procs={t['processor_count']} tdp_kw={t['tdp_kw']} idle_kw={t['idle_kw']}")
-
+                print(
+                    f"  Type {tid}: accel={t['accel_type']} cfg={t['gpu_config']} procs={t['processor_count']} tdp_kw={t['tdp_kw']} idle_kw={t['idle_kw']}")
 
             # GPU tables overview
             a100_keys = list(gpu_tables['A100'].keys())
@@ -1537,8 +1552,6 @@ class LLM_Simulator:
             # Latency matrix shape
             n = len(lat_mat)
             print(f"[VERIFY] Latency matrix size: {n}x{n}")
-
-
 
         # Expand nodes & perf/power using the exact-header world builder
         dc_specs, node_recs, lat_mat, gpu_tables = build_world_from_csvs_exact(
@@ -1664,11 +1677,11 @@ class LLM_Simulator:
                   f"makeup={makeup_m3:.6f} m³")
 
     def run_epoch(
-        self,
-        epoch_idx: int,
-        workload_df: pd.DataFrame,
-        schedule_plan: Dict[str, Any],
-        power_plan: Dict[str, Any],
+            self,
+            epoch_idx: int,
+            workload_df: pd.DataFrame,
+            schedule_plan: Dict[str, Any],
+            power_plan: Dict[str, Any],
     ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Dict[int, Dict[str, float]]]:
         # --- ensure deterministic runs (consecutive runs identical) ---
         for dc in self.datacenters.values():
@@ -1700,7 +1713,7 @@ class LLM_Simulator:
         metrics["by_datacenter"] = dc_usage
 
         if self.debug:
-            used = ", ".join(f"dc{d}:{u['utilization']:.2f}" for d,u in sorted(dc_usage.items()))
+            used = ", ".join(f"dc{d}:{u['utilization']:.2f}" for d, u in sorted(dc_usage.items()))
             print(f"[EPOCH {epoch_idx}] "
                   f"TTFT={metrics['avg_ttft']:.6f}s  "
                   f"C={metrics['carbon_emissions']:.6f}  "
@@ -1868,8 +1881,6 @@ class LLM_Simulator:
             return 900
 
 
-
-
 # =========================
 # EXACT-HEADER CSV HELPERS
 # =========================
@@ -1905,6 +1916,7 @@ def _parse_24h_exact(series_str: str) -> List[float]:
     parts = [p.strip() for p in str(series_str).replace(",", ";").split(";")]
     return [float(x) for x in parts]
 
+
 def _parse_gpu_from_node_type_exact(s: str) -> Tuple[str, str]:
     """ '8_A100s' -> ('A100','8_A100'), '4_H100' -> ('H100','4_H100') """
     t = s.strip().upper().replace("-", "_")
@@ -1913,10 +1925,12 @@ def _parse_gpu_from_node_type_exact(s: str) -> Tuple[str, str]:
     n, g = t.split("_", 1)
     return (g, f"{n}_{g}")  # accel_type, gpu_config
 
+
 def _counts_from_nodetypes_exact(nodetypes_str: str) -> Dict[int, int]:
     """ '0;0;1;5;5' -> {0:2,1:1,5:2} """
     seq = [int(x.strip()) for x in nodetypes_str.split(";") if x.strip()]
     return dict(sorted(Counter(seq).items()))
+
 
 def _parse_24h_semicolon(val):
     """
@@ -2030,17 +2044,17 @@ def load_dc_specs_exact(self) -> dict[int, dict]:
     df = pd.read_csv(path)
 
     # Expected column set (per the CSV you sent)
-    COL_DC      = "DC_Num"
-    COL_CI      = "Carbon_Intensity"
-    COL_WS      = "Water_Static"
-    COL_WCD     = "Water_Cycling_Density"
-    COL_SR      = "Solids_Ratio"
-    COL_PEI     = "Potable_Energy_Intensity"
-    COL_WWEI    = "Wastewater_Energy_Intensity"
-    COL_TOU24   = "Time_of_Use(24_Hours)"
-    COL_COP24   = "COP_Profile(24_Hours)"
-    COL_TYPES   = "Node_Types"
-    COL_TOTAL   = "Total_Nodes"
+    COL_DC = "DC_Num"
+    COL_CI = "Carbon_Intensity"
+    COL_WS = "Water_Static"
+    COL_WCD = "Water_Cycling_Density"
+    COL_SR = "Solids_Ratio"
+    COL_PEI = "Potable_Energy_Intensity"
+    COL_WWEI = "Wastewater_Energy_Intensity"
+    COL_TOU24 = "Time_of_Use(24_Hours)"
+    COL_COP24 = "COP_Profile(24_Hours)"
+    COL_TYPES = "Node_Types"
+    COL_TOTAL = "Total_Nodes"
 
     missing = [c for c in [COL_DC, COL_CI, COL_WS, COL_WCD, COL_SR, COL_PEI, COL_WWEI, COL_TOU24, COL_COP24, COL_TYPES]
                if c not in df.columns]
@@ -2056,15 +2070,15 @@ def load_dc_specs_exact(self) -> dict[int, dict]:
         carbon = _safe_float(row[COL_CI])  # g CO2 per kWh
 
         # Water/cooling fields
-        water_static = _safe_float(row[COL_WS])                     # m^3 per kWh_heat (constant adder)
-        water_cycle  = _safe_float(row[COL_WCD])                    # m^3 per kWh_heat evaporated
-        blowdown     = _safe_float(row[COL_SR])                    # ratio (e.g., 0.30)
-        potable_ei   = _safe_float(row[COL_PEI])                    # kWh per m^3
-        waste_ei     = _safe_float(row[COL_WWEI])                   # kWh per m^3
+        water_static = _safe_float(row[COL_WS])  # m^3 per kWh_heat (constant adder)
+        water_cycle = _safe_float(row[COL_WCD])  # m^3 per kWh_heat evaporated
+        blowdown = _safe_float(row[COL_SR])  # ratio (e.g., 0.30)
+        potable_ei = _safe_float(row[COL_PEI])  # kWh per m^3
+        waste_ei = _safe_float(row[COL_WWEI])  # kWh per m^3
 
         # 24-hour arrays
-        tou_24  = _parse_24h_semicolon(row[COL_TOU24])
-        cop_24  = _parse_24h_semicolon(row[COL_COP24])
+        tou_24 = _parse_24h_semicolon(row[COL_TOU24])
+        cop_24 = _parse_24h_semicolon(row[COL_COP24])
 
         # Node types list → counts
         type_counts, node_type_counts_str = _parse_node_type_counts_from_row(row[COL_TYPES])
@@ -2113,11 +2127,11 @@ def load_node_type_templates_exact(node_specs_csv: str) -> Dict[int, Dict[str, A
         tid = int(row["Node_Num"])  # use Node_Num as the Type_ID
         accel_type, gpu_config = _parse_gpu_from_node_type_exact(row["Node_Type"])
         templates[tid] = {
-            "accel_type": accel_type,   # "A100" or "H100"
-            "gpu_config": gpu_config,   # e.g., "8_A100"
-            "processor_count": 1,       # default = 1 processor per node
-            "tdp_kw": 0.0,              # filled later from GPU tables
-            "idle_kw": 0.0,             # filled later
+            "accel_type": accel_type,  # "A100" or "H100"
+            "gpu_config": gpu_config,  # e.g., "8_A100"
+            "processor_count": 1,  # default = 1 processor per node
+            "tdp_kw": 0.0,  # filled later from GPU tables
+            "idle_kw": 0.0,  # filled later
         }
 
     return templates
@@ -2127,23 +2141,32 @@ def load_node_type_templates_exact(node_specs_csv: str) -> Dict[int, Dict[str, A
 
 def load_gpu_table_exact(gpu_csv_path: str, chip: str) -> Dict[str, Dict[str, Any]]:
     """
-    Build a lookup keyed by '<num>_<chip>' (e.g., '8_A100', '4_H100') → full row dict
-    with an added '_meta': {'tdp_kw': TDP/1000}.
+    Build a lookup keyed by '<num>_<chip>' (e.g., '8_A100', '4_H100').
+    OLD: Returns a single row dict.
+    NEW: Returns a LIST of row dicts to support multiple batch/quantization variants.
     """
     t = pd.read_csv(gpu_csv_path)
-    table: Dict[str, Dict[str, Any]] = {}
+    # New structure: Key -> List[Rows]
+    table: Dict[str, List[Dict[str, Any]]] = {}
+
     for _, row in t.iterrows():
         num = int(row["num_GPUs"])
         key = f"{num}_{chip}"
+
         d = row.to_dict()
         d["_meta"] = {"tdp_kw": float(row["TDP"]) / 1000.0}
-        table[key] = d
+
+        if key not in table:
+            table[key] = []
+        table[key].append(d)
+
     return table
 
+
 def build_gpu_tables_exact(
-    a100_csv: str,
-    h100_csv: str,
-    cpu_csv: str | None = None,
+        a100_csv: str,
+        h100_csv: str,
+        cpu_csv: str | None = None,
 ) -> Dict[str, Dict[str, Dict[str, Any]]]:
     tables: Dict[str, Dict[str, Dict[str, Any]]] = {
         "A100": load_gpu_table_exact(a100_csv, "A100"),
@@ -2168,195 +2191,183 @@ def load_latency_matrix_exact(lat_csv: str) -> List[List[float]]:
 # -------- Epoch length (optional helper) --------
 
 def build_world_from_csvs_exact(
-    dc_specs_csv: str,
-    node_specs_csv: str,
-    latency_csv: str,
-    a100_csv: str,
-    h100_csv: str,
-    cpu_csv: str | None = None,
+        dc_specs_csv: str,
+        node_specs_csv: str,
+        latency_csv: str,
+        a100_csv: str,
+        h100_csv: str,
+        cpu_csv: str | None = None,
 ) -> tuple[
-        Dict[int, Dict[str, Any]],
-        List[Dict[str, Any]],
-        List[List[float]],
-        Dict[str, Dict[str, Dict[str, Any]]]
-    ]:
-    """
-    Returns:
-      dc_specs : dict[dc_id] -> per-DC parameters (already normalized)
-      nodes    : list of node records, each with model_perf+power
-      lat_mat  : NxN list of floats (ms)
-      gpu_tbls : {'A100': {...}, 'H100': {...}, 'CPU': {...}}
-    """
-
-    # ---------------------------
-    # Local utility functions
-    # ---------------------------
+    Dict[int, Dict[str, Any]],
+    List[Dict[str, Any]],
+    List[List[float]],
+    Dict[str, Dict[str, Any]]
+]:
+    # --- Local Helpers (Required to avoid NameErrors) ---
     def _parse_counts_str_to_dict(s: str) -> Dict[int, int]:
-        if not s:
-            return {}
-        parts = [p.strip() for p in s.replace(",", ";").split(";") if p.strip()]
-        out: Dict[int, int] = {}
+        if not s: return {}
+        parts = [p.strip() for p in str(s).replace(",", ";").split(";") if p.strip()]
+        out = {}
         for piece in parts:
-            if ":" not in piece:
-                continue
+            if ":" not in piece: continue
             k, v = piece.split(":", 1)
             try:
-                ki = int(k.strip())
-                vi = int(float(v.strip()))
-                if ki >= 0 and vi >= 0:
-                    out[ki] = vi
-            except Exception:
+                ki, vi = int(k.strip()), int(float(v.strip()))
+                if ki >= 0 and vi >= 0: out[ki] = vi
+            except:
                 pass
         return out
 
     def _even_split_counts(total_nodes: int, ntypes: int) -> Dict[int, int]:
         t = max(0, int(total_nodes or 0))
-        base, rem = divmod(t, ntypes)
+        base, rem = divmod(t, max(1, ntypes))
         out = {i: base for i in range(ntypes)}
-        for i in range(rem):
-            out[i] += 1
+        for i in range(rem): out[i] += 1
         return out
 
     def _num(x):
-        if x is None:
-            return None
-        if isinstance(x, (int, float)):
-            return float(x)
+        if x is None: return None
+        if isinstance(x, (int, float)): return float(x)
         s = str(x).strip().lower()
-        if s in ("none", "nan", ""):
-            return None
+        if s in ("none", "nan", ""): return None
         try:
             return float(s)
-        except Exception:
+        except:
             return None
 
-    # ---------------------------
-    # Load CSV-driven structures
-    # ---------------------------
-    dc_specs  = load_dc_specs_exact(dc_specs_csv)
+    # --- Load Data ---
+    dc_specs = load_dc_specs_exact(dc_specs_csv)
     templates = load_node_type_templates_exact(node_specs_csv)
-    gpu_tbls  = build_gpu_tables_exact(a100_csv, h100_csv, cpu_csv=cpu_csv)
-    lat_mat   = load_latency_matrix_exact(latency_csv)
+    # Note: gpu_tbls values are now LISTS of dicts
+    gpu_tbls = build_gpu_tables_exact(a100_csv, h100_csv, cpu_csv=cpu_csv)
+    lat_mat = load_latency_matrix_exact(latency_csv)
 
-    # ---------------------------
-    # Global overrides for node counts
-    # ---------------------------
     global MANUAL_NODE_TYPE_COUNTS
     overrides = MANUAL_NODE_TYPE_COUNTS or {}
 
     ntypes = len(templates)
     nodes: List[Dict[str, Any]] = []
-
     FORCE_DC_ID = 0
 
     for dc_id, params in dc_specs.items():
+        if overrides and dc_id != FORCE_DC_ID: continue
 
-        # When overrides are active, skip all other DCs
-        if overrides and dc_id != FORCE_DC_ID:
-            continue
-
-        # ---------------------------------------------
-        # Load CSV-based counts (existing code)
-        # ---------------------------------------------
-        counts_str = params.get("node_type_counts_str", "")
-        if not counts_str:
-            counts_str = params.get("Node_Type_Counts", "") or params.get("node_types", "")
-
+        counts_str = params.get("node_type_counts_str", "") or params.get("Node_Type_Counts", "")
         counts = _parse_counts_str_to_dict(counts_str)
         if not counts:
-            total_nodes = params.get("Total_Nodes", params.get("total_nodes", 0))
-            try:
-                total_nodes = int(total_nodes)
-            except Exception:
-                total_nodes = 0
-            if total_nodes > 0:
-                counts = _even_split_counts(total_nodes, ntypes)
+            total = int(params.get("Total_Nodes", 0))
+            if total > 0: counts = _even_split_counts(total, ntypes)
 
-        # ---------------------------------------------
-        # APPLY OVERRIDES, but only for DC 0
-        # ---------------------------------------------
         if overrides and dc_id in overrides:
-            # overrides replace counts for those type_ids
-            for tid, manual_count in overrides[dc_id].items():
-                if 0 <= tid < ntypes:
-                    counts[tid] = int(manual_count)
+            for tid, val in overrides[dc_id].items():
+                if 0 <= tid < ntypes: counts[tid] = int(val)
 
-        if not counts:
-            continue
+        if not counts: continue
 
-        # ---------------------------
-        # 3) Expand nodes based on final counts
-        # ---------------------------
+        # --- Expand Nodes ---
         next_local_node_id = 0
-
         for type_id in sorted(counts.keys()):
             num = int(counts[type_id])
-            if num <= 0:
-                continue
+            if num <= 0: continue
 
             tmpl = templates[type_id]
-            accel = tmpl["accel_type"]          # "A100", "H100", or "CPU"
-            cfg   = tmpl["gpu_config"]
+            accel = tmpl["accel_type"]
+            cfg = tmpl["gpu_config"]
             procs = int(tmpl.get("processor_count", 1))
 
-            # Lookup GPU/CPU power tables
-            row  = gpu_tbls[accel][cfg]
-            meta = row.get("_meta", {})
+            # Retrieve list of variants (or empty list)
+            rows_list = gpu_tbls.get(accel, {}).get(cfg, [])
 
-            tdp_kw  = float(meta.get("tdp_kw", 0.0))
-            idle_kw = float(meta.get("idle_kw", 0.15 * tdp_kw))
+            # Helper for CPU backward compatibility (dictionaries inside lists)
+            if isinstance(rows_list, dict): rows_list = [rows_list]
 
-            # ---------------------------
-            # Build performance tables
-            # ---------------------------
-            pre_sz = _num(row.get("prefill_token_size"))
-            gen_sz = _num(row.get("gen_token_size"))
-            denom  = (pre_sz or 0) + (gen_sz or 0) or 1.0
-
-            ms7  = _num(row.get("Llama7b_Process"))
-            ms70 = _num(row.get("Llama70b_Process"))
-
-            if accel in ("A100", "H100"):
-                model_perf = {
-                    "Llama7b": {
-                        "ms_per_request": ms7,
-                        "ms_per_token":   ms7 / denom if ms7 else None,
-                    },
-                    "Llama70b": {
-                        "ms_per_request": ms70,
-                        "ms_per_token":   ms70 / denom if ms70 else None,
-                    },
-                }
-
-            elif accel == "CPU":
-                # load SPEC workload ms_per_request values
+            if not rows_list:
+                # Config not found
+                tdp_kw, idle_kw = 0.0, 0.0
                 model_perf = {}
-                for wl in SPEC_CPU_WORKLOADS:
-                    val = _num(row.get(wl))
-                    if val is not None:
-                        model_perf[wl] = {
-                            "ms_per_request": val,
-                            "ms_per_token": val,
-                        }
-
-                # fallback to POVRAY if nothing inserted yet
-                if not model_perf:
-                    if ms7 is not None:
-                        model_perf = {
-                            "povray_r": {
-                                "ms_per_request": ms7,
-                                "ms_per_token": ms7,
-                            }
-                        }
-                    else:
-                        model_perf = {}
-
             else:
+                # Power specs come from the first row (hardware constant)
+                meta = rows_list[0].get("_meta", {})
+                tdp_kw = float(meta.get("tdp_kw", 0.0))
+                idle_kw = float(meta.get("idle_kw", 0.15 * tdp_kw))
+
                 model_perf = {}
 
-            # ---------------------------
-            # Instantiate node entries
-            # ---------------------------
+                # --- BRANCH: CPU (Legacy SPEC Logic) ---
+                if accel == "CPU":
+                    # CPU rows usually don't have variants, just use the first row
+                    row = rows_list[0]
+                    # SPEC Workloads
+                    for wl in SPEC_CPU_WORKLOADS:
+                        val = _num(row.get(wl))
+                        if val is not None:
+                            model_perf[wl] = {"ms_per_request": val, "ms_per_token": val}
+                    # Fallback
+                    if not model_perf:
+                        ms7 = _num(row.get("Llama7b_Process"))
+                        if ms7: model_perf["povray_r"] = {"ms_per_request": ms7, "ms_per_token": ms7}
+
+                # --- BRANCH: GPU (New Variant Logic) ---
+                else:
+                    for row in rows_list:
+                        # 1. New Extended Logic (Compound Keys)
+                        if "Model_Variant" in row:
+                            # Clean up variant name (remove "(70B)" if present to normalize)
+                            raw_var = str(row.get("Model_Variant", "Base"))
+                            variant = raw_var.replace("(70B)", "").strip()
+
+                            scenario = str(row.get("Scenario_Type", "Standard"))
+                            batch = int(float(row.get("batch_size", "1")))
+
+                            # Iterate over base models to check which ones have data in this row
+                            for base_model in ["Llama7b", "Llama70b"]:
+                                col_name = f"{base_model}_Process"  # e.g. Llama7b_Process
+                                val = _num(row.get(col_name))
+
+                                if val is not None and val > 0:
+                                    # CRITICAL MATH FIX:
+                                    # CSV Value (val) = Total Latency (ms) for the entire batch.
+                                    # We assume the benchmark used standard ~1000 token sequence lengths.
+                                    # ms_per_token = Total_Latency / (Batch_Size * 1000.0)
+                                    ms_per_token = val / (batch * 1000.0)
+
+                                    entry = {
+                                        "ms_per_token": ms_per_token,
+                                        "batch_size": batch,
+                                        "variant": variant,
+                                        "scenario": scenario
+                                    }
+
+                                    # 1. Full Key: "Llama7b_Chat_AWQ 4-bit_B32"
+                                    full_key = f"{base_model}_{scenario}_{variant}_B{batch}"
+                                    model_perf[full_key] = entry
+
+                                    # 2. Relaxed Key (No Scenario): "Llama7b_AWQ 4-bit_B32"
+                                    relaxed_key = f"{base_model}_{variant}_B{batch}"
+                                    if relaxed_key not in model_perf:
+                                        model_perf[relaxed_key] = entry
+
+                        # 2. Legacy Logic (Standard Llama7b columns)
+                        else:
+                            pre_sz = _num(row.get("prefill_token_size"))
+                            gen_sz = _num(row.get("gen_token_size"))
+                            denom = (pre_sz or 0) + (gen_sz or 0) or 1.0
+
+                            ms7 = _num(row.get("Llama7b_Process"))
+                            ms70 = _num(row.get("Llama70b_Process"))
+
+                            if ms7:
+                                model_perf["Llama7b"] = {
+                                    "ms_per_request": ms7,
+                                    "ms_per_token": ms7 / denom
+                                }
+                            if ms70:
+                                model_perf["Llama70b"] = {
+                                    "ms_per_request": ms70,
+                                    "ms_per_token": ms70 / denom
+                                }
+
+            # Instantiate
             for _ in range(num):
                 nodes.append({
                     "dc_id": int(dc_id),
@@ -2372,8 +2383,3 @@ def build_world_from_csvs_exact(
                 next_local_node_id += 1
 
     return dc_specs, nodes, lat_mat, gpu_tbls
-
-
-
-
-

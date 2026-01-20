@@ -25,7 +25,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 # Adjust this import if your file/module name is different
-from MultiAgentRL import ResourceEnv
+from MultiAgentRL_Broken import ResourceEnv
 
 
 # ---------------------------------------------------------------------

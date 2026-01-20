@@ -11,7 +11,13 @@ from Rate_Flow_Sim import LLM_Simulator
 # Defaults / knobs
 # -----------------------------
 DEFAULT_EPOCH_LEN = 900
-DEFAULT_NODE_TYPES = [0, 1, 2, 3, 4, 5]  # for simple power-plan heuristic
+DEFAULT_NODE_TYPES = [0, 1, 2, 3, 4, 5]
+
+# -----------------------------
+# Configuration
+# -----------------------------
+# Fixed Variant: Full Model (FP16), Reasonable Batch Size (32)
+FIXED_VARIANT = "_FP16 (Base)_B16"
 
 
 # -----------------------------
@@ -39,11 +45,9 @@ def _ensure_epoch_columns(df: pd.DataFrame, epoch_len: int) -> pd.DataFrame:
         if c not in d.columns:
             raise ValueError(f"epoch_data is missing required column '{c}'")
 
-    # Arrival time is optional – default everything to 0
     if "arrival_ms" not in d.columns:
         d["arrival_ms"] = 0.0
 
-    # Clamp/normalize obvious things
     d["source_dc_id"] = d["source_dc_id"].astype(int)
     d["model_type"] = d["model_type"].astype(str)
     d["num_tokens"] = d["num_tokens"].astype(float).clip(lower=0.0)
@@ -57,15 +61,6 @@ def _ensure_epoch_columns(df: pd.DataFrame, epoch_len: int) -> pd.DataFrame:
 def _normalize_sim_output(
     sim_out: Tuple[Dict[str, Any], List[Dict[str, Any]], Any]
 ) -> Tuple[Dict[str, Any], List[Dict[str, Any]], Any]:
-    """
-    Convert whatever the simulator returns into a stable, simpler shape for the frameworks.
-
-    sim_out = (metrics, details, leftovers)
-      metrics: dict with avg_ttft (s), energy_kwh, carbon_emissions (g),
-               water_usage (m^3), energy_cost ($)
-      details: per-request info
-      leftovers: any structure – passed through
-    """
     if not isinstance(sim_out, tuple) or len(sim_out) != 3:
         raise ValueError("Expected simulator output of form (metrics, details, leftovers)")
 
@@ -97,16 +92,7 @@ def _normalize_sim_output(
 # DC discovery from node_properties
 # -----------------------------
 def _discover_dcs_from_node_props(node_properties) -> List[int]:
-    """
-    Attempt to infer the set of DC ids from node_properties.
-
-    Accepts:
-      - dict[node_id] -> {"dc_id": int, ...}
-      - iterable of dicts with "dc_id" or "dc" key
-      - anything else returns an empty list
-    """
     dcs = set()
-
     if isinstance(node_properties, dict):
         iterable = node_properties.values()
     elif isinstance(node_properties, (list, tuple)):
@@ -127,18 +113,12 @@ def _discover_dcs_from_node_props(node_properties) -> List[int]:
                 except Exception:
                     pass
                 break
-
     return sorted(dcs)
 
 
 def _capacity_per_dc(node_properties, dcs: List[int]) -> Dict[int, float]:
-    """
-    Estimate relative capacity from node_properties by counting entries per DC.
-    If unavailable, use equal capacities across discovered DCs.
-    """
     caps = {dc: 0.0 for dc in dcs}
     count_any = False
-
     if isinstance(node_properties, dict):
         iterable = node_properties.values()
     elif isinstance(node_properties, (list, tuple)):
@@ -156,7 +136,6 @@ def _capacity_per_dc(node_properties, dcs: List[int]) -> Dict[int, float]:
             dc_id = int(rec.get("dc_id", rec.get("dc")))
         except Exception:
             continue
-
         if dc_id in caps:
             caps[dc_id] += 1.0
             count_any = True
@@ -171,13 +150,6 @@ def _capacity_per_dc(node_properties, dcs: List[int]) -> Dict[int, float]:
 
 
 def _capacity_per_dc_from_sim(sim: LLM_Simulator) -> Dict[int, float]:
-    """
-    Estimate per-DC capacity from the simulator's GPU perf tables.
-
-    We aggregate tokens/epoch over all processors in each datacenter using
-    ms_per_token (or ms_per_request / avg_tokens_per_request if needed).
-    This gives us a Helix-style "capacity" for the max-flow style heuristic.
-    """
     caps: Dict[int, float] = {}
     epoch_len_s = float(getattr(sim, "epoch_length", DEFAULT_EPOCH_LEN))
     epoch_ms = epoch_len_s * 1000.0
@@ -189,45 +161,28 @@ def _capacity_per_dc_from_sim(sim: LLM_Simulator) -> Dict[int, float]:
             perf = getattr(u, "model_perf", {})
             if not isinstance(perf, dict):
                 continue
-
-            # Aggregate capacity across all models this unit can serve.
             for rec in perf.values():
                 ms_per_tok = 0.0
-
-                # Prefer ms_per_token if it exists
                 try:
                     ms_per_tok = float(rec.get("ms_per_token", 0.0))
                 except Exception:
                     ms_per_tok = 0.0
-
                 if ms_per_tok <= 0.0:
-                    # Fallback: derive from ms_per_request / avg_tokens_per_request if available
                     try:
                         ms_req = float(rec.get("ms_per_request", 0.0))
-                        avg_tok = float(
-                            rec.get(
-                                "avg_tokens_per_request",
-                                rec.get("avg_tokens_per_req", 0.0),
-                            )
-                        )
+                        avg_tok = float(rec.get("avg_tokens_per_request", rec.get("avg_tokens_per_req", 0.0)))
                     except Exception:
                         ms_req, avg_tok = 0.0, 0.0
-
                     if ms_req > 0.0 and avg_tok > 0.0:
                         ms_per_tok = ms_req / avg_tok
-
                 if ms_per_tok > 0.0:
                     tokens_per_ms = 1.0 / ms_per_tok
                     total_tokens += tokens_per_ms * epoch_ms
-
         caps[int(dc_id)] = total_tokens
 
-    # If everything somehow came out zero, fall back to equal capacities.
     if not any(v > 0.0 for v in caps.values()):
         for dc_id in caps:
             caps[dc_id] = 1.0
-
-    # Avoid divide-by-zero downstream
     for dc_id in caps:
         caps[dc_id] = max(1e-6, caps[dc_id])
 
@@ -235,19 +190,12 @@ def _capacity_per_dc_from_sim(sim: LLM_Simulator) -> Dict[int, float]:
 
 
 # -----------------------------
-# Power plan (Idle/Off per node type) scaled by routed share
+# Power plan (Idle/Off per node type)
 # -----------------------------
 def _build_power_plan(
     routed_token_share_by_dc: Dict[int, float],
     epoch_summary: Any,
 ) -> Dict[int, Dict[int, str]]:
-    """
-    Heuristic Idle/Off power plan scaled by per-DC share.
-    epoch_summary may contain:
-      - node_types (default DEFAULT_NODE_TYPES)
-      - min_idle_types (default 1)
-      - max_idle_types (default len(node_types))
-    """
     if isinstance(epoch_summary, dict):
         node_types = list(epoch_summary.get("node_types", DEFAULT_NODE_TYPES))
         min_idle = int(epoch_summary.get("min_idle_types", 1))
@@ -258,7 +206,6 @@ def _build_power_plan(
         max_idle = len(node_types)
 
     max_idle = max(1, min(max_idle, len(node_types)))
-
     total = sum(max(0.0, v) for v in routed_token_share_by_dc.values()) or 1.0
     shares = {
         dc: max(0.0, routed_token_share_by_dc.get(dc, 0.0)) / total
@@ -267,7 +214,6 @@ def _build_power_plan(
 
     power_plan: Dict[int, Dict[int, str]] = {}
     for dc, share in shares.items():
-        # More share = fewer Idle node types (high share -> more "On")
         idle_types = max(
             min_idle,
             min(max_idle, int(round((1.0 - share) * len(node_types)))),
@@ -291,22 +237,12 @@ def _build_power_plan(
 class Helix:
     @staticmethod
     def milp_optimizer(
-        epoch_data,
-        epoch_idx: int,
-        node_properties,
-        epoch_summary: Any,
+            epoch_data,
+            epoch_idx: int,
+            node_properties,
+            epoch_summary: Any,
     ):
-        """
-        Build a schedule + power plan and run the LLM_Simulator on a per-request path.
-
-        Returns: (stats, results, leftovers)
-          - stats: dict with keys avg_ttft (s), carbon_emissions (g),
-                   water_usage (m^3), total_energy (kWh), energy_cost ($)
-          - results: per-request details
-          - leftovers: simulator leftovers (e.g., per-DC utilization)
-        """
-
-        # 0) Normalize epoch rows to ensure required columns exist
+        # 0) Normalize epoch rows
         if hasattr(epoch_data, "iterrows") and hasattr(epoch_data, "columns"):
             df = _ensure_epoch_columns(epoch_data, DEFAULT_EPOCH_LEN)
         else:
@@ -317,146 +253,108 @@ class Helix:
         work_df = (
             df.groupby(["source_dc_id", "model_type"], as_index=False)["num_tokens"]
             .sum()
-            .rename(
-                columns={"source_dc_id": "src_dc", "num_tokens": "total_tokens"}
-            )
+            .rename(columns={"source_dc_id": "src_dc", "num_tokens": "total_tokens"})
         )
         if work_df["total_tokens"].sum() <= 0:
-            empty_stats = {
-                "processed_tokens": 0.0,
-                "avg_ttft_sec": 0.0,
-                "avg_ttft": 0.0,
-                "energy_kwh": 0.0,
-                "total_energy": 0.0,
-                "carbon_emissions": 0.0,
-                "water_usage": 0.0,
-                "energy_cost": 0.0,
-            }
-            return empty_stats, [], []
+            return {}, [], []
 
-        # 2) Discover DCs and capacities using the simulator's GPU perf tables
+        # 2) Initialize Simulator to discover Capacities
+        spec_dir = "sim_specs"
+        epoch_len = DEFAULT_EPOCH_LEN
+        a100_csv = None
+        h100_csv = None
+
+        if isinstance(epoch_summary, dict):
+            spec_dir = epoch_summary.get("spec_dir", "sim_specs")
+            epoch_len = int(epoch_summary.get("epoch_length", DEFAULT_EPOCH_LEN))
+            a100_csv = epoch_summary.get("a100_csv")
+            h100_csv = epoch_summary.get("h100_csv")
+
         try:
-            if isinstance(epoch_summary, dict):
-                spec_dir = epoch_summary.get("spec_dir", "sim_specs")
-                epoch_len = int(
-                    epoch_summary.get("epoch_length", DEFAULT_EPOCH_LEN)
-                )
-            else:
-                spec_dir = "sim_specs"
-                epoch_len = DEFAULT_EPOCH_LEN
-
             sim = LLM_Simulator(
-                spec_dir=spec_dir, epoch_length=epoch_len, debug=False
+                spec_dir=spec_dir,
+                epoch_length=epoch_len,
+                debug=False,
+                a100_csv=a100_csv,
+                h100_csv=h100_csv
             )
-
             dcs = sorted(int(dc_id) for dc_id in sim.datacenters.keys())
             cap_tps = _capacity_per_dc_from_sim(sim)
-        except Exception:
-            # Fallback: keep the old behavior based on node_properties only
-            dcs = _discover_dcs_from_node_props(node_properties)
-            if not dcs:
-                dcs = (
-                    sorted(
-                        df["source_dc_id"].unique().astype(int).tolist()
-                        or [0]
-                    )
-                )
-            cap_tps = _capacity_per_dc(node_properties, dcs)
 
-            # And build a default simulator so we can still run the epoch
+        except Exception as e:
+            print(f"[Helix] Init warning: {e}. Using node property fallbacks.")
+            dcs = _discover_dcs_from_node_props(node_properties)
+            cap_tps = _capacity_per_dc(node_properties, dcs)
             sim = LLM_Simulator(
-                spec_dir="sim_specs",
-                epoch_length=DEFAULT_EPOCH_LEN,
+                spec_dir=spec_dir,
+                epoch_length=epoch_len,
                 debug=False,
+                a100_csv=a100_csv,
+                h100_csv=h100_csv
             )
 
-        # 3) Greedy routing "fraction plan" per (src, model) -> {tgt_dc: frac}
-        pending: Dict[int, float] = {dc: 0.0 for dc in dcs}
-        routed_tokens_by_dc: Dict[int, float] = {dc: 0.0 for dc in dcs}
-        frac_plan: Dict[Tuple[int, str], Dict[int, float]] = {}
+        # 3) Greedy Routing (Load Balancing)
+        pending = {dc: 0.0 for dc in dcs}
+        frac_plan = {}
 
         for row in work_df.itertuples(index=False):
-            src_dc = int(getattr(row, "src_dc"))
-            model = str(getattr(row, "model_type"))
-            tokens = float(getattr(row, "total_tokens"))
+            best_dc = None
+            best_score = float('inf')
 
-            # choose DC with minimal load ratio
-            best_dc, best_score = None, None
+            # Safe capacity division
             for dc in dcs:
-                score = pending[dc] / cap_tps[dc]
-                if (best_score is None) or (score < best_score):
+                cap = cap_tps.get(dc, 1e-6)
+                score = pending.get(dc, 0.0) / cap
+                if score < best_score:
                     best_score, best_dc = score, dc
 
-            tgt = int(best_dc)
-            pending[tgt] += tokens
-            routed_tokens_by_dc[tgt] += tokens
+            tgt = int(best_dc if best_dc is not None else dcs[0])
+            pending[tgt] += row.total_tokens
 
-            key = (src_dc, model)
+            key = (row.src_dc, row.model_type)
             d = frac_plan.setdefault(key, {})
             d[tgt] = d.get(tgt, 0.0) + 1.0
 
-            # light smoothing so one huge bucket doesn't dominate
-            pending[tgt] = max(0.0, pending[tgt] - cap_tps[tgt])
+            # Smoothing
+            pending[tgt] = max(0.0, pending[tgt] - cap_tps.get(tgt, 1.0))
 
-        # Normalize weights to fractions
-        for key, dist in frac_plan.items():
-            s = sum(dist.values())
-            if s > 0:
-                for dc in list(dist.keys()):
-                    dist[dc] = dist[dc] / s
+        # 4) Power Plan
+        total_tokens = work_df["total_tokens"].sum() or 1.0
+        routed_share = {dc: (pending.get(dc, 0.0) / total_tokens) for dc in dcs}
+        power_plan = _build_power_plan(routed_share, epoch_summary if isinstance(epoch_summary, dict) else {})
 
-        # 4) Build a simple power plan from routed shares
-        total_tokens = sum(routed_tokens_by_dc.values()) or 1.0
-        routed_share = {
-            dc: (routed_tokens_by_dc[dc] / total_tokens) for dc in dcs
-        }
-        power_plan = _build_power_plan(
-            routed_share,
-            epoch_summary if isinstance(epoch_summary, dict) else {},
-        )
-
-        # 5) Convert the fraction plan into a per-request 'map' (deterministic argmax)
+        # 5) Build Request List with FIXED VARIANT
         req_rows = []
-        plan_map: Dict[int, int] = {}
+        plan_map = {}
         row_idx = 0
-        for r in work_df.itertuples(index=False):
-            src_dc = int(getattr(r, "src_dc"))
-            model = str(getattr(r, "model_type"))
-            tokens = int(getattr(r, "total_tokens"))
-            req_rows.append(
-                {
-                    "source_dc": src_dc,
-                    "model": model,
-                    "arrival_ms": 0,
-                    "tokens": tokens,
-                }
-            )
 
-            choices = frac_plan.get((src_dc, model), {})
+        for r in work_df.itertuples(index=False):
+            # Deterministic Routing
+            choices = frac_plan.get((r.src_dc, r.model_type), {})
             if choices:
-                # pick highest fraction; break ties by smallest dc_id
-                tgt = sorted(
-                    choices.items(), key=lambda kv: (-kv[1], kv[0])
-                )[0][0]
+                tgt = sorted(choices.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
             else:
-                tgt = src_dc
+                tgt = r.src_dc
+
+            # --- FORCE FIXED VARIANT (No dynamic optimization) ---
+            full_model_str = f"{r.model_type}{FIXED_VARIANT}"
+
+            req_rows.append({
+                "source_dc": r.src_dc,
+                "model": full_model_str,
+                "arrival_ms": 0,
+                "tokens": r.total_tokens,
+            })
             plan_map[row_idx] = int(tgt)
             row_idx += 1
 
         requests_df = pd.DataFrame(req_rows)
         schedule_plan = {"map": plan_map}
 
-        # 6) Run the simulator for this epoch (per-request path)
+        # 6) Run Simulator
         metrics, details, leftovers = sim.run_epoch(
             epoch_idx, requests_df, schedule_plan, power_plan
         )
 
-        # 7) Normalize & return
-        stats, results, leftovers_norm = _normalize_sim_output(
-            (metrics, details, leftovers)
-        )
+        stats, results, leftovers_norm = _normalize_sim_output((metrics, details, leftovers))
         return stats, results, leftovers_norm
-
-
-
-

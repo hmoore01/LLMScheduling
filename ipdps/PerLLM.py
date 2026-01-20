@@ -515,6 +515,7 @@ class PerLLM:
         )
 
         # 5) Convert the fraction plan into a per-request 'map' (deterministic argmax)
+        FIXED_VARIANT = "_FP16 (Base)_B16"
         req_rows = []
         plan_map: Dict[int, int] = {}
         row_idx = 0
@@ -522,10 +523,12 @@ class PerLLM:
             src_dc = int(getattr(r, "src_dc"))
             model = str(getattr(r, "model_type"))
             tokens = int(getattr(r, "total_tokens"))
+
+            full_model = f"{model}{FIXED_VARIANT}"
             req_rows.append(
                 {
                     "source_dc": src_dc,
-                    "model": model,
+                    "model": full_model,
                     "arrival_ms": 0,
                     "tokens": tokens,
                 }
@@ -555,4 +558,3 @@ class PerLLM:
             (metrics, details, leftovers)
         )
         return stats, results, leftovers_norm
-
