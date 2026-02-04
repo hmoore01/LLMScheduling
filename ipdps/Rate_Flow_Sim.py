@@ -1496,9 +1496,9 @@ class LLM_Simulator:
         self.spec_dir = spec_dir
 
         # Resolve file paths (exact header CSVs)
-        self.dc_specs_csv = dc_specs_csv or os.path.join(spec_dir, "Datacenter_specs.csv")
+        self.dc_specs_csv = dc_specs_csv or os.path.join(spec_dir, "Datacenter_specs_synthetic.csv")
         self.node_specs_csv = node_specs_csv or os.path.join(spec_dir, "Node_Specs.csv")
-        self.latency_csv = latency_csv or os.path.join(spec_dir, "Geo_Latencies.csv")
+        self.latency_csv = latency_csv or os.path.join(spec_dir, "Geo_Latencies_synthetic.csv")
         self.a100_csv = a100_csv or os.path.join(spec_dir, "A100_GPU.csv")
         self.h100_csv = h100_csv or os.path.join(spec_dir, "H100_GPU.csv")
         self.cpu_csv = os.path.join(spec_dir, "POVRay_CPU.csv")
@@ -1516,9 +1516,9 @@ class LLM_Simulator:
         if self.debug:
             print("=== LLM_Simulator init ===")
             print(f"spec_dir               : {self.spec_dir}")
-            print(f"Datacenter_specs.csv   : {self.dc_specs_csv}")
+            print(f"Datacenter_specs_synthetic.csv   : {self.dc_specs_csv}")
             print(f"Node_Specs.csv         : {self.node_specs_csv}")
-            print(f"Geo_Latencies.csv      : {self.latency_csv}")
+            print(f"Geo_Latencies_synthetic.csv      : {self.latency_csv}")
             print(f"A100_GPU.csv           : {self.a100_csv}")
             print(f"H100_GPU.csv           : {self.h100_csv}")
             print(f"Epoch length (s)       : {self.epoch_length}")
@@ -1563,8 +1563,8 @@ class LLM_Simulator:
             print(f"\n[VERIFY] Expanded node records: {len(node_recs)}")
             if node_recs:
                 s = node_recs[0]
-                mp7 = s["model_perf"]["Llama7b"]
-                mp70 = s["model_perf"]["Llama70b"]
+                mp7 = s["model_perf"]["Llama7b_FP16 (Base)_B16"]
+                mp70 = s["model_perf"]["Llama70b_FP16 (Base)_B16"]
                 print("  example node:",
                       f"dc={s['dc_id']} type={s['type_id']} accel={s['accel_type']} cfg={s['gpu_config']} "
                       f"procs={s['processor_count']} tdp_kw={s['tdp_kw']:.3f} idle_kw={s['idle_kw']:.3f}")
@@ -2040,7 +2040,7 @@ def load_dc_specs_exact(self) -> dict[int, dict]:
     import pandas as pd
     import os
 
-    path = "sim_specs/Datacenter_specs.csv"
+    path = "sim_specs/Datacenter_specs_synthetic.csv"
     df = pd.read_csv(path)
 
     # Expected column set (per the CSV you sent)

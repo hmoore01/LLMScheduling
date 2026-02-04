@@ -11,9 +11,9 @@ import numpy as np
 
 # --------- Defaults ---------
 DEFAULT_INPUT = "BurstGPT_without_fails_2.csv"
-DEFAULT_OUTPUT = "simulator_per_request.csv"
+DEFAULT_OUTPUT = "simulator_ready_trace.csv"
 DEFAULT_EPOCH_LENGTH = 900  # seconds
-DEFAULT_NUM_DCS = 12
+DEFAULT_NUM_DCS = 3
 
 # --- Scenario Injection Configuration ---
 # Probability distribution for assigning scenarios to raw trace requests

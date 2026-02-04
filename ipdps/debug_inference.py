@@ -1,718 +1,419 @@
 #!/usr/bin/env python3
 """
-Experiment Runner for LLM Simulator
-===================================
+Diagnostic Script for Synthetic Environment
 
-Supports three experiment types:
-1. SCALABILITY: Vary number of DCs and nodes/node types per DC
-2. MISPREDICTION: Test multiple misprediction (error) rates
-3. DISTRIBUTION: Compare even vs population-weighted request origin distributions
+This script verifies that:
+1. The synthetic CSV files are properly formatted
+2. The LLM_Simulator correctly loads the DC characteristics
+3. Different DCs produce different metrics when routing to them
 
-Usage:
-    python run_experiments.py --experiment scalability --frameworks Helix NSGA2
-    python run_experiments.py --experiment misprediction --error-rates 0.0 0.1 0.2 0.3
-    python run_experiments.py --experiment distribution --frameworks Helix
-
-Author: Auto-generated for LLM Simulation Framework
+Run this BEFORE training to ensure the environment is set up correctly.
 """
 
-from __future__ import annotations
-import argparse
-import subprocess
 import os
 import sys
-import json
-import itertools
 import pandas as pd
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Any
-from dataclasses import dataclass, field
-from datetime import datetime
-import shutil
+from typing import Dict, Any
 
-# ==============================================================================
-# Configuration Defaults
-# ==============================================================================
-
-DEFAULT_FRAMEWORKS = ["Helix", "NSGA2", "PerLLM", "Splitwise"]
-DEFAULT_EPOCHS = 96
-DEFAULT_TRACE = "simulator_ready_trace.csv"
-DEFAULT_SPEC_DIR = "sim_specs"
-DEFAULT_OUTPUT_DIR = "experiment_results"
-
-# Scalability configurations
-SCALABILITY_CONFIGS = {
-    "small": {"num_dcs": 4, "nodes_per_dc": 100, "node_type_dist": {0: 20, 1: 20, 2: 20, 3: 20, 4: 10, 5: 10}},
-    "medium": {"num_dcs": 8, "nodes_per_dc": 500, "node_type_dist": {0: 100, 1: 100, 2: 100, 3: 100, 4: 50, 5: 50}},
-    "large": {"num_dcs": 12, "nodes_per_dc": 1000, "node_type_dist": {0: 167, 1: 167, 2: 167, 3: 167, 4: 166, 5: 166}},
-}
-
-# Misprediction rates to test
-DEFAULT_ERROR_RATES = [0.0, 0.05, 0.10, 0.15, 0.20, 0.25, 0.30]
-
-# Population weights for major regions (normalized)
-# Based on approximate global internet user distribution
-POPULATION_WEIGHTS = {
-    0: 0.12,  # US East
-    1: 0.10,  # US West
-    2: 0.08,  # US Central
-    3: 0.15,  # Europe West
-    4: 0.10,  # Europe Central
-    5: 0.05,  # Europe North
-    6: 0.18,  # Asia Pacific (China region)
-    7: 0.08,  # Asia Pacific (Japan/Korea)
-    8: 0.06,  # Asia Pacific (Southeast)
-    9: 0.04,  # South America
-    10: 0.02,  # Middle East
-    11: 0.02,  # Africa
-}
+SPEC_DIR = "./sim_specs"  # Should contain Datacenter_specs.csv, etc.
 
 
-# ==============================================================================
-# Utility Functions
-# ==============================================================================
+def check_csv_files():
+    """Verify all required CSV files exist and are properly formatted."""
+    print("\n" + "=" * 60)
+    print("STEP 1: Checking CSV Files")
+    print("=" * 60)
 
-def ensure_dir(path: str) -> str:
-    """Create directory if it doesn't exist."""
-    os.makedirs(path, exist_ok=True)
-    return path
-
-
-def timestamp_str() -> str:
-    """Return current timestamp as string for filenames."""
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
-
-
-def parse_results_file(filepath: str) -> Dict[str, float]:
-    """Parse a results .txt file into a dictionary."""
-    results = {}
-    if not os.path.exists(filepath):
-        return results
-
-    with open(filepath, "r") as f:
-        for line in f:
-            line = line.strip()
-            if ":" in line:
-                key, val = line.split(":", 1)
-                key = key.strip()
-                val = val.strip()
-                try:
-                    results[key] = float(val)
-                except ValueError:
-                    results[key] = val
-    return results
-
-
-# ==============================================================================
-# Datacenter Spec Modification
-# ==============================================================================
-
-def modify_dc_specs(
-        spec_dir: str,
-        num_dcs: int,
-        node_type_counts: Dict[int, int],
-        output_dir: str
-) -> str:
-    """
-    Create modified DC specs with specified number of DCs and node counts.
-    Returns path to the new spec directory.
-    """
-    new_spec_dir = os.path.join(output_dir, "sim_specs")
-    ensure_dir(new_spec_dir)
-
-    # Copy base specs
-    for fname in ["Node_specs.csv", "Geo_Latencies.csv", "A100_specs.csv", "H100_specs.csv"]:
-        src = os.path.join(spec_dir, fname)
-        dst = os.path.join(new_spec_dir, fname)
-        if os.path.exists(src):
-            shutil.copy(src, dst)
-
-    # Modify DC specs
-    dc_specs_path = os.path.join(spec_dir, "Datacenter_specs.csv")
-    if os.path.exists(dc_specs_path):
-        df = pd.read_csv(dc_specs_path)
-
-        # Filter to requested number of DCs
-        df = df[df["DC_Num"] < num_dcs].copy()
-
-        # Update node type counts
-        counts_str = ";".join(f"{k}:{v}" for k, v in sorted(node_type_counts.items()))
-        total_nodes = sum(node_type_counts.values())
-
-        df["Node_Type_Counts"] = counts_str
-        df["Total_Nodes"] = total_nodes
-
-        # If we need more DCs than available, duplicate with offset
-        if len(df) < num_dcs:
-            base_df = df.copy()
-            while len(df) < num_dcs:
-                add_df = base_df.copy()
-                offset = len(df)
-                add_df["DC_Num"] = add_df["DC_Num"] + offset
-                df = pd.concat([df, add_df], ignore_index=True)
-            df = df[df["DC_Num"] < num_dcs]
-
-        df.to_csv(os.path.join(new_spec_dir, "Datacenter_specs.csv"), index=False)
-
-    # Modify latency matrix for new DC count
-    lat_path = os.path.join(spec_dir, "Geo_Latencies.csv")
-    if os.path.exists(lat_path):
-        lat_df = pd.read_csv(lat_path)
-        # Ensure matrix is square for num_dcs
-        if len(lat_df) >= num_dcs:
-            lat_df = lat_df.iloc[:num_dcs, :num_dcs + 1]  # +1 for label column
-        else:
-            # Extend matrix with synthetic latencies
-            while len(lat_df) < num_dcs:
-                new_row = lat_df.iloc[len(lat_df) % len(lat_df)].copy()
-                lat_df = pd.concat([lat_df, pd.DataFrame([new_row])], ignore_index=True)
-            lat_df = lat_df.iloc[:num_dcs]
-
-        lat_df.to_csv(os.path.join(new_spec_dir, "Geo_Latencies.csv"), index=False)
-
-    return new_spec_dir
-
-
-# ==============================================================================
-# Trace Modification for Distribution Experiments
-# ==============================================================================
-
-def apply_population_distribution(
-        trace_path: str,
-        num_dcs: int,
-        output_path: str,
-        weights: Optional[Dict[int, float]] = None
-) -> str:
-    """
-    Modify trace to use population-weighted source DC distribution.
-    """
-    df = pd.read_csv(trace_path)
-
-    if weights is None:
-        weights = POPULATION_WEIGHTS
-
-    # Normalize weights to available DCs
-    available_weights = {k: v for k, v in weights.items() if k < num_dcs}
-    total = sum(available_weights.values())
-    if total > 0:
-        available_weights = {k: v / total for k, v in available_weights.items()}
-    else:
-        # Fallback to even distribution
-        available_weights = {i: 1.0 / num_dcs for i in range(num_dcs)}
-
-    # Assign source DCs based on weights
-    dc_ids = list(available_weights.keys())
-    dc_probs = list(available_weights.values())
-
-    # Stratified assignment per epoch for consistency
-    if "epoch" in df.columns:
-        new_src_dcs = []
-        for epoch_idx, group in df.groupby("epoch"):
-            n = len(group)
-            assigned = np.random.choice(dc_ids, size=n, p=dc_probs)
-            new_src_dcs.extend(assigned)
-        df["source_dc_id"] = new_src_dcs
-    else:
-        df["source_dc_id"] = np.random.choice(dc_ids, size=len(df), p=dc_probs)
-
-    df.to_csv(output_path, index=False)
-    return output_path
-
-
-def apply_even_distribution(
-        trace_path: str,
-        num_dcs: int,
-        output_path: str
-) -> str:
-    """
-    Modify trace to use even (round-robin) source DC distribution.
-    """
-    df = pd.read_csv(trace_path)
-
-    # Round-robin per epoch
-    if "epoch" in df.columns:
-        new_src_dcs = []
-        for epoch_idx, group in df.groupby("epoch"):
-            n = len(group)
-            assigned = np.arange(n) % num_dcs
-            new_src_dcs.extend(assigned)
-        df["source_dc_id"] = new_src_dcs
-    else:
-        df["source_dc_id"] = np.arange(len(df)) % num_dcs
-
-    df.to_csv(output_path, index=False)
-    return output_path
-
-
-# ==============================================================================
-# Experiment Runners
-# ==============================================================================
-
-@dataclass
-class ExperimentResult:
-    """Container for experiment results."""
-    experiment_type: str
-    config_name: str
-    framework: str
-    parameters: Dict[str, Any]
-    metrics: Dict[str, float]
-    runtime_seconds: float = 0.0
-
-
-def run_single_experiment(
-        framework: str,
-        num_dcs: int,
-        num_epochs: int,
-        error_rate: float = 0.0,
-        trace_path: str = DEFAULT_TRACE,
-        spec_dir: str = DEFAULT_SPEC_DIR,
-        extra_args: Optional[List[str]] = None
-) -> Tuple[Dict[str, float], float]:
-    """
-    Run a single experiment with the given configuration.
-    Returns (metrics_dict, runtime_seconds).
-    """
-    import time
-
-    cmd = [
-        sys.executable, "simulator_LLM.py",
-        "-f", framework,
-        "--num-dcs", str(num_dcs),
-        "-e", str(num_epochs),
-        "--error-rate", str(error_rate),
+    # Check for both standard and _synthetic suffix versions
+    file_pairs = [
+        ("Datacenter_specs.csv", "Datacenter_specs_synthetic.csv"),
+        ("Geo_Latencies.csv", "Geo_Latencies_synthetic.csv"),
+        ("Node_Specs.csv", None),
+        ("A100_GPU.csv", None),
+        ("H100_GPU.csv", None),
     ]
 
-    if extra_args:
-        cmd.extend(extra_args)
+    all_ok = True
+    actual_dc_file = None
+    actual_latency_file = None
 
-    # Set environment for spec directory if modified
-    env = os.environ.copy()
-    if spec_dir != DEFAULT_SPEC_DIR:
-        # The simulator reads from sim_specs by default; we need to symlink or copy
-        if os.path.exists("sim_specs"):
-            shutil.rmtree("sim_specs", ignore_errors=True)
-        shutil.copytree(spec_dir, "sim_specs")
+    for primary, alternate in file_pairs:
+        path = os.path.join(SPEC_DIR, primary)
+        alt_path = os.path.join(SPEC_DIR, alternate) if alternate else None
 
-    start_time = time.time()
+        if os.path.exists(path):
+            df = pd.read_csv(path)
+            print(f"✓ {primary}: {len(df)} rows, columns: {list(df.columns)[:5]}...")
+            if "Datacenter" in primary:
+                actual_dc_file = alternate
+            if "Latencies" in primary:
+                actual_latency_file = alternate
+        elif alt_path and os.path.exists(alt_path):
+            df = pd.read_csv(alt_path)
+            print(f"✓ {alternate}: {len(df)} rows, columns: {list(df.columns)[:5]}...")
+            print(f"  ⚠️  NOTE: Using '{alternate}' instead of '{primary}'")
+            print(f"      The simulator may not find this file automatically!")
+            print(f"      Consider renaming to '{primary}'")
+            if "Datacenter" in alternate:
+                actual_dc_file = alternate
+            if "Latencies" in alternate:
+                actual_latency_file = alternate
+        else:
+            print(f"✗ {primary}: NOT FOUND!")
+            all_ok = False
 
-    try:
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=3600,  # 1 hour timeout
-            env=env
-        )
+    # CRITICAL WARNING about file naming
+    if actual_dc_file and "_synthetic" in actual_dc_file:
+        print("\n" + "!" * 60)
+        print("CRITICAL WARNING: Datacenter specs file has '_synthetic' suffix!")
+        print(f"  Found: {actual_dc_file}")
+        print(f"  Expected: Datacenter_specs.csv")
+        print()
+        print("The simulator looks for 'Datacenter_specs.csv' by default.")
+        print("Your synthetic environment will NOT be loaded unless you:")
+        print(f"  1. Rename '{actual_dc_file}' to 'Datacenter_specs.csv', OR")
+        print("  2. Pass the correct filename to the simulator")
+        print("!" * 60 + "\n")
 
-        if result.returncode != 0:
-            print(f"  [WARNING] Command failed with return code {result.returncode}")
-            print(f"  STDERR: {result.stderr[:500]}")
-    except subprocess.TimeoutExpired:
-        print(f"  [ERROR] Experiment timed out after 1 hour")
-        return {}, time.time() - start_time
-    except Exception as e:
-        print(f"  [ERROR] Exception during experiment: {e}")
-        return {}, time.time() - start_time
-
-    runtime = time.time() - start_time
-
-    # Parse results
-    results_file = f"LLM_Results/{framework}_final.txt"
-    metrics = parse_results_file(results_file)
-
-    return metrics, runtime
+    return all_ok, actual_dc_file, actual_latency_file
 
 
-def run_scalability_experiment(
-        frameworks: List[str],
-        configs: Dict[str, Dict] = None,
-        num_epochs: int = DEFAULT_EPOCHS,
-        output_dir: str = DEFAULT_OUTPUT_DIR
-) -> List[ExperimentResult]:
-    """
-    Run scalability experiments across different DC/node configurations.
-    """
-    if configs is None:
-        configs = SCALABILITY_CONFIGS
-
-    results = []
-    exp_dir = ensure_dir(os.path.join(output_dir, f"scalability_{timestamp_str()}"))
-
-    print("=" * 60)
-    print("SCALABILITY EXPERIMENT")
+def check_dc_specs(dc_file=None):
+    """Verify Datacenter_specs.csv has correct values for synthetic env."""
+    print("\n" + "=" * 60)
+    print("STEP 2: Checking DC Specifications")
     print("=" * 60)
 
-    for config_name, config in configs.items():
-        print(f"\n--- Configuration: {config_name} ---")
-        print(f"    DCs: {config['num_dcs']}, Nodes/DC: {config['nodes_per_dc']}")
+    if dc_file is None:
+        dc_file = "Datacenter_specs_synthetic.csv"
 
-        # Modify specs for this configuration
-        config_dir = ensure_dir(os.path.join(exp_dir, config_name))
-        new_spec_dir = modify_dc_specs(
-            DEFAULT_SPEC_DIR,
-            config["num_dcs"],
-            config["node_type_dist"],
-            config_dir
-        )
+    path = os.path.join(SPEC_DIR, dc_file)
+    if not os.path.exists(path):
+        print(f"✗ Cannot find {dc_file}")
+        return False
 
-        for fw in frameworks:
-            print(f"  Running {fw}...")
+    df = pd.read_csv(path)
 
-            metrics, runtime = run_single_experiment(
-                framework=fw,
-                num_dcs=config["num_dcs"],
-                num_epochs=num_epochs,
-                spec_dir=new_spec_dir
-            )
+    print(f"\nFound {len(df)} datacenters:\n")
 
-            result = ExperimentResult(
-                experiment_type="scalability",
-                config_name=config_name,
-                framework=fw,
-                parameters={
-                    "num_dcs": config["num_dcs"],
-                    "nodes_per_dc": config["nodes_per_dc"],
-                    "node_type_dist": config["node_type_dist"]
-                },
-                metrics=metrics,
-                runtime_seconds=runtime
-            )
-            results.append(result)
-
-            print(f"    TTFT: {metrics.get('Average TTFT (s)', 'N/A')}")
-            print(f"    Carbon: {metrics.get('Total Carbon (g)', 'N/A')}")
-            print(f"    Runtime: {runtime:.2f}s")
-
-    # Save results
-    save_results(results, os.path.join(exp_dir, "results.json"))
-    save_results_csv(results, os.path.join(exp_dir, "results.csv"))
-
-    return results
-
-
-def run_misprediction_experiment(
-        frameworks: List[str],
-        error_rates: List[float] = None,
-        num_dcs: int = 12,
-        num_epochs: int = DEFAULT_EPOCHS,
-        output_dir: str = DEFAULT_OUTPUT_DIR
-) -> List[ExperimentResult]:
-    """
-    Run misprediction experiments with varying error rates.
-    """
-    if error_rates is None:
-        error_rates = DEFAULT_ERROR_RATES
-
-    results = []
-    exp_dir = ensure_dir(os.path.join(output_dir, f"misprediction_{timestamp_str()}"))
-
-    print("=" * 60)
-    print("MISPREDICTION EXPERIMENT")
-    print("=" * 60)
-
-    for error_rate in error_rates:
-        print(f"\n--- Error Rate: {error_rate:.0%} ---")
-
-        for fw in frameworks:
-            print(f"  Running {fw}...")
-
-            metrics, runtime = run_single_experiment(
-                framework=fw,
-                num_dcs=num_dcs,
-                num_epochs=num_epochs,
-                error_rate=error_rate
-            )
-
-            result = ExperimentResult(
-                experiment_type="misprediction",
-                config_name=f"error_{error_rate:.2f}",
-                framework=fw,
-                parameters={
-                    "error_rate": error_rate,
-                    "num_dcs": num_dcs
-                },
-                metrics=metrics,
-                runtime_seconds=runtime
-            )
-            results.append(result)
-
-            print(f"    TTFT: {metrics.get('Average TTFT (s)', 'N/A')}")
-            print(f"    Carbon: {metrics.get('Total Carbon (g)', 'N/A')}")
-
-    # Save results
-    save_results(results, os.path.join(exp_dir, "results.json"))
-    save_results_csv(results, os.path.join(exp_dir, "results.csv"))
-
-    return results
-
-
-def run_distribution_experiment(
-        frameworks: List[str],
-        num_dcs: int = 12,
-        num_epochs: int = DEFAULT_EPOCHS,
-        trace_path: str = DEFAULT_TRACE,
-        output_dir: str = DEFAULT_OUTPUT_DIR
-) -> List[ExperimentResult]:
-    """
-    Run distribution experiments comparing even vs population-weighted.
-    """
-    results = []
-    exp_dir = ensure_dir(os.path.join(output_dir, f"distribution_{timestamp_str()}"))
-
-    print("=" * 60)
-    print("DISTRIBUTION EXPERIMENT")
-    print("=" * 60)
-
-    distributions = {
-        "even": {"apply_fn": apply_even_distribution, "weights": None},
-        "population": {"apply_fn": apply_population_distribution, "weights": POPULATION_WEIGHTS},
+    expected = {
+        0: {"Carbon_Intensity": 50.0, "name": "Carbon Best"},
+        1: {"Carbon_Intensity": 500.0, "name": "Water Best"},
+        2: {"Carbon_Intensity": 500.0, "name": "Cost Best"},
     }
 
-    for dist_name, dist_config in distributions.items():
-        print(f"\n--- Distribution: {dist_name} ---")
+    for _, row in df.iterrows():
+        dc_num = int(row["DC_Num"])
+        ci = float(row["Carbon_Intensity"])
+        ws = float(row["Water_Static"])
+        wcd = float(row["Water_Cycling_Density"])
 
-        # Create modified trace
-        dist_dir = ensure_dir(os.path.join(exp_dir, dist_name))
-        modified_trace = os.path.join(dist_dir, "trace.csv")
+        # Parse ToU prices
+        tou_str = str(row["Time_of_Use(24_Hours)"])
+        tou_prices = [float(x) for x in tou_str.split(";")]
+        avg_price = np.mean(tou_prices)
 
-        dist_config["apply_fn"](
-            trace_path,
-            num_dcs,
-            modified_trace,
-            **({"weights": dist_config["weights"]} if dist_name == "population" else {})
-        )
+        print(f"DC {dc_num} ({row['DC_Name']}):")
+        print(f"  Carbon Intensity: {ci} g/kWh")
+        print(f"  Water Static: {ws}")
+        print(f"  Water Cycling: {wcd}")
+        print(f"  Avg Energy Price: ${avg_price:.3f}/kWh")
+        print()
 
-        # Copy trace to expected location
-        shutil.copy(modified_trace, "simulator_ready_trace.csv")
+    # Verify expected characteristics
+    print("Expected Synthetic Environment:")
+    print("  DC 0: LOWEST carbon (50 g/kWh)")
+    print("  DC 1: LOWEST water (0.5 static, 0.01 cycling)")
+    print("  DC 2: LOWEST cost ($0.02/kWh)")
+    print()
 
-        for fw in frameworks:
-            print(f"  Running {fw}...")
+    # Check if values match
+    dc0 = df[df["DC_Num"] == 0].iloc[0]
+    dc1 = df[df["DC_Num"] == 1].iloc[0]
+    dc2 = df[df["DC_Num"] == 2].iloc[0]
 
-            metrics, runtime = run_single_experiment(
-                framework=fw,
-                num_dcs=num_dcs,
-                num_epochs=num_epochs,
-                trace_path=modified_trace
-            )
+    issues = []
 
-            result = ExperimentResult(
-                experiment_type="distribution",
-                config_name=dist_name,
-                framework=fw,
-                parameters={
-                    "distribution": dist_name,
-                    "num_dcs": num_dcs,
-                    "weights": dist_config["weights"] if dist_name == "population" else "even"
-                },
-                metrics=metrics,
-                runtime_seconds=runtime
-            )
-            results.append(result)
+    # DC 0 should have lowest carbon
+    if dc0["Carbon_Intensity"] >= dc1["Carbon_Intensity"]:
+        issues.append("DC 0 carbon NOT lower than DC 1!")
+    if dc0["Carbon_Intensity"] >= dc2["Carbon_Intensity"]:
+        issues.append("DC 0 carbon NOT lower than DC 2!")
 
-            print(f"    TTFT: {metrics.get('Average TTFT (s)', 'N/A')}")
-            print(f"    Carbon: {metrics.get('Total Carbon (g)', 'N/A')}")
+    # DC 1 should have lowest water
+    if dc1["Water_Static"] >= dc0["Water_Static"]:
+        issues.append("DC 1 water NOT lower than DC 0!")
+    if dc1["Water_Cycling_Density"] >= dc0["Water_Cycling_Density"]:
+        issues.append("DC 1 water cycling NOT lower than DC 0!")
 
-    # Save results
-    save_results(results, os.path.join(exp_dir, "results.json"))
-    save_results_csv(results, os.path.join(exp_dir, "results.csv"))
+    # DC 2 should have lowest price
+    tou0 = np.mean([float(x) for x in str(dc0["Time_of_Use(24_Hours)"]).split(";")])
+    tou1 = np.mean([float(x) for x in str(dc1["Time_of_Use(24_Hours)"]).split(";")])
+    tou2 = np.mean([float(x) for x in str(dc2["Time_of_Use(24_Hours)"]).split(";")])
 
-    return results
+    if tou2 >= tou0:
+        issues.append(f"DC 2 price (${tou2:.3f}) NOT lower than DC 0 (${tou0:.3f})!")
+    if tou2 >= tou1:
+        issues.append(f"DC 2 price (${tou2:.3f}) NOT lower than DC 1 (${tou1:.3f})!")
+
+    if issues:
+        print("⚠️  ISSUES FOUND:")
+        for issue in issues:
+            print(f"   - {issue}")
+        return False
+    else:
+        print("✓ DC specifications look correct for synthetic environment!")
+        return True
 
 
-# ==============================================================================
-# Results Saving
-# ==============================================================================
+def check_latency_matrix(latency_file=None):
+    """Verify latencies are equal (isolated variable)."""
+    print("\n" + "=" * 60)
+    print("STEP 3: Checking Latency Matrix")
+    print("=" * 60)
 
-def save_results(results: List[ExperimentResult], filepath: str):
-    """Save results to JSON."""
-    data = []
-    for r in results:
-        data.append({
-            "experiment_type": r.experiment_type,
-            "config_name": r.config_name,
-            "framework": r.framework,
-            "parameters": r.parameters,
-            "metrics": r.metrics,
-            "runtime_seconds": r.runtime_seconds
+    if latency_file is None:
+        latency_file = "Geo_Latencies_synthetic.csv"
+
+    path = os.path.join(SPEC_DIR, latency_file)
+    if not os.path.exists(path):
+        print(f"✗ Cannot find {latency_file}")
+        return False
+
+    df = pd.read_csv(path)
+
+    print(f"\nLatency matrix ({len(df)}x{len(df.columns) - 1}):\n")
+    print(df.to_string())
+    print()
+
+    # Check if all non-diagonal entries are equal
+    latencies = []
+    for i in range(len(df)):
+        for j in range(len(df)):
+            if i != j:
+                col = str(j)
+                if col in df.columns:
+                    latencies.append(float(df.iloc[i][col]))
+
+    unique_latencies = set(latencies)
+    if len(unique_latencies) == 1:
+        print(f"✓ All latencies are equal: {unique_latencies.pop()} ms")
+        return True
+    else:
+        print(f"⚠️  Latencies vary: {unique_latencies}")
+        print("   This may confuse the time_agent optimization!")
+        return False
+
+
+def test_simulator_routing():
+    """Test that routing to different DCs produces different metrics."""
+    print("\n" + "=" * 60)
+    print("STEP 4: Testing Simulator Routing")
+    print("=" * 60)
+
+    try:
+        from Rate_Flow_Sim import LLM_Simulator
+    except ImportError:
+        print("✗ Could not import LLM_Simulator")
+        print("  Make sure Rate_Flow_Sim.py is in the current directory")
+        return False
+
+    # Create simulator - use debug=False to avoid broken debug prints in Rate_Flow_Sim
+    print("\nInitializing LLM_Simulator...")
+    sim = LLM_Simulator(spec_dir=SPEC_DIR, epoch_length=3600, debug=False)
+
+    print(f"Loaded {len(sim.datacenters)} datacenters")
+
+    # Print DC characteristics from simulator
+    print("\nDC characteristics loaded by simulator:")
+    for dc_id, dc in sim.datacenters.items():
+        ci = getattr(dc, "carbon_intensity_g_per_kwh", "?")
+        ws = getattr(dc, "water_static", "?")
+        wcd = getattr(dc, "water_cycling_density", "?")
+        tou = getattr(dc, "tou_price", None)
+        avg_price = np.mean(tou) if tou is not None else "?"
+        print(f"  DC {dc_id}: carbon={ci} g/kWh, water_static={ws}, water_cycling={wcd}, avg_price=${avg_price}")
+
+    # Create LARGER test workload to see real differentiation
+    # Use 500 requests with realistic token counts
+    print("\nCreating larger test workload (500 requests)...")
+    np.random.seed(42)
+    test_rows = []
+    for i in range(500):
+        model = "Llama7b_FP16 (Base)_B1" if np.random.random() < 0.6 else "Llama70b_FP16 (Base)_B1"
+        tokens = int(np.random.exponential(500) + 100)
+        test_rows.append({
+            "source_dc": 0,
+            "model": model,
+            "arrival_ms": i * 7000,  # Spread over epoch
+            "tokens": tokens,
         })
+    test_workload = pd.DataFrame(test_rows)
+    total_tokens = test_workload["tokens"].sum()
+    print(f"  Total requests: {len(test_workload)}")
+    print(f"  Total tokens: {total_tokens:,}")
 
-    with open(filepath, "w") as f:
-        json.dump(data, f, indent=2)
+    results = {}
 
-    print(f"\n[SAVED] Results to {filepath}")
+    # CRITICAL: Only turn ON the target DC, turn OFF others
+    # This isolates the effect of routing decisions
+    for target_dc in range(min(3, len(sim.datacenters))):
+        print(f"\nRouting ALL traffic to DC {target_dc} (others OFF)...")
 
+        # Route everything to target DC
+        schedule = {"default_target_dc": target_dc}
 
-def save_results_csv(results: List[ExperimentResult], filepath: str):
-    """Save results to CSV for easy analysis."""
-    rows = []
-    for r in results:
-        row = {
-            "experiment_type": r.experiment_type,
-            "config_name": r.config_name,
-            "framework": r.framework,
-            "runtime_seconds": r.runtime_seconds,
-        }
-        # Flatten parameters
-        for k, v in r.parameters.items():
-            if isinstance(v, dict):
-                row[f"param_{k}"] = json.dumps(v)
+        # Power plan: ONLY target DC is ON, others are OFF
+        # This eliminates idle power from non-target DCs
+        power = {}
+        for dc_id in sim.datacenters.keys():
+            if dc_id == target_dc:
+                power[dc_id] = {"all": "ON"}
             else:
-                row[f"param_{k}"] = v
-        # Flatten metrics
-        for k, v in r.metrics.items():
-            row[f"metric_{k.replace(' ', '_').replace('(', '').replace(')', '')}"] = v
-        rows.append(row)
+                power[dc_id] = {"all": "OFF"}
 
-    df = pd.DataFrame(rows)
-    df.to_csv(filepath, index=False)
-    print(f"[SAVED] CSV to {filepath}")
+        # Reset simulator state
+        for dc_id, dc in sim.datacenters.items():
+            if hasattr(dc, 'reset_epoch'):
+                dc.reset_epoch()  # Reinitialize for clean state
 
+        metrics, details, usage = sim.run_epoch(0, test_workload, schedule, power)
 
-# ==============================================================================
-# CLI
-# ==============================================================================
+        results[target_dc] = {
+            "ttft": metrics.get("avg_ttft", 0),
+            "carbon": metrics.get("carbon_emissions", 0),
+            "water": metrics.get("water_usage", 0),
+            "cost": metrics.get("energy_cost", 0),
+            "energy": metrics.get("total_energy", 0),
+        }
+
+        print(f"  TTFT: {results[target_dc]['ttft']:.4f} s")
+        print(f"  Carbon: {results[target_dc]['carbon']:.2f} g")
+        print(f"  Water: {results[target_dc]['water']:.6f} m³")
+        print(f"  Cost: ${results[target_dc]['cost']:.4f}")
+        print(f"  Energy: {results[target_dc]['energy']:.2f} kWh")
+
+    # Analyze results
+    print("\n" + "-" * 40)
+    print("ROUTING ANALYSIS:")
+    print("-" * 40)
+
+    if len(results) >= 3:
+        # Find best DC for each metric
+        best_carbon_dc = min(results.keys(), key=lambda x: results[x]["carbon"])
+        best_water_dc = min(results.keys(), key=lambda x: results[x]["water"])
+        best_cost_dc = min(results.keys(), key=lambda x: results[x]["cost"])
+
+        print(f"\nBest DC for CARBON: DC {best_carbon_dc} ({results[best_carbon_dc]['carbon']:.2f} g)")
+        print(f"Best DC for WATER:  DC {best_water_dc} ({results[best_water_dc]['water']:.6f} m³)")
+        print(f"Best DC for COST:   DC {best_cost_dc} (${results[best_cost_dc]['cost']:.4f})")
+
+        # Check if metrics differ significantly
+        carbons = [r["carbon"] for r in results.values()]
+        waters = [r["water"] for r in results.values()]
+        costs = [r["cost"] for r in results.values()]
+
+        carbon_min, carbon_max = min(carbons), max(carbons)
+        water_min, water_max = min(waters), max(waters)
+        cost_min, cost_max = min(costs), max(costs)
+
+        carbon_diff = carbon_max / max(carbon_min, 0.001)
+        water_diff = water_max / max(water_min, 0.0001)
+        cost_diff = cost_max / max(cost_min, 0.001)
+
+        print(f"\nMetric variation ratios (higher = more differentiation):")
+        print(f"  Carbon: {carbon_diff:.2f}x  (range: {carbon_min:.0f} - {carbon_max:.0f} g)")
+        print(f"  Water:  {water_diff:.2f}x  (range: {water_min:.4f} - {water_max:.4f} m³)")
+        print(f"  Cost:   {cost_diff:.2f}x  (range: ${cost_min:.2f} - ${cost_max:.2f})")
+
+        # For synthetic env, we expect:
+        # - Carbon: 10x difference (50 vs 500 g/kWh)
+        # - Water: 10x difference (0.5+0.01 vs 5.0+0.1)
+        # - Cost: 5x difference ($0.02 vs $0.10)
+
+        expected_carbon_ratio = 10.0
+        expected_water_ratio = 10.0
+        expected_cost_ratio = 5.0
+
+        issues = []
+
+        if carbon_diff < expected_carbon_ratio * 0.5:
+            issues.append(f"Carbon ratio {carbon_diff:.1f}x is less than expected ~{expected_carbon_ratio}x")
+        if water_diff < expected_water_ratio * 0.5:
+            issues.append(f"Water ratio {water_diff:.1f}x is less than expected ~{expected_water_ratio}x")
+        if cost_diff < expected_cost_ratio * 0.5:
+            issues.append(f"Cost ratio {cost_diff:.1f}x is less than expected ~{expected_cost_ratio}x")
+
+        if best_carbon_dc != 0:
+            issues.append(f"Expected DC 0 best for carbon, got DC {best_carbon_dc}")
+        if best_water_dc != 1:
+            issues.append(f"Expected DC 1 best for water, got DC {best_water_dc}")
+        if best_cost_dc != 2:
+            issues.append(f"Expected DC 2 best for cost, got DC {best_cost_dc}")
+
+        if issues:
+            print("\n⚠️  ISSUES FOUND:")
+            for issue in issues:
+                print(f"   - {issue}")
+
+            # Additional debugging
+            print("\n[DEBUG] Checking if energy usage is the same across DCs...")
+            energies = [r["energy"] for r in results.values()]
+            if max(energies) - min(energies) < 0.01 * max(energies):
+                print("  Energy is nearly identical across all DCs.")
+                print("  This means the simulator computes carbon/water/cost")
+                print("  based on the same energy regardless of DC characteristics.")
+                print("\n  POSSIBLE CAUSES:")
+                print("  1. All DCs have the same node configurations")
+                print("  2. The synthetic CSV file names don't match what's being loaded")
+                print("  3. There's a bug in how DC metrics are computed")
+
+            return False
+        else:
+            print("\n✓ Synthetic environment produces expected metric differentiation!")
+            print(f"  Carbon agent should prefer DC 0 (lowest carbon)")
+            print(f"  Water agent should prefer DC 1 (lowest water)")
+            print(f"  Cost agent should prefer DC 2 (lowest cost)")
+            return True
+
+    return False
+
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Run experiments for LLM Simulator",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Run scalability experiment with default configs
-  python run_experiments.py --experiment scalability --frameworks Helix NSGA2
-
-  # Run misprediction experiment with custom error rates
-  python run_experiments.py --experiment misprediction --error-rates 0.0 0.1 0.2 0.3
-
-  # Run distribution experiment
-  python run_experiments.py --experiment distribution --frameworks Helix
-
-  # Run all experiments
-  python run_experiments.py --experiment all --frameworks Helix NSGA2 PerLLM Splitwise
-        """
-    )
-
-    parser.add_argument(
-        "--experiment",
-        type=str,
-        required=True,
-        choices=["scalability", "misprediction", "distribution", "all"],
-        help="Type of experiment to run"
-    )
-
-    parser.add_argument(
-        "--frameworks",
-        nargs="+",
-        default=DEFAULT_FRAMEWORKS,
-        help=f"Frameworks to test (default: {DEFAULT_FRAMEWORKS})"
-    )
-
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=DEFAULT_EPOCHS,
-        help=f"Number of epochs to run (default: {DEFAULT_EPOCHS})"
-    )
-
-    parser.add_argument(
-        "--num-dcs",
-        type=int,
-        default=12,
-        help="Number of datacenters for misprediction/distribution experiments (default: 12)"
-    )
-
-    parser.add_argument(
-        "--error-rates",
-        nargs="+",
-        type=float,
-        default=DEFAULT_ERROR_RATES,
-        help=f"Error rates for misprediction experiment (default: {DEFAULT_ERROR_RATES})"
-    )
-
-    parser.add_argument(
-        "--scalability-configs",
-        nargs="+",
-        default=list(SCALABILITY_CONFIGS.keys()),
-        choices=list(SCALABILITY_CONFIGS.keys()),
-        help=f"Scalability configurations to test (default: all)"
-    )
-
-    parser.add_argument(
-        "--trace",
-        type=str,
-        default=DEFAULT_TRACE,
-        help=f"Input trace file (default: {DEFAULT_TRACE})"
-    )
-
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default=DEFAULT_OUTPUT_DIR,
-        help=f"Output directory for results (default: {DEFAULT_OUTPUT_DIR})"
-    )
-
-    parser.add_argument(
-        "--spec-dir",
-        type=str,
-        default=DEFAULT_SPEC_DIR,
-        help=f"Spec directory (default: {DEFAULT_SPEC_DIR})"
-    )
-
-    args = parser.parse_args()
-
-    ensure_dir(args.output_dir)
-
-    all_results = []
-
-    if args.experiment in ["scalability", "all"]:
-        configs = {k: v for k, v in SCALABILITY_CONFIGS.items() if k in args.scalability_configs}
-        results = run_scalability_experiment(
-            frameworks=args.frameworks,
-            configs=configs,
-            num_epochs=args.epochs,
-            output_dir=args.output_dir
-        )
-        all_results.extend(results)
-
-    if args.experiment in ["misprediction", "all"]:
-        results = run_misprediction_experiment(
-            frameworks=args.frameworks,
-            error_rates=args.error_rates,
-            num_dcs=args.num_dcs,
-            num_epochs=args.epochs,
-            output_dir=args.output_dir
-        )
-        all_results.extend(results)
-
-    if args.experiment in ["distribution", "all"]:
-        results = run_distribution_experiment(
-            frameworks=args.frameworks,
-            num_dcs=args.num_dcs,
-            num_epochs=args.epochs,
-            trace_path=args.trace,
-            output_dir=args.output_dir
-        )
-        all_results.extend(results)
-
-    # Print summary
-    print("\n" + "=" * 60)
-    print("EXPERIMENT SUMMARY")
     print("=" * 60)
-    print(f"Total experiments run: {len(all_results)}")
+    print("SYNTHETIC ENVIRONMENT DIAGNOSTIC")
+    print("=" * 60)
+    print(f"Spec directory: {os.path.abspath(SPEC_DIR)}")
 
-    if all_results:
-        # Group by experiment type
-        by_type = {}
-        for r in all_results:
-            by_type.setdefault(r.experiment_type, []).append(r)
+    csv_ok, actual_dc_file, actual_latency_file = check_csv_files()
 
-        for exp_type, exp_results in by_type.items():
-            print(f"\n{exp_type.upper()}:")
-            for r in exp_results:
-                ttft = r.metrics.get("Average TTFT (s)", "N/A")
-                carbon = r.metrics.get("Total Carbon (g)", "N/A")
-                print(f"  {r.config_name}/{r.framework}: TTFT={ttft}, Carbon={carbon}")
+    results = {
+        "csv_files": csv_ok,
+        "dc_specs": check_dc_specs(actual_dc_file),
+        "latency": check_latency_matrix(actual_latency_file),
+        "simulator": test_simulator_routing(),
+    }
+
+    print("\n" + "=" * 60)
+    print("SUMMARY")
+    print("=" * 60)
+
+    all_pass = True
+    for name, passed in results.items():
+        status = "✓ PASS" if passed else "✗ FAIL"
+        print(f"  {name}: {status}")
+        all_pass = all_pass and passed
+
+    if all_pass:
+        print("\n✓ Synthetic environment is correctly configured!")
+        print("  You can proceed with MARL training.")
+    else:
+        print("\n✗ Issues found! Fix them before training.")
+        print("  The MARL agents will not learn properly with the current setup.")
+
+    return 0 if all_pass else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

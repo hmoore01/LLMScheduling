@@ -1233,6 +1233,69 @@ class ResourceEnv(ParallelEnv):
                 f"violations=[{violations_str}]"
             )
 
+            # ==================================================================
+            # 6f) INDIVIDUALIZED REWARD CALCULATION (Fix for Credit Assignment)
+            # ==================================================================
+
+            # 1. Aggregate Per-Agent Metrics from simulator results
+            agent_local_stats = {
+                i: {"carbon_g": 0.0, "water_m3": 0.0, "cost_usd": 0.0, "energy_kwh": 0.0}
+                for i in range(self.NUM_DATACENTERS)
+            }
+
+            # 'results' contains per-request details including target_dc
+            for r in results:
+                tgt = r.get("target_dc")
+                if tgt is not None and tgt >= 0:
+                    tgt = int(tgt)
+                    if tgt in agent_local_stats:
+                        agent_local_stats[tgt]["carbon_g"] += r.get("carbon_g", 0.0)
+                        agent_local_stats[tgt]["water_m3"] += r.get("water_m3", 0.0)
+                        agent_local_stats[tgt]["cost_usd"] += r.get("cost_usd", 0.0)
+                        agent_local_stats[tgt]["energy_kwh"] += r.get("energy_kwh", 0.0)
+
+            # 2. Calculate Final Reward per Agent
+            # Mix Global Reward (Performance) with Local Penalty (Efficiency)
+            ALPHA_LOCAL = 2.0
+            rewards = {}
+
+            for agent in self.agents:
+                dc_id = int(agent.split("_")[1])
+                stats = agent_local_stats.get(dc_id, {})
+
+                # Calculate local penalty specific to this agent's profile weights
+                local_penalty_score = 0.0
+
+                # Normalize local raw metrics roughly to [0,1] magnitude to match base_rw scale
+                if "carbon" in self.reward_weights:
+                    # 1000g reference
+                    local_penalty_score += (stats["carbon_g"] / 1000.0) * self.reward_weights["carbon"]
+
+                if "water" in self.reward_weights:
+                    # 0.1 m3 reference (100L)
+                    local_penalty_score += (stats["water_m3"] / 100.0) * self.reward_weights["water"]
+
+                if "cost" in self.reward_weights:
+                    # $1.0 reference
+                    local_penalty_score += (stats["cost_usd"] / 10) * self.reward_weights["cost"]
+
+                if "total_energy" in self.reward_weights:
+                    # 10 kWh reference
+                    local_penalty_score += (stats["energy_kwh"] / 100.0) * self.reward_weights["total_energy"]
+
+                # Combine: Global Base - Local Penalty
+                raw_agent_reward = base_rw - (ALPHA_LOCAL * local_penalty_score)
+
+                # Subtract Global Constraint Penalty (applies to everyone)
+                raw_agent_reward -= effective_penalty_weight * total_penalty
+
+                # Scale and Clip
+                rewards[agent] = self._scale_reward(raw_agent_reward)
+
+            # Store violations for external access
+            self._constraint_violations = constraint_violations
+
+
         # ------------------------------------------------------------------
         # 7) Build outputs for all agents (single-step episode)
         # ------------------------------------------------------------------
@@ -1288,16 +1351,12 @@ class ResourceEnv(ParallelEnv):
             last_ttft = last_carbon = last_water = last_cost = 0.0
             last_total_energy = last_network_load = 0.0
         else:
-            last_ttft = float(
-                self._last_metrics.get("avg_ttft_sec", self._last_metrics.get("avg_ttft", 0.0))
-            )
-            last_carbon = float(self._last_metrics.get("carbon_emissions", 0.0))
-            last_water = float(self._last_metrics.get("water_usage", 0.0))
-            last_cost = float(self._last_metrics.get("energy_cost", 0.0))
-            last_total_energy = float(
-                self._last_metrics.get("total_energy", self._last_metrics.get("energy_kwh", 0.0))
-            )
-            last_network_load = float(self._last_metrics.get("avg_net_latency_ms", 0.0))
+            last_ttft = float(self._last_metrics.get("avg_ttft_sec", 0.0)) / 10.0
+            last_carbon = float(self._last_metrics.get("carbon_emissions", 0.0)) / 1000.0  # ~kg
+            last_water = float(self._last_metrics.get("water_usage", 0.0)) / 100.0  # ~100L
+            last_cost = float(self._last_metrics.get("energy_cost", 0.0)) / 100.0  # ~$100
+            last_total_energy = float(self._last_metrics.get("total_energy", 0.0)) / 1000.0
+            last_network_load = float(self._last_metrics.get("avg_net_latency_ms", 0.0)) / 100.0
 
         last_features = np.array(
             [
@@ -1322,13 +1381,17 @@ class ResourceEnv(ParallelEnv):
             agent_one_hot = np.zeros(self.NUM_DATACENTERS, dtype=np.float32)
             agent_one_hot[dc_idx] = 1.0
 
+            ci_norm = float(self._dc_carbon[dc_idx]) / 1000.0
+
+            # Water Intensity: 0 to ~10 L/kWh
+            water_norm = float(self._dc_water[dc_idx]) / 100.0
+
+            # Energy Price: 0 to ~1.0 $/kWh
+            price_norm = float(self._dc_price[dc_idx]) * 2.0
+
             # Per-DC profile features (carbon / water / price for THIS DC)
             dc_profile = np.array(
-                [
-                    float(self._dc_carbon[dc_idx]),
-                    float(self._dc_water[dc_idx]),
-                    float(self._dc_price[dc_idx]),
-                ],
+                [ci_norm, water_norm, price_norm],
                 dtype=np.float32,
             )
 
@@ -1738,7 +1801,7 @@ def run_multiagent(
 
     # Always use 12 DCs for MARL to match trained model observation space
     # Use active_dcs to mask which ones are actually enabled
-    MARL_FIXED_NUM_DC = 12
+    MARL_FIXED_NUM_DC = 3
     num_dc = MARL_FIXED_NUM_DC
 
     # Determine which DCs are active based on logical_num_dc
@@ -1924,7 +1987,7 @@ def milp_optimizer(
         else:
             spec_dir = "sim_specs"
 
-        dc_specs_path = os.path.join(spec_dir, "Datacenter_specs.csv")
+        dc_specs_path = os.path.join(spec_dir, "Datacenter_specs_synthetic.csv")
         num_dc = epoch_summary.get("num_datacenters", len(epoch_summary.get("datacenters", range(12))))
 
         if os.path.exists(dc_specs_path):
@@ -2697,7 +2760,7 @@ def train_all_schemes_parallel(
 def train_with_multi_epoch_parallel(
         *,
         trace_path: str = None,
-        num_datacenters: int = 12,
+        num_datacenters: int = 3,
         agent_specs: Dict[str, Dict[str, Any]] = None,
         node_properties: Dict[str, Any] = None,
         total_timesteps: int = 100_000,
@@ -2756,7 +2819,7 @@ def train_with_multi_epoch_parallel(
     print(f"[MARL PARALLEL] Using {len(training_epochs)} epochs")
 
     # Load DC specs
-    dc_specs_path = os.path.join(spec_dir, "Datacenter_specs.csv")
+    dc_specs_path = os.path.join(spec_dir, "Datacenter_specs_synthetic.csv")
     if os.path.exists(dc_specs_path):
         dc_df = pd.read_csv(dc_specs_path)
         if "DC_Num" in dc_df.columns:
@@ -2977,7 +3040,7 @@ class RewardPlotCallback(BaseCallback):
 def train_with_multi_epoch(
         *,
         trace_path: str = None,
-        num_datacenters: int = 12,
+        num_datacenters: int = 3,
         agent_specs: Dict[str, Dict[str, Any]] = None,
         node_properties: Dict[str, Any] = None,
         total_timesteps: int = 100_000,
@@ -3090,7 +3153,7 @@ def train_with_multi_epoch(
     print(f"[MARL TRAIN] Using {len(training_epochs)} epochs for training: {training_epochs[:5]}...")
 
     # Load carbon intensity from specs
-    dc_specs_path = os.path.join(spec_dir, "Datacenter_specs.csv")
+    dc_specs_path = os.path.join(spec_dir, "Datacenter_specs_synthetic.csv")
     if os.path.exists(dc_specs_path):
         dc_df = pd.read_csv(dc_specs_path)
         if "DC_Num" in dc_df.columns:

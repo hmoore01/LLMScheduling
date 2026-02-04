@@ -14,6 +14,75 @@ import pandas as pd
 import hashlib
 from typing import Dict, Any, List, Optional, Callable, Union, Literal
 
+# --- ADD THESE IMPORTS FOR CONDOR ---
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
+# --- CONDOR IMPORTS END ---
+
+# --- CONDOR: World Model (Neural Network) ---
+class DatacenterSurrogate(nn.Module):
+    """
+    Approximates the physics engine.
+    Input: [req_7b, req_70b, logit_7b, logit_70b, power_scalar]
+    Output: [predicted_latency, predicted_carbon]
+    """
+
+    def __init__(self):
+        super(DatacenterSurrogate, self).__init__()
+        self.net = nn.Sequential(
+            nn.Linear(5, 64),
+            nn.ReLU(),
+            nn.Linear(64, 64),
+            nn.ReLU(),
+            nn.Linear(64, 2)  # Latency, Carbon
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+# --- CONDOR: MPC Agent ---
+class CondorMPCAgent:
+    def __init__(self, surrogate_model):
+        self.model = surrogate_model
+        self.model.eval()
+
+    def select_action(self, req_7b, req_70b, num_candidates=1000, alpha=0.5):
+        """
+        Simulates 1000 random actions using the World Model and picks the best one.
+        alpha: Weight for Carbon (0.0=Only Latency, 1.0=Only Carbon)
+        """
+        # 1. Random Shooting: Generate random candidate actions
+        # Logits: -5 to 5, Power: 0.1 to 1.0
+        c_logits = np.random.uniform(-5, 5, (num_candidates, 2))
+        c_power = np.random.uniform(0.1, 1.0, (num_candidates, 1))
+        actions = np.hstack([c_logits, c_power])
+
+        # 2. Prepare Inputs: [Workload + Action]
+        w_tensor = np.array([[req_7b, req_70b]] * num_candidates)
+        inputs = np.hstack([w_tensor, actions])
+        inputs_t = torch.FloatTensor(inputs)
+
+        # 3. Predict Cost
+        with torch.no_grad():
+            preds = self.model(inputs_t).numpy()  # [Latency, Carbon]
+
+        # Cost = alpha * Carbon + (1-alpha) * Latency
+        costs = (alpha * preds[:, 1]) + ((1 - alpha) * preds[:, 0])
+
+        # 4. Pick Best
+        best_idx = np.argmin(costs)
+        best_act = actions[best_idx]
+
+        return {
+            "logit_7b": best_act[0],
+            "logit_70b": best_act[1],
+            "power_scalar": best_act[2]
+        }
+
+
 
 def train_marl_constrained_profiles(
         epoch_data: pd.DataFrame,
@@ -59,7 +128,7 @@ def train_marl_constrained_profiles(
     # --- [NEW] Load Real Carbon Intensity from Specs ---
     # We need the agents to know the REAL carbon values, not the 1.0 fallback.
     import os
-    dc_specs_path = os.path.join(spec_dir, "Datacenter_specs.csv")
+    dc_specs_path = os.path.join(spec_dir, "Datacenter_specs_synthetic.csv")
     if os.path.exists(dc_specs_path):
         dc_df = pd.read_csv(dc_specs_path)
         # Sort by DC_Num to ensure alignment
@@ -89,14 +158,302 @@ def train_marl_constrained_profiles(
     # 4) Delegate to the multi-agent trainer
     MultiAgentRL.train_with_multi_epoch(
         trace_path="simulator_ready_trace.csv",
-        num_datacenters=12,
-        agent_specs=build_agent_specs(12),
+        num_datacenters=3,
+        agent_specs=build_agent_specs(3),
         node_properties=node_properties,
-        total_timesteps=2_000_000,
+        total_timesteps=250_000,
         sampling_strategy="stratified",  # or "uniform", "curriculum"
         use_domain_randomization=True,
     )
     print("[MARL TRAIN] Finished training all selected MARL profiles.")
+
+
+def train_condor_profile(epoch_data: pd.DataFrame, node_properties: List[Dict]):
+    """
+    Runs the Model-Based RL (CONDOR) training loop.
+    Corrected to handle column naming mismatches (source_dc_id -> source_dc).
+    """
+    print("\n=== Starting CONDOR Model-Based Training ===")
+
+    # 1. Setup Simulator
+    from Rate_Flow_Sim import LLM_Simulator
+
+    # Check if spec_dir is provided
+    spec_dir = "sim_specs"
+    if isinstance(node_properties, dict) and "spec_dir" in node_properties:
+        spec_dir = node_properties["spec_dir"]
+
+    print(f"[CONDOR] Initializing simulator from {spec_dir}...")
+    sim = LLM_Simulator(
+        spec_dir=spec_dir,
+        epoch_length=900,
+        debug=False
+    )
+
+    # 2. Setup Surrogate Model & Optimizer
+    surrogate = DatacenterSurrogate()
+    optimizer = optim.Adam(surrogate.parameters(), lr=0.001)
+    criterion = nn.MSELoss()
+
+    # 3. Prepare Data
+    if "epoch" in epoch_data.columns:
+        grouped = epoch_data.groupby("epoch")
+    elif "epoch_id" in epoch_data.columns:
+        grouped = epoch_data.groupby("epoch_id")
+    else:
+        grouped = [("batch_1", epoch_data)]
+
+    print(f"[CONDOR] Training on {len(grouped)} epochs...")
+
+    data_inputs = []
+    data_targets = []
+
+    # Loop over epochs
+    for i, (epoch_id, df_original) in enumerate(grouped):
+
+        # --- FIX: SANITIZE DATAFRAME COLUMNS ---
+        # Rate_Flow_Sim expects: 'source_dc', 'model', 'tokens'
+        # We create a copy to avoid SettingWithCopy warnings
+        df_epoch = df_original.copy()
+
+        # 1. Map Source DC
+        if "source_dc" not in df_epoch.columns and "src_dc" not in df_epoch.columns:
+            if "source_dc_id" in df_epoch.columns:
+                df_epoch["source_dc"] = df_epoch["source_dc_id"]
+            else:
+                df_epoch["source_dc"] = 0  # Fallback
+
+        # 2. Map Model
+        if "model" not in df_epoch.columns:
+            if "model_type" in df_epoch.columns:
+                df_epoch["model"] = df_epoch["model_type"]
+            else:
+                df_epoch["model"] = "Llama7b"  # Fallback
+
+        # 3. Map Tokens
+        if "tokens" not in df_epoch.columns:
+            if "num_tokens" in df_epoch.columns:
+                df_epoch["tokens"] = df_epoch["num_tokens"]
+            elif "total_tokens" in df_epoch.columns:
+                df_epoch["tokens"] = df_epoch["total_tokens"]
+            else:
+                df_epoch["tokens"] = 100  # Fallback
+
+        # --- A. Analyze Workload State ---
+        duration = 900.0
+        total_tokens = df_epoch["tokens"].sum()
+
+        # Separate 7b vs 70b load for the Neural Net Input
+        is_7b = df_epoch["model"].astype(str).str.contains("7b", case=False)
+        req_7b = df_epoch[is_7b]["tokens"].sum() / duration
+        req_70b = df_epoch[~is_7b]["tokens"].sum() / duration
+
+        # --- B. Agent Action (MPC or Random) ---
+        if i < 50:
+            action_dict = {
+                "logit_7b": np.random.uniform(-5, 5),
+                "logit_70b": np.random.uniform(-5, 5),
+                "power_scalar": np.random.uniform(0.1, 1.0)
+            }
+        else:
+            agent = CondorMPCAgent(surrogate)
+            action_dict = agent.select_action(req_7b, req_70b, alpha=0.5)
+
+        # --- C. Convert Action -> Simulator Plans ---
+        # 1. Power Plan
+        power_threshold = int(action_dict["power_scalar"] * 7)  # 0 to 7
+        unit_status = {}
+        for type_id in range(7):
+            unit_status[type_id] = "ON" if type_id <= power_threshold else "OFF"
+
+        power_plan = {
+            dc_id: {"unit": unit_status}
+            for dc_id in sim.datacenters.keys()
+        }
+
+        # 2. Schedule Plan (Fractional/Probabilistic Routing)
+        dcs = sorted(sim.datacenters.keys())
+        num_dcs = len(dcs)
+        plan_map = {}
+
+        # Reset index to ensure it aligns with row_idx in enumeration
+        df_epoch = df_epoch.reset_index(drop=True)
+
+        for row_idx, row in df_epoch.iterrows():
+            model_name = str(row.get("model", ""))
+            logit = action_dict["logit_7b"] if "7b" in model_name else action_dict["logit_70b"]
+
+            # Simple probabilistic routing logic based on logit
+            # High logit -> Concentrate on DC 0
+            # Low logit -> Spread Round Robin
+            if np.random.uniform(-5, 5) < logit:
+                target = dcs[0]
+            else:
+                target = dcs[row_idx % num_dcs]
+
+            plan_map[row_idx] = target
+
+        schedule_plan = {"map": plan_map}
+
+        # --- D. Run Simulation Step ---
+        metrics, _, _ = sim.run_epoch(i, df_epoch, schedule_plan, power_plan)
+
+        # Extract Results
+        latency = metrics.get("avg_ttft", 0.0)
+        carbon = metrics.get("carbon_emissions", 0.0)
+
+        # --- E. Train Surrogate Model ---
+        # Input: [Workload, Action] -> Target: [Latency, Carbon]
+        inp = [req_7b, req_70b, action_dict["logit_7b"], action_dict["logit_70b"], action_dict["power_scalar"]]
+        tgt = [latency, carbon]
+
+        data_inputs.append(inp)
+        data_targets.append(tgt)
+
+        # Train every 10 steps
+        if len(data_inputs) > 20 and i % 10 == 0:
+            # Train on recent history window
+            recent_inputs = torch.FloatTensor(data_inputs[-200:])
+            recent_targets = torch.FloatTensor(data_targets[-200:])
+
+            t_mean = recent_targets.mean(dim=0)
+            t_std = recent_targets.std(dim=0) + 1e-6
+            norm_targets = (recent_targets - t_mean) / t_std
+
+            surrogate.train()
+            for _ in range(5):
+                optimizer.zero_grad()
+                preds = surrogate(recent_inputs)
+                loss = criterion(preds, norm_targets)
+                loss.backward()
+                optimizer.step()
+
+        if i % 10 == 0:
+            print(
+                f"  [Epoch {i}] Act={action_dict['power_scalar']:.2f} | Latency={latency:.3f}s | Carbon={carbon:.1f}g")
+
+    print(f"=== CONDOR Training Complete ===")
+
+    # Save Model
+    if not os.path.exists("models"):
+        os.makedirs("models")
+    torch.save(surrogate.state_dict(), "models/condor_physics_model.pth")
+    print("Saved surrogate model to models/condor_physics_model.pth")
+
+
+# --- GLOBAL CACHE (to avoid reloading weights every epoch) ---
+_CONDOR_MODEL_CACHE = None
+
+
+def get_cached_condor_model(model_path="models/condor_physics_model.pth"):
+    global _CONDOR_MODEL_CACHE
+    if _CONDOR_MODEL_CACHE is None:
+        if not os.path.exists(model_path):
+            # Fallback to init a blank one if training hasn't run (prevents crash)
+            print(f"[CONDOR] WARNING: {model_path} not found. Using random weights.")
+            _CONDOR_MODEL_CACHE = DatacenterSurrogate()
+        else:
+            surrogate = DatacenterSurrogate()
+            surrogate.load_state_dict(torch.load(model_path))
+            surrogate.eval()
+            _CONDOR_MODEL_CACHE = surrogate
+            print(f"[CONDOR] Loaded weights from {model_path}")
+    return _CONDOR_MODEL_CACHE
+
+
+def condor_optimizer(
+        epoch_data,
+        epoch_idx: int,
+        node_properties: Dict[str, Any],
+        epoch_summary: Dict[str, Any]
+):
+    """
+    Standard 'Framework' entry point for CONDOR.
+    Matches the signature of 'milp_optimizer' so it fits the main inference loop.
+    """
+    # 1. Prepare Data
+    if isinstance(epoch_data, pd.DataFrame):
+        df_epoch = epoch_data.copy()
+    else:
+        df_epoch = pd.DataFrame(epoch_data).copy()
+
+    # Data Sanitization (Columns)
+    if "source_dc" not in df_epoch.columns and "src_dc" not in df_epoch.columns:
+        if "source_dc_id" in df_epoch.columns:
+            df_epoch["source_dc"] = df_epoch["source_dc_id"]
+        else:
+            df_epoch["source_dc"] = 0
+    if "model" not in df_epoch.columns:
+        df_epoch["model"] = df_epoch.get("model_type", "Llama7b")
+    if "tokens" not in df_epoch.columns:
+        df_epoch["tokens"] = df_epoch.get("num_tokens", df_epoch.get("total_tokens", 100))
+
+    # 2. Setup Simulator (Lightweight Init)
+    from Rate_Flow_Sim import LLM_Simulator
+    spec_dir = "sim_specs"
+    if isinstance(node_properties, dict) and "spec_dir" in node_properties:
+        spec_dir = node_properties["spec_dir"]
+
+    # We init simulator for just this epoch (fast)
+    sim = LLM_Simulator(spec_dir=spec_dir, epoch_length=900, debug=False)
+
+    # 3. Get Agent Action (Inference)
+    surrogate = get_cached_condor_model()
+    agent = CondorMPCAgent(surrogate)
+
+    # Calculate Workload State
+    duration = 900.0
+    is_7b = df_epoch["model"].astype(str).str.contains("7b", case=False)
+    req_7b = df_epoch[is_7b]["tokens"].sum() / duration
+    req_70b = df_epoch[~is_7b]["tokens"].sum() / duration
+
+    # MPC Planning
+    action_dict = agent.select_action(req_7b, req_70b, alpha=0.5)
+
+    # 4. Convert Action to Plans (Power & Schedule)
+    # Power Plan
+    power_threshold = int(action_dict["power_scalar"] * 7)
+    unit_status = {}
+    for type_id in range(7):
+        unit_status[type_id] = "ON" if type_id <= power_threshold else "OFF"
+    power_plan = {dc_id: {"unit": unit_status} for dc_id in sim.datacenters.keys()}
+
+    # Schedule Plan
+    dcs = sorted(sim.datacenters.keys())
+    num_dcs = len(dcs)
+    plan_map = {}
+    df_epoch = df_epoch.reset_index(drop=True)
+
+    for row_idx, row in df_epoch.iterrows():
+        model_name = str(row.get("model", ""))
+        logit = action_dict["logit_7b"] if "7b" in model_name else action_dict["logit_70b"]
+
+        if np.random.uniform(-5, 5) < logit:
+            target = dcs[0]
+        else:
+            target = dcs[row_idx % num_dcs]
+        plan_map[row_idx] = target
+
+    schedule_plan = {"map": plan_map}
+
+    # 5. Run Simulator
+    metrics, _, _ = sim.run_epoch(epoch_idx, df_epoch, schedule_plan, power_plan)
+
+    # 6. Format Output to Match Comparison Works
+    # They expect: stats_dict, profile_metrics_dict, leftovers_dict
+    stats = {
+        "avg_ttft": float(metrics.get("avg_ttft", 0.0)),
+        "avg_ttft_sec": float(metrics.get("avg_ttft", 0.0)),
+        "carbon_emissions": float(metrics.get("carbon_emissions", 0.0)),
+        "water_usage": float(metrics.get("water_usage", 0.0)),
+        "energy_cost": float(metrics.get("energy_cost", 0.0)),
+        "total_energy": float(metrics.get("total_energy", 0.0)),
+    }
+
+    # Wrap in profile dict
+    profile_metrics = {"condor": stats}
+
+    return stats, profile_metrics, {}
 
 
 def write_epoch_stats(tag: str, epoch_index: int, stats_dict: dict, tag2: Optional[str] = None) -> None:
@@ -392,7 +749,7 @@ if __name__ == "__main__":
     parser.add_argument('-d', '--duration', type=int, default=22)
     parser.add_argument('-r', '--request', type=int, default=1)
     parser.add_argument('-f', '--framework', type=str, default='Helix',
-                        choices=['Helix', 'NSGA2', 'PerLLM', 'Splitwise', 'Hybrid', 'MARL'])
+                        choices=['Helix', 'NSGA2', 'PerLLM', 'Splitwise', 'Hybrid', 'MARL', 'QLearning', 'ddqn', 'actorcritic', 'condor'])
 
     # Scaling
     parser.add_argument('--freq-scale', type=float, default=1.0)
@@ -401,7 +758,7 @@ if __name__ == "__main__":
     parser.add_argument('--error-rate', type=float, default=0.0)
 
     # Optional: override # of DCs used for default distribution when src DC is missing
-    parser.add_argument('--num-dcs', type=int, default=12)
+    parser.add_argument('--num-dcs', type=int, default=3)
     parser.add_argument(
         '--train-marl',
         action='store_true',
@@ -465,6 +822,12 @@ if __name__ == "__main__":
         default=None,
         help='JSON string of node type counts per type (e.g., \'{"0":167,"1":167,...}\')'
     )
+
+    parser.add_argument('--ql-theta', type=float, default=0.87,
+                        help='Weight factor: theta * N_active + (1-theta) * N_migrated')
+    parser.add_argument('--ql-alpha', type=float, default=0.1, help='Learning rate for Q-Learning')
+    parser.add_argument('--ql-gamma', type=float, default=0.9, help='Discount factor for future rewards')
+    parser.add_argument('--ql-epsilon', type=float, default=0.1, help='Exploration rate for epsilon-greedy')
 
     args = parser.parse_args()
 
@@ -906,23 +1269,39 @@ if __name__ == "__main__":
         # Use the first training epoch as the "representative" idx
         # for summary / perturbation purposes; the env will override
         # self.epoch_idx per episode during reset().
-        train_epoch_idx = int(train_epochs[0])
 
-        train_marl_constrained_profiles(
-            epoch_data=epoch_data,
-            epoch_idx=train_epoch_idx,
-            num_datacenters=args.num_dcs,
-            node_properties=node_properties,
-            total_timesteps=args.marl_timesteps,
-            num_envs=args.marl_num_envs,
-            overwrite_existing=args.marl_overwrite,
-            model_dir="trained_models/sb3_agents",
-            spec_dir="sim_specs",
-            epoch_length=900,
-        )
+        CONDOR_FLAG = True
 
-        print("[MARL TRAIN] Completed training; exiting without running evaluation.")
-        exit(0)
+        if CONDOR_FLAG:
+            print("[CONDOR] Switching execution to Model-Based RL training loop...")
+
+            # Ensure the train_condor_profile function is defined earlier in the file!
+            train_condor_profile(
+                epoch_data=epoch_data,
+                node_properties=node_properties
+            )
+
+            print("[CONDOR] Completed training; exiting without running evaluation.")
+            exit(0)
+
+        else:
+            train_epoch_idx = int(train_epochs[0])
+
+            train_marl_constrained_profiles(
+                epoch_data=epoch_data,
+                epoch_idx=train_epoch_idx,
+                num_datacenters=args.num_dcs,
+                node_properties=node_properties,
+                total_timesteps=args.marl_timesteps,
+                num_envs=args.marl_num_envs,
+                overwrite_existing=args.marl_overwrite,
+                model_dir="trained_models/sb3_agents",
+                spec_dir="sim_specs",
+                epoch_length=900,
+            )
+
+            print("[MARL TRAIN] Completed training; exiting without running evaluation.")
+            exit(0)
 
 
     # ---------- Framework Import ----------
@@ -946,6 +1325,24 @@ if __name__ == "__main__":
         elif fw == 'marl':
             import MultiAgentRL;
             return MultiAgentRL
+        elif fw == 'qlearning':
+            import QLearning;
+            return QLearning
+        elif fw == 'ddqn':
+            import DDQN_Consolidator
+            return DDQN_Consolidator
+        elif fw == 'actorcritic':
+            import ActorCritic_Consolidator
+            return ActorCritic_Consolidator
+        elif fw == 'condor':
+            # Wraps the local condor_optimizer function to match the standard interface
+            class CondorFramework:
+                @staticmethod
+                def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
+                    # Calls the condor_optimizer function you added earlier
+                    return condor_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary)
+
+            return CondorFramework
         else:
             raise ValueError(f"Framework '{framework}' not found")
 
@@ -999,6 +1396,12 @@ if __name__ == "__main__":
                 # Input/output fraction for Splitwise phase splitting
                 "in_frac": 0.7,
                 "out_frac": 0.3,
+                "ql_params": {
+                    "theta": args.ql_theta,
+                    "alpha": args.ql_alpha,
+                    "gamma": args.ql_gamma,
+                    "epsilon": args.ql_epsilon
+                }
             }
         )
 
