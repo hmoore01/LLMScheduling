@@ -749,7 +749,7 @@ if __name__ == "__main__":
     parser.add_argument('-d', '--duration', type=int, default=22)
     parser.add_argument('-r', '--request', type=int, default=1)
     parser.add_argument('-f', '--framework', type=str, default='Helix',
-                        choices=['Helix', 'NSGA2', 'PerLLM', 'Splitwise', 'Hybrid', 'MARL', 'QLearning', 'ddqn', 'actorcritic', 'condor'])
+                        choices=['Helix', 'NSGA2', 'PerLLM', 'Splitwise', 'Hybrid', 'MARL', 'QLearning', 'ddqn', 'actorcritic', 'condor', 'lahyper'])
 
     # Scaling
     parser.add_argument('--freq-scale', type=float, default=1.0)
@@ -1303,6 +1303,13 @@ if __name__ == "__main__":
             print("[MARL TRAIN] Completed training; exiting without running evaluation.")
             exit(0)
 
+    SCHEMES_TO_RUN = [
+        "time_agent", "carbon_agent", "water_agent", "cost_agent",
+        "green_perf", "cost_guard", "water_saver", "peak_power_guard"
+    ]
+
+    # Global results container
+    global_results_comparison = {}
 
     # ---------- Framework Import ----------
     def get_framework(framework):
@@ -1334,6 +1341,9 @@ if __name__ == "__main__":
         elif fw == 'actorcritic':
             import ActorCritic_Consolidator
             return ActorCritic_Consolidator
+        elif fw == 'lahyper':
+            import LA_Hyper_DDQN
+            return LA_Hyper_DDQN
         elif fw == 'condor':
             # Wraps the local condor_optimizer function to match the standard interface
             class CondorFramework:
