@@ -1479,6 +1479,10 @@ if __name__ == "__main__":
     print(f"Energy ($): {cumulative_energy:.3f}")
     print(f"Total Energy (kWh): {cumulative_total_energy:.3f}")
 
+    if framework.lower() == "lahyper":
+        if hasattr(FW, "get_final_report"):
+            print(FW.get_final_report())
+
     out = f"LLM_Results/{framework}_final.txt"
     with open(out, "w") as f:
         f.write("=== Final Results ===\n")

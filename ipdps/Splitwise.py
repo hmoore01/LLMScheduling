@@ -14,8 +14,8 @@ DEFAULT_EPOCH_LEN = 900
 W_TOKEN = 1.5
 W_LAT = 0.001
 
-# Fixed Variant: Full Model (FP16), Reasonable Batch Size (32)
-FIXED_VARIANT = "_FP16 (Base)_B16"
+# [FIX 1] Disable the suffix so model names match the trace (e.g., "Llama7b_Chat")
+FIXED_VARIANT = ""
 
 def _prepare_epoch_df(epoch_data: Any) -> pd.DataFrame:
     if isinstance(epoch_data, pd.DataFrame):
@@ -82,7 +82,8 @@ def _build_power_plan_from_share(routed_token_share_by_dc: Dict[int, float]) -> 
     power_plan: Dict[int, Dict[str, Any]] = {}
     for dc, share in routed_token_share_by_dc.items():
         if share > 0.0:
-            power_plan[int(dc)] = {"all": "IDLE"}
+            # [FIX 2] Active Data Centers must be "ON", not "IDLE"
+            power_plan[int(dc)] = {"all": "ON"}
         else:
             power_plan[int(dc)] = {"all": "OFF"}
     return power_plan
@@ -143,7 +144,8 @@ class Splitwise:
 
             tgt_dc = int(best_dc if best_dc is not None else row.source_dc)
 
-            # --- FIXED VARIANT SELECTION (Removed 4-bit logic) ---
+            # --- FIXED VARIANT SELECTION ---
+            # [FIX 1 Redux] Use row.model directly without appending garbage string
             full_model = f"{row.model}{FIXED_VARIANT}"
 
             req_rows.append({
