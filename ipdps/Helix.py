@@ -351,6 +351,9 @@ class Helix:
         requests_df = pd.DataFrame(req_rows)
         schedule_plan = {"map": plan_map}
 
+        print(schedule_plan)
+        print(power_plan)
+
         # 6) Run Simulator
         metrics, details, leftovers = sim.run_epoch(
             epoch_idx, requests_df, schedule_plan, power_plan
