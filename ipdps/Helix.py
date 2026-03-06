@@ -80,6 +80,8 @@ def _normalize_sim_output(
         "water_usage": float(metrics.get("water_usage", 0.0)),
         "energy_cost": float(metrics.get("energy_cost", 0.0)),
         "processed_tokens": float(metrics.get("processed_tokens", 0.0)),
+        "requests_completed": float(metrics.get("requests_completed", 0.0)),
+        "requests_dropped": float(metrics.get("requests_dropped", 0.0)),
     }
 
     if not isinstance(details, list):
@@ -195,7 +197,7 @@ def _capacity_per_dc_from_sim(sim: LLM_Simulator) -> Dict[int, float]:
 def _build_power_plan(
     routed_token_share_by_dc: Dict[int, float],
     epoch_summary: Any,
-) -> Dict[int, Dict[int, str]]:
+) -> Dict[int, Dict[str, Dict[int, str]]]:
     if isinstance(epoch_summary, dict):
         node_types = list(epoch_summary.get("node_types", DEFAULT_NODE_TYPES))
         min_idle = int(epoch_summary.get("min_idle_types", 1))
@@ -212,7 +214,7 @@ def _build_power_plan(
         for dc in routed_token_share_by_dc
     }
 
-    power_plan: Dict[int, Dict[int, str]] = {}
+    power_plan: Dict[int, Dict[str, Dict[int, str]]] = {}
     for dc, share in shares.items():
         idle_types = max(
             min_idle,
@@ -223,10 +225,10 @@ def _build_power_plan(
         dc_power: Dict[int, str] = {}
         for idx, nt in enumerate(node_types):
             if idx < idle_types:
-                dc_power[nt] = "Idle"
+                dc_power[nt] = "IDLE"
             else:
-                dc_power[nt] = "Off"
-        power_plan[int(dc)] = dc_power
+                dc_power[nt] = "OFF"
+        power_plan[int(dc)] = {"unit": dc_power}
 
     return power_plan
 
@@ -315,44 +317,40 @@ class Helix:
             d = frac_plan.setdefault(key, {})
             d[tgt] = d.get(tgt, 0.0) + 1.0
 
-            # Smoothing
-            pending[tgt] = max(0.0, pending[tgt] - cap_tps.get(tgt, 1.0))
-
         # 4) Power Plan
         total_tokens = work_df["total_tokens"].sum() or 1.0
         routed_share = {dc: (pending.get(dc, 0.0) / total_tokens) for dc in dcs}
         power_plan = _build_power_plan(routed_share, epoch_summary if isinstance(epoch_summary, dict) else {})
 
-        # 5) Build Request List with FIXED VARIANT
+        # 5) Build Request List with FIXED VARIANT (preserve per-request arrivals/tokens)
         req_rows = []
         plan_map = {}
         row_idx = 0
 
-        for r in work_df.itertuples(index=False):
+        for r in df.itertuples(index=False):
             # Deterministic Routing
-            choices = frac_plan.get((r.src_dc, r.model_type), {})
+            src_dc = int(r.source_dc_id)
+            model = str(r.model_type)
+            choices = frac_plan.get((src_dc, model), {})
             if choices:
                 tgt = sorted(choices.items(), key=lambda kv: (-kv[1], kv[0]))[0][0]
             else:
-                tgt = r.src_dc
+                tgt = src_dc
 
             # --- FORCE FIXED VARIANT (No dynamic optimization) ---
-            full_model_str = f"{r.model_type}{FIXED_VARIANT}"
+            full_model_str = f"{model}{FIXED_VARIANT}"
 
             req_rows.append({
-                "source_dc": r.src_dc,
+                "source_dc": src_dc,
                 "model": full_model_str,
-                "arrival_ms": 0,
-                "tokens": r.total_tokens,
+                "arrival_ms": float(r.arrival_ms),
+                "tokens": float(r.num_tokens),
             })
             plan_map[row_idx] = int(tgt)
             row_idx += 1
 
         requests_df = pd.DataFrame(req_rows)
         schedule_plan = {"map": plan_map}
-
-        print(schedule_plan)
-        print(power_plan)
 
         # 6) Run Simulator
         metrics, details, leftovers = sim.run_epoch(

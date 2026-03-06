@@ -1,132 +1,93 @@
-import Rate_Flow_Sim
-import numpy as np
+import pandas as pd
+import math
+from Rate_Flow_Sim import LLM_Simulator
 
 
-def run_checks():
-    print("=" * 80)
-    print("=== PHYSICS EXPLOIT DETECTION SUITE ===")
-    print("=" * 80)
+def find_scaling_factors(trace_csv="simulator_ready_trace.csv", target_utilization=0.95):
+    print("Initializing Simulator...")
+    # Load the simulator. It will automatically load Node_Specs.csv, Datacenter_specs.csv, etc.
+    sim = LLM_Simulator(debug=False)
 
-    # Initialize Simulator
-    try:
-        sim = Rate_Flow_Sim.LLM_Simulator(spec_dir="sim_specs", epoch_length=900, debug=False)
-    except Exception as e:
-        print(f"CRITICAL: Could not load simulator. {e}")
-        return
+    print(f"Loading Trace: {trace_csv}\n")
+    df = pd.read_csv(trace_csv)
 
-    # --- TEST 1: GHOST COMPUTING (Routing to OFF nodes) ---
-    print("\n[TEST 1] 'Ghost Computing' Check")
-    dc0 = sim.datacenters[0]
-    dc0.apply_power_plan({"all": "OFF"})
-    res = dc0.schedule_request(model="Llama7b", arrival=0, net_latency_ms=50, tokens=100)
+    # Map your CSV columns to what the Simulator explicitly expects
+    if 'source_dc_id' in df.columns:
+        df.rename(columns={'source_dc_id': 'source_dc'}, inplace=True)
+    if 'model_type' in df.columns:
+        df.rename(columns={'model_type': 'model'}, inplace=True)
+    if 'num_tokens' in df.columns:
+        df.rename(columns={'num_tokens': 'tokens'}, inplace=True)
 
-    if res['ttft_s'] >= 50.0:
-        print("✅ PASS: Request to OFF node penalized (TTFT > 50s).")
-    else:
-        print(f"🚨 FAIL: Request to OFF node processed instantly (TTFT={res['ttft_s']}s).")
-        print("   -> Fix: Ensure 'schedule_request' returns a timeout if available_units is empty.")
+    epochs = sorted(df['epoch'].unique())
 
-    # --- TEST 2: ZOMBIE POWER (Free Idle Energy) ---
-    print("\n[TEST 2] 'Zombie Power' Check (Do idle servers burn carbon?)")
-    dc0.reset_epoch()
-    dc0.apply_power_plan({"all": "ON"})  # Turn everything ON
-    # Do NOT send any requests. Just finalize.
-    dc0.finalize_epoch()
+    # 1. Calculate the maximum raw capacity per Datacenter
+    dc_capacity_ms = {}
+    epoch_length_ms = sim.epoch_length * 1000.0
 
-    energy_idle = dc0.energy_it_kwh + dc0.energy_other_kwh
+    for dc_id, dc in sim.datacenters.items():
+        # Treat all units as ON to find the theoretical max capacity
+        total_nodes = len(dc.units)
+        dc_capacity_ms[dc_id] = total_nodes * epoch_length_ms
 
-    if energy_idle > 0.1:
-        print(f"✅ PASS: Idle servers consume power ({energy_idle:.4f} kWh).")
-    else:
-        print(f"🚨 FAIL: Idle servers consume ZERO power ({energy_idle:.4f} kWh).")
-        print("   -> Fix: Check 'finalize_epoch' logic for base_idle_frac calculation.")
+    # 2. Dry run each epoch to measure baseline compute demand
+    for ep in epochs:
+        print(f"====================================")
+        print(f"       ANALYZING EPOCH {ep}        ")
+        print(f"====================================")
 
-    # --- TEST 3: THE 'CLOWN CAR' (Infinite Capacity) ---
-    print("\n[TEST 3] 'Clown Car' Check (Infinite Capacity Exploit)")
-    # This is the most dangerous exploit. Can 1 node handle 1 million requests instantly?
-    dc0.reset_epoch()
-    dc0.apply_power_plan({"all": "OFF"})
+        ep_df = df[df['epoch'] == ep].copy()
 
-    # Enable exactly 1 node
-    if dc0.units:
-        dc0.units[0].state = "ON"
-        target_node = dc0.units[0]
-        # Calculate theoretical max capacity for 900s epoch
-        # Assume 1000 tokens ~ 0.5s processing
-        est_ms = target_node.estimate_exec_ms(tokens=1000, model="Llama7b", kwargs={})
-        capacity = (900.0 * 1000.0) / max(1.0, est_ms)
+        # Turn all servers ON and use default routing (requests stay in source_dc)
+        power_plan = {"all": "ON"}
+        schedule_plan = {}
 
-        print(f"   Node Capacity: ~{int(capacity)} requests/epoch")
-
-        # Send 100x Capacity
-        overload_count = int(capacity * 100)
-        print(f"   Sending {overload_count} requests to 1 node...")
-
-        ttfts = []
-        for i in range(100):  # Sample first 100
-            r = dc0.schedule_request(model="Llama7b", arrival=i * 10, tokens=1000)
-            ttfts.append(r['ttft_s'])
-
-        # In a rate-flow sim without queuing, TTFT often stays flat even if utilization > 100%
-        # This is a common simplification that RL agents abuse.
-        avg_ttft = sum(ttfts) / len(ttfts)
-
-        dc0.finalize_epoch()
-        util = dc0.report_utilization()
-
-        print(f"   Utilization: {util * 100:.1f}%")
-        print(f"   Avg TTFT   : {avg_ttft:.4f}s")
-
-        if util > 1.0 and avg_ttft < 1.0:
-            print("🚨 FAIL: EXPLOIT CONFIRMED.")
-            print("   The node handled 100x capacity with NO latency penalty.")
-            print("   The RL agent will route EVERYTHING to a single node to save power.")
-            print("   -> Fix: Add a 'Congestion Penalty' in the Reward Function or Simulator.")
-        elif util > 1.0 and avg_ttft > 5.0:
-            print("✅ PASS: Congestion correctly spikes latency.")
-        else:
-            print("⚠️ WARN: Utilization calculation might be capped or skewed.")
-
-    # --- TEST 4: TELEPORTATION (Network Latency) ---
-    print("\n[TEST 4] 'Teleportation' Check (Network Latency)")
-    # Route from DC 0 to DC 11 (assuming they are far apart)
-    src, dst = 0, 11
-    if len(sim.datacenters) > 11:
-        net_lat = sim.network._ring_path_latency_ms(src, dst)
-        dc_dst = sim.datacenters[dst]
-        dc_dst.apply_power_plan({"all": "ON"})
-
-        res = dc_dst.schedule_request(
-            model="Llama7b", arrival=0, net_latency_ms=net_lat, tokens=100
+        # Run Simulator to calculate the raw `exec_ms` for every request
+        metrics, details, dc_usage = sim.run_epoch(
+            epoch_idx=ep,
+            workload_df=ep_df,
+            schedule_plan=schedule_plan,
+            power_plan=power_plan
         )
 
-        if res['ttft_s'] * 1000.0 >= net_lat:
-            print(f"✅ PASS: Latency enforced ({res['ttft_s']:.3f}s >= {net_lat / 1000.0:.3f}s).")
-        else:
-            print(f"🚨 FAIL: Traffic moved faster than light ({res['ttft_s']:.3f}s < {net_lat / 1000.0:.3f}s).")
-    else:
-        print("   Skipping (Not enough DCs).")
+        # 3. Sum up the actual Execution MS per datacenter
+        dc_exec_sums = {dc_id: 0.0 for dc_id in dc_capacity_ms.keys()}
 
-    # --- TEST 5: COLD FUSION (Free Cooling) ---
-    print("\n[TEST 5] 'Cold Fusion' Check (Cooling Overhead)")
-    dc0.reset_epoch()
-    dc0.apply_power_plan({"all": "ON"})
-    # Send moderate load
-    for i in range(100):
-        dc0.schedule_request(model="Llama7b", arrival=i, tokens=1000)
+        for req in details:
+            if 'tag' in req and req['tag'] == 'epoch_finalize_idle':
+                continue  # Skip idle accumulation records
 
-    dc0.finalize_epoch()
+            if 'dc_id' in req and 'exec_ms' in req:
+                dc_id = int(req['dc_id'])
+                if dc_id in dc_exec_sums:
+                    dc_exec_sums[dc_id] += float(req['exec_ms'])
 
-    it_power = dc0.energy_it_kwh
-    cooling_power = dc0.energy_cooling_kwh
+        # 4. Calculate the Multipliers needed to reach Target Utilization
+        for dc_id, capacity in dc_capacity_ms.items():
+            if capacity == 0:
+                continue
 
-    if cooling_power > 0 and cooling_power < it_power:  # Cooling shouldn't be 0, but usually less than IT
-        print(f"✅ PASS: Cooling consumes energy ({cooling_power:.4f} kWh for {it_power:.4f} IT kWh).")
-    elif cooling_power == 0:
-        print("🚨 FAIL: Cooling is FREE (0 kWh). Check COP/PUE logic.")
-    else:
-        print(f"⚠️ NOTE: Cooling is higher than IT? ({cooling_power:.4f} > {it_power:.4f}). Check simulation specs.")
+            used_ms = dc_exec_sums[dc_id]
+            current_util = used_ms / capacity
+
+            if used_ms == 0:
+                print(f"DC {dc_id}: 0.00% Utilized (No traffic routed here).")
+                continue
+
+            # The Math: Target Compute Time / Current Compute Time
+            target_ms = capacity * target_utilization
+            multiplier = target_ms / used_ms
+
+            print(f"DC {dc_id} | Baseline Util: {current_util * 100:.2f}% | Target: {target_utilization * 100:.0f}%")
+
+            if multiplier < 1.0:
+                print(f"  -> OVERLOADED. Scale volume DOWN by a factor of {multiplier:.2f}x\n")
+            else:
+                print(f"  -> UNDERUTILIZED. Scale volume UP by a factor of {multiplier:.2f}x")
+                print(f"     Option A: Multiply 'num_tokens' column by {multiplier:.2f}")
+                print(f"     Option B: Duplicate the request rows {math.ceil(multiplier)} times\n")
 
 
 if __name__ == "__main__":
-    run_checks()
+    # You can change 0.95 to 1.00 if you want to push it to the absolute breaking point
+    find_scaling_factors("simulator_ready_trace.csv", target_utilization=0.95)

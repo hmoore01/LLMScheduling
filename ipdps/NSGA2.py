@@ -94,6 +94,11 @@ def _normalize_sim_output(
     stats.setdefault("water_usage", 0.0)
     stats.setdefault("energy_cost", 0.0)
     stats.setdefault("processed_tokens", float(metrics.get("processed_tokens", 0.0)))
+    stats.setdefault(
+        "requests_completed",
+        float(metrics.get("requests_completed", metrics.get("served_requests", 0.0))),
+    )
+    stats.setdefault("requests_dropped", float(metrics.get("requests_dropped", 0.0)))
 
     if not isinstance(details, list):
         details = []
@@ -108,7 +113,7 @@ def _build_power_plan(
     routed_tokens_by_dc: Dict[int, float],
     node_types: List[int],
     all_dcs: List[int],
-) -> Dict[int, Dict[int, str]]:
+) -> Dict[int, Dict[str, Dict[int, str]]]:
     """
     Simple Idle/Off power plan scaled by per-DC share of total tokens.
 
@@ -123,7 +128,7 @@ def _build_power_plan(
 
     total_tokens = sum(max(0.0, v) for v in routed_tokens_by_dc.values()) or 1.0
 
-    power_plan: Dict[int, Dict[int, str]] = {}
+    power_plan: Dict[int, Dict[str, Dict[int, str]]] = {}
     for dc in all_dcs:
         share = max(0.0, routed_tokens_by_dc.get(dc, 0.0)) / total_tokens
 
@@ -137,10 +142,10 @@ def _build_power_plan(
         dc_power: Dict[int, str] = {}
         for idx, nt in enumerate(node_types):
             if idx < idle_types:
-                dc_power[nt] = "Idle"
+                dc_power[nt] = "IDLE"
             else:
-                dc_power[nt] = "Off"
-        power_plan[int(dc)] = dc_power
+                dc_power[nt] = "OFF"
+        power_plan[int(dc)] = {"unit": dc_power}
 
     return power_plan
 
@@ -344,6 +349,8 @@ class NSGA2:
                 "carbon_emissions": 0.0,
                 "water_usage": 0.0,
                 "energy_cost": 0.0,
+                "requests_completed": 0.0,
+                "requests_dropped": 0.0,
             }
             return empty_stats, [], []
 
@@ -367,6 +374,8 @@ class NSGA2:
                 "carbon_emissions": 0.0,
                 "water_usage": 0.0,
                 "energy_cost": 0.0,
+                "requests_completed": 0.0,
+                "requests_dropped": 0.0,
             }
             return empty_stats, [], []
 
@@ -399,6 +408,7 @@ class NSGA2:
 
         if not dcs:
             dcs = [0]
+        dcs_set = set(dcs)
 
         num_dcs = len(dcs)
         gene_length = num_pairs * num_dcs
@@ -456,34 +466,36 @@ class NSGA2:
                 all_dcs=[int(dc) for dc in dcs],
             )
 
-            # Per-request mapping: one pseudo-request per bucket, routed by argmax fraction
+            # Per-request mapping: preserve original arrivals/tokens, routed by argmax fraction.
             req_rows: List[Dict[str, Any]] = []
             plan_map: Dict[int, int] = {}
-            row_idx = 0
             FIXED_VARIANT = "_FP16 (Base)_B16"
-            for (src_dc, model, tokens) in pairs:
+            for row_idx, row in enumerate(df.itertuples(index=False)):
+                src_dc = int(getattr(row, "source_dc_id"))
+                model = str(getattr(row, "model_type"))
+                arrival_ms = float(getattr(row, "arrival_ms"))
+                tokens = int(max(0.0, round(float(getattr(row, "num_tokens")))))
+
+                choices = frac_plan.get((src_dc, model), {})
+                if choices:
+                    best_j = max(
+                        range(num_dcs),
+                        key=lambda j: (float(choices.get(int(dcs[j]), 0.0)), -int(dcs[j])),
+                    )
+                    tgt_dc = int(dcs[best_j])
+                else:
+                    tgt_dc = src_dc if src_dc in dcs_set else int(dcs[0])
 
                 full_model = f"{model}{FIXED_VARIANT}"
                 req_rows.append(
                     {
                         "source_dc": src_dc,
                         "model": full_model,
-                        "arrival_ms": 0,
-                        "tokens": int(tokens),
+                        "arrival_ms": arrival_ms,
+                        "tokens": tokens,
                     }
                 )
-
-                # Recompute block for this pair
-                p_idx = row_idx
-                start = p_idx * num_dcs
-                end = start + num_dcs
-                block = [max(0.0, x) for x in gene[start:end]]
-                if sum(block) <= 0.0:
-                    block = [1.0 / float(num_dcs)] * num_dcs
-
-                best_j = max(range(num_dcs), key=lambda j: block[j])
-                plan_map[row_idx] = int(dcs[best_j])
-                row_idx += 1
+                plan_map[row_idx] = int(tgt_dc)
 
             requests_df = pd.DataFrame(req_rows)
             schedule_plan = {"map": plan_map}

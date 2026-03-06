@@ -15,7 +15,7 @@ W_TOKEN = 1.5
 W_LAT = 0.001
 
 # [FIX 1] Disable the suffix so model names match the trace (e.g., "Llama7b_Chat")
-FIXED_VARIANT = ""
+FIXED_VARIANT = "_FP16 (Base)_B16"
 
 def _prepare_epoch_df(epoch_data: Any) -> pd.DataFrame:
     if isinstance(epoch_data, pd.DataFrame):
@@ -96,8 +96,16 @@ class Splitwise:
         df = _prepare_epoch_df(epoch_data)
         if df.empty or df["tokens"].sum() <= 0:
             return {
-                "avg_ttft": 0.0, "avg_e2e_latency": 0.0, "total_energy": 0.0,
-                "carbon_emissions": 0.0, "water_usage": 0.0, "energy_cost": 0.0
+                "avg_ttft": 0.0,
+                "avg_ttft_sec": 0.0,
+                "avg_e2e_latency": 0.0,
+                "total_energy": 0.0,
+                "carbon_emissions": 0.0,
+                "water_usage": 0.0,
+                "energy_cost": 0.0,
+                "processed_tokens": 0.0,
+                "requests_completed": 0.0,
+                "requests_dropped": 0.0,
             }, [], []
 
         # 2) Init Simulator
@@ -165,13 +173,17 @@ class Splitwise:
             epoch_idx, pd.DataFrame(req_rows), {"map": plan_map}, power_plan
         )
 
+        avg_ttft = float(metrics.get("avg_ttft", metrics.get("avg_ttft_sec", 0.0)))
         stats = {
-            "avg_ttft": float(metrics.get("avg_ttft", 0.0)),
-            "avg_e2e_latency": float(metrics.get("avg_e2e_latency", metrics.get("avg_ttft", 0.0))),
+            "avg_ttft": avg_ttft,
+            "avg_ttft_sec": avg_ttft,
+            "avg_e2e_latency": float(metrics.get("avg_e2e_latency", avg_ttft)),
             "energy_cost": float(metrics.get("energy_cost", 0.0)),
             "carbon_emissions": float(metrics.get("carbon_emissions", 0.0)),
             "water_usage": float(metrics.get("water_usage", 0.0)),
             "total_energy": float(metrics.get("total_energy", 0.0)),
-            "processed_tokens": float(df["tokens"].sum())
+            "processed_tokens": float(metrics.get("processed_tokens", float(df["tokens"].sum()))),
+            "requests_completed": float(metrics.get("requests_completed", metrics.get("served_requests", 0.0))),
+            "requests_dropped": float(metrics.get("requests_dropped", 0.0)),
         }
         return stats, details or [], leftovers

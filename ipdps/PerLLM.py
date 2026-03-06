@@ -107,6 +107,10 @@ def _normalize_sim_output(
         "water_usage": float(metrics.get("water_usage", 0.0)),
         "energy_cost": float(metrics.get("energy_cost", 0.0)),
         "processed_tokens": float(metrics.get("processed_tokens", 0.0)),
+        "requests_completed": float(
+            metrics.get("requests_completed", metrics.get("served_requests", 0.0))
+        ),
+        "requests_dropped": float(metrics.get("requests_dropped", 0.0)),
     }
 
     if not isinstance(details, list):
@@ -262,7 +266,7 @@ def _capacity_per_dc_from_sim(sim: LLM_Simulator) -> Dict[int, float]:
 def _build_power_plan(
     routed_token_share_by_dc: Dict[int, float],
     epoch_summary: Any,
-) -> Dict[int, Dict[int, str]]:
+) -> Dict[int, Dict[str, Dict[int, str]]]:
     """
     Heuristic Idle/Off power plan scaled by per-DC share.
     epoch_summary may contain:
@@ -287,7 +291,7 @@ def _build_power_plan(
         for dc in routed_token_share_by_dc
     }
 
-    power_plan: Dict[int, Dict[int, str]] = {}
+    power_plan: Dict[int, Dict[str, Dict[int, str]]] = {}
     for dc, share in shares.items():
         # More share = fewer Idle node types (high share -> more "On")
         idle_types = max(
@@ -299,10 +303,10 @@ def _build_power_plan(
         dc_power: Dict[int, str] = {}
         for idx, nt in enumerate(node_types):
             if idx < idle_types:
-                dc_power[nt] = "Idle"
+                dc_power[nt] = "IDLE"
             else:
-                dc_power[nt] = "Off"
-        power_plan[int(dc)] = dc_power
+                dc_power[nt] = "OFF"
+        power_plan[int(dc)] = {"unit": dc_power}
 
     return power_plan
 
@@ -365,6 +369,8 @@ class PerLLM:
                 "carbon_emissions": 0.0,
                 "water_usage": 0.0,
                 "energy_cost": 0.0,
+                "requests_completed": 0.0,
+                "requests_dropped": 0.0,
             }
             return empty_stats, [], []
 
@@ -429,7 +435,14 @@ class PerLLM:
             epoch_len = DEFAULT_EPOCH_LEN
             delay_budget_sec = DEFAULT_DELAY_BUDGET_SEC
 
+        if not dcs:
+            dcs = sorted(df["source_dc_id"].unique().astype(int).tolist() or [0])
+        for dc in dcs:
+            cap_tps.setdefault(int(dc), 1.0)
+            dc_price.setdefault(int(dc), 0.1)
+
         epoch_len_s = float(getattr(sim, "epoch_length", epoch_len))
+        dcs_set = set(dcs)
 
         # 3) PerLLM-style routing: constraint satisfaction on delay, then minimize energy
         pending_tokens_by_dc: Dict[int, float] = {dc: 0.0 for dc in dcs}
@@ -518,18 +531,18 @@ class PerLLM:
         FIXED_VARIANT = "_FP16 (Base)_B16"
         req_rows = []
         plan_map: Dict[int, int] = {}
-        row_idx = 0
-        for r in work_df.itertuples(index=False):
-            src_dc = int(getattr(r, "src_dc"))
+        for row_idx, r in enumerate(df.itertuples(index=False)):
+            src_dc = int(getattr(r, "source_dc_id"))
             model = str(getattr(r, "model_type"))
-            tokens = int(getattr(r, "total_tokens"))
+            tokens = int(max(0.0, round(float(getattr(r, "num_tokens")))))
+            arrival_ms = float(getattr(r, "arrival_ms"))
 
             full_model = f"{model}{FIXED_VARIANT}"
             req_rows.append(
                 {
                     "source_dc": src_dc,
                     "model": full_model,
-                    "arrival_ms": 0,
+                    "arrival_ms": arrival_ms,
                     "tokens": tokens,
                 }
             )
@@ -541,9 +554,8 @@ class PerLLM:
                     choices.items(), key=lambda kv: (-kv[1], kv[0])
                 )[0][0]
             else:
-                tgt = src_dc
+                tgt = src_dc if src_dc in dcs_set else dcs[0]
             plan_map[row_idx] = int(tgt)
-            row_idx += 1
 
         requests_df = pd.DataFrame(req_rows)
         schedule_plan = {"map": plan_map}
