@@ -9,6 +9,81 @@ import math
 import hashlib
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import Rate_Flow_Sim
+import threading
+
+# ─────────────────────────────────────────────────────────────────────────────
+# METRIC NORMALIZER  — one instance per agent, fully isolated
+# Prevents cross-contamination of EMA baselines between agents.
+# ─────────────────────────────────────────────────────────────────────────────
+class MetricNormalizer:
+    EMA_ALPHA_METRIC = 0.05
+    EMA_ALPHA_SLA    = 0.15
+    FLOOR            = 1e-6
+
+    def __init__(self):
+        self.ttft = self.carbon = self.water = self.cost = None
+        self.ratio_ema = [1.0, 1.0, 1.0, 1.0]
+        self.ratio_sq_ema = [1.0, 1.0, 1.0, 1.0]
+        self.sla_target = 0.80
+        self.n_obs      = 0
+        self.lock       = threading.Lock()  # Protects global state from concurrent threads
+
+    def update(self, metrics: dict):
+        with self.lock:
+            ttft   = float(metrics.get("avg_ttft",         0.0))
+            carbon = float(metrics.get("carbon_emissions", 0.0)) / 1000.0
+            water  = float(metrics.get("water_usage",      0.0)) / 100.0
+            cost   = float(metrics.get("energy_cost",      0.0))
+
+            req_done = float(metrics.get("requests_completed",
+                                         metrics.get("served_requests", 0.0)))
+            req_drop = float(metrics.get("requests_dropped", 0.0))
+            req_tot  = max(0.0, req_done + req_drop)
+            if req_tot > 0.0:
+                sr = req_done / req_tot
+                self.sla_target = max(
+                    0.70, (1 - self.EMA_ALPHA_SLA) * self.sla_target + self.EMA_ALPHA_SLA * sr)
+
+            vals = (max(abs(ttft), self.FLOOR), max(abs(carbon), self.FLOOR),
+                    max(abs(water), self.FLOOR), max(abs(cost),  self.FLOOR))
+            if self.n_obs == 0:
+                self.ttft, self.carbon, self.water, self.cost = vals
+            else:
+                a = self.EMA_ALPHA_METRIC
+                self.ttft   = (1 - a) * self.ttft   + a * vals[0]
+                self.carbon = (1 - a) * self.carbon + a * vals[1]
+                self.water  = (1 - a) * self.water  + a * vals[2]
+                self.cost   = (1 - a) * self.cost   + a * vals[3]
+
+            if self.n_obs >= 1:
+                denoms = self._denominators_unsafe()
+                ratios = [v / d for v, d in zip(vals, denoms)]
+                a2 = min(0.15, self.EMA_ALPHA_METRIC * 3)
+                for i in range(4):
+                    self.ratio_ema[i]    = (1 - a2) * self.ratio_ema[i]    + a2 * ratios[i]
+                    self.ratio_sq_ema[i] = (1 - a2) * self.ratio_sq_ema[i] + a2 * ratios[i] ** 2
+
+            self.n_obs += 1
+
+    def _denominators_unsafe(self):
+        """Internal helper strictly for when the lock is already acquired."""
+        if self.n_obs == 0:
+            return 100.0, 100.0, 100.0, 100.0
+        # Enforcing realistic minimum floors to prevent punishment for optimal performance
+        return (max(self.ttft, 0.5), max(self.carbon, 5.0),
+                max(self.water, 5.0), max(self.cost, 0.5))
+
+    def denominators(self):
+        with self.lock:
+            return self._denominators_unsafe()
+
+    def ratio_stds(self):
+        with self.lock:
+            stds = []
+            for i in range(4):
+                var = max(0.0, self.ratio_sq_ema[i] - self.ratio_ema[i] ** 2)
+                stds.append(max(math.sqrt(var), 0.01))
+            return stds
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONFIGURATION
@@ -35,7 +110,7 @@ VETO_CAPITAL_THRESH   = 150.0           # Minimum capital to exercise veto power
 VETO_Q_DEGRADATION    = 0.25            # Q-value degradation ratio that triggers veto
 VETO_STRENGTH_CAP     = 0.5             # Max fraction veto can pull consensus
 METRIC_REWARD_SCALE   = 8.0             # Amplified metric penalty in reward (was 4.0)
-ECO_BONUS_SCALE       = 0.25            # Dampen shared eco bonus to avoid homogeneity
+ECO_BONUS_SCALE       = 0.05            # Dampen shared eco bonus to avoid homogeneity
 HER_CROSS_PRIORITY    = 0.4             # Priority discount for cross-agent HER samples
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -79,6 +154,7 @@ _GLOBAL_AGENTS     = {}
 _PREV_STATES       = {}                          # Cross-epoch state memory per scheme
 _POLITICAL_CAPITAL = {}                          # Persistent across epochs
 _EPOCH_HISTORY     = []                          # List of {epoch, metrics} dicts
+_GLOBAL_NORMALIZER = MetricNormalizer()
 
 
 def configure_schemes(scheme_list: list = None):
@@ -102,6 +178,7 @@ def configure_schemes(scheme_list: list = None):
     """
     global SCHEMES, SCHEME_WEIGHTS, PRIMARY_METRIC_KEY
     global _GLOBAL_AGENTS, _PREV_STATES, _POLITICAL_CAPITAL, _EPOCH_HISTORY
+    global _GLOBAL_NORMALIZER
 
     if scheme_list is None:
         scheme_list = DEFAULT_SCHEMES
@@ -138,6 +215,7 @@ def configure_schemes(scheme_list: list = None):
     _PREV_STATES.clear()
     _POLITICAL_CAPITAL = {s: 100.0 for s in SCHEMES}
     _EPOCH_HISTORY     = []
+    _GLOBAL_NORMALIZER = MetricNormalizer()
 
     nw = max(12, max(len(s) for s in SCHEMES))
     print(f"[CONFIG] {len(SCHEMES)} scheme(s) registered:")
@@ -154,6 +232,7 @@ def reset_simulation():
     _PREV_STATES.clear()
     _POLITICAL_CAPITAL = {s: 100.0 for s in SCHEMES}
     _EPOCH_HISTORY     = []
+    _GLOBAL_NORMALIZER = MetricNormalizer()
     print("[RESET] All agents, buffers, capital, and history cleared.")
 
 
@@ -436,84 +515,6 @@ class PrioritizedReplayBuffer:
     def __len__(self) -> int:
         return self.tree.size
 
-
-# ─────────────────────────────────────────────────────────────────────────────
-# METRIC NORMALIZER  — one instance per agent, fully isolated
-# Prevents cross-contamination of EMA baselines between agents.
-# ─────────────────────────────────────────────────────────────────────────────
-class MetricNormalizer:
-    EMA_ALPHA_METRIC = 0.05
-    EMA_ALPHA_SLA    = 0.15
-    FLOOR            = 1e-6
-
-    def __init__(self):
-        self.ttft = self.carbon = self.water = self.cost = None
-        # Variance tracking: EMA of squared ratios for per-metric std normalisation.
-        # Without this, high-variance metrics (typically cost) dominate the reward
-        # gradient for Balanced agents, causing them to over-optimise on cost.
-        self.ratio_ema = [1.0, 1.0, 1.0, 1.0]     # EMA of ratio
-        self.ratio_sq_ema = [1.0, 1.0, 1.0, 1.0]   # EMA of ratio^2
-        self.sla_target = 0.80
-        self.n_obs      = 0
-
-    def update(self, metrics: dict):
-        ttft   = float(metrics.get("avg_ttft",         0.0))
-        carbon = float(metrics.get("carbon_emissions", 0.0)) / 1000.0
-        water  = float(metrics.get("water_usage",      0.0)) / 100.0
-        cost   = float(metrics.get("energy_cost",      0.0))
-
-        req_done = float(metrics.get("requests_completed",
-                                     metrics.get("served_requests", 0.0)))
-        req_drop = float(metrics.get("requests_dropped", 0.0))
-        req_tot  = max(0.0, req_done + req_drop)
-        if req_tot > 0.0:
-            sr = req_done / req_tot
-            self.sla_target = max(
-                0.70, (1 - self.EMA_ALPHA_SLA) * self.sla_target + self.EMA_ALPHA_SLA * sr)
-
-        vals = (max(abs(ttft), self.FLOOR), max(abs(carbon), self.FLOOR),
-                max(abs(water), self.FLOOR), max(abs(cost),  self.FLOOR))
-        if self.n_obs == 0:
-            self.ttft, self.carbon, self.water, self.cost = vals
-        else:
-            a = self.EMA_ALPHA_METRIC
-            self.ttft   = (1 - a) * self.ttft   + a * vals[0]
-            self.carbon = (1 - a) * self.carbon + a * vals[1]
-            self.water  = (1 - a) * self.water  + a * vals[2]
-            self.cost   = (1 - a) * self.cost   + a * vals[3]
-
-        # Track ratio variance (only after we have a denominator)
-        if self.n_obs >= 1:
-            denoms = self.denominators()
-            ratios = [v / d for v, d in zip(vals, denoms)]
-            a2 = min(0.15, self.EMA_ALPHA_METRIC * 3)  # faster variance tracking
-            for i in range(4):
-                self.ratio_ema[i]    = (1 - a2) * self.ratio_ema[i]    + a2 * ratios[i]
-                self.ratio_sq_ema[i] = (1 - a2) * self.ratio_sq_ema[i] + a2 * ratios[i] ** 2
-
-        self.n_obs += 1
-
-    def denominators(self):
-        if self.n_obs == 0:
-            return 100.0, 100.0, 100.0, 100.0
-        return (max(self.ttft,   self.FLOOR), max(self.carbon, self.FLOOR),
-                max(self.water,  self.FLOOR), max(self.cost,   self.FLOOR))
-
-    def ratio_stds(self):
-        """Per-metric standard deviation of the ratio (raw/EMA).
-
-        Used to equalise gradient contribution across metrics: dividing each
-        ratio by its std ensures that a 1-sigma change in cost has the same
-        reward impact as a 1-sigma change in TTFT.  Without this, whichever
-        metric has highest variance dominates the Balanced agent's learning.
-        """
-        stds = []
-        for i in range(4):
-            var = max(0.0, self.ratio_sq_ema[i] - self.ratio_ema[i] ** 2)
-            stds.append(max(math.sqrt(var), 0.01))  # floor at 1% to avoid div-by-zero
-        return stds
-
-
 # ─────────────────────────────────────────────────────────────────────────────
 # SAC ACTOR  (Gaussian policy with reparameterization)
 # Replaces hand-crafted Dirichlet/Gaussian/dropout noise with a single
@@ -636,7 +637,7 @@ class SACAgent:
         self.alpha_optimizer  = optim.Adam([self.log_alpha],         lr=LR_ALPHA)
 
         # Per-agent normalizer: rewards are scaled against this agent's own history only
-        self.normalizer = MetricNormalizer()
+        # self.normalizer = MetricNormalizer()
 
         # Separate buffers: intra-epoch (same-state transitions) and
         # cross-epoch (true temporal transitions, sampled 70% of the time)
@@ -706,13 +707,15 @@ class SACAgent:
         dc_score += dc_bias
 
         # ── Temperature & softmax ────────────────────────────────────────
-        temperature = 8.0 + 22.0 * concentration
+        temp_scale = 1.0 - w[0] * 0.95
+        temperature = (8.0 + 22.0 * concentration) * temp_scale
         exp_scores = np.exp((dc_score - dc_score.max()) * temperature)
         routing_pref = exp_scores / (exp_scores.sum() + 1e-8)
 
         # ── Power follows routing ────────────────────────────────────────
         pref_rank = routing_pref / (routing_pref.max() + 1e-8)
-        power_pref = np.clip(pref_rank ** (1.0 + concentration), 0.0, 1.0)
+        latency_power_floor = w[0]
+        power_pref = np.clip((pref_rank ** (1.0 + concentration)) + latency_power_floor, 0.0, 1.0)
 
         return np.concatenate([routing_pref, routing_pref, power_pref])
 
@@ -874,23 +877,43 @@ def _normalize_weights(w: np.ndarray) -> np.ndarray:
 
 
 def get_rich_state(sim, dc_ids, epoch_data, epoch_idx: int) -> np.ndarray:
-    n_dcs  = len(dc_ids)
-    state  = np.zeros((n_dcs, 4), dtype=np.float32)
+    n_dcs = len(dc_ids)
+    state = np.zeros((n_dcs, 4), dtype=np.float32)
     n_reqs = len(epoch_data) if epoch_data is not None else 0
-    hour   = int(epoch_idx % 24)
+
+    try:
+        epoch_len = float(next(iter(sim.datacenters.values()))._epoch_length_s)
+    except Exception:
+        epoch_len = 900.0
+
+    epoch_start_sec = epoch_idx * epoch_len
+    hour = int((epoch_start_sec % 86400) // 3600)
+
     for i, dc_id in enumerate(dc_ids):
-        ci, cost, wv = 400.0, 0.10, 1.18
+        ci, cost, true_water_intensity = 400.0, 0.10, 1.0
+
         if hasattr(sim, 'datacenters') and dc_id in sim.datacenters:
             dc = sim.datacenters[dc_id]
             ci = float(getattr(dc, 'carbon_intensity_g_per_kwh', 400.0))
+
             try:
-                tou  = getattr(dc, 'tou_price', None)
+                tou = getattr(dc, 'tou_price', None)
                 cost = float(tou[hour]) if isinstance(tou, (list, tuple)) and len(tou) == 24 \
                     else float(getattr(dc, 'tou_price', [0.10])[0])
             except Exception:
                 pass
-            wv = float(getattr(dc, 'pue_value', 1.18))
-        state[i] = [ci / 1000.0, cost * 5.0, wv / 2.0, min(n_reqs / 50_000.0, 1.0)]
+
+            # Extract true water intensity based on the simulator's physical math
+            static_factor = float(getattr(dc, 'water_static', 0.0))
+            evap_factor = float(getattr(dc, 'water_cycling_density', 0.0))
+            blowdown = max(1e-9, float(getattr(dc, 'blowdown_ratio', 0.30)))
+
+            # Total m3 of water drawn per kWh of heat rejected
+            true_water_intensity = static_factor + (evap_factor / blowdown)
+
+        # Scale the water intensity by 10.0 to keep it roughly in the [0, 1] range for the neural network
+        state[i] = [ci / 1000.0, cost * 5.0, true_water_intensity / 10.0, min(n_reqs / 50_000.0, 1.0)]
+
     return state
 
 
@@ -1246,7 +1269,7 @@ def milp_optimizer(epoch_data, epoch_idx: int, node_properties: dict, epoch_summ
 
             metrics, _, dc_usage = temp_sim.run_epoch(epoch_idx, clean_data, sp, pp)
             reward = _score_solution(metrics, ps, dc_usage, dc_to_idx,
-                                     agent.weights, agent.normalizer, update_norm=True)
+                                     agent.weights, _GLOBAL_NORMALIZER, update_norm=True)
 
             agent.intra_buffer.push(curr_state, full_action, reward, curr_state, False)
             her_log.append((curr_state.copy(), full_action.copy(), metrics, ps.copy(), dc_usage))
@@ -1307,7 +1330,7 @@ def milp_optimizer(epoch_data, epoch_idx: int, node_properties: dict, epoch_summ
         for scheme in SCHEMES:
             ag = _GLOBAL_AGENTS[scheme]
             r  = _score_solution(mets, ps, dc_use, dc_to_idx,
-                                 ag.weights, ag.normalizer, update_norm=False)
+                                 ag.weights, _GLOBAL_NORMALIZER, update_norm=False)
             ag.intra_buffer.push(s_vec, a_vec, r, s_vec, False,
                                  priority_boost=HER_CROSS_PRIORITY)
 

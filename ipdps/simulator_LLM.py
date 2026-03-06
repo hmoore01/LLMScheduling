@@ -552,7 +552,7 @@ if __name__ == "__main__":
                         help="Binary-search steps for autoscale drop-constrained tuning.")
     parser.add_argument('--autoscale-max-rows', type=int, default=AUTOSCALE_MAX_EXPANDED_ROWS,
                         help="Max expanded row count per epoch during autoscaling.")
-    parser.add_argument('--num-dcs', type=int, default=12)
+    parser.add_argument('--num-dcs', type=int, default=8)
     parser.add_argument('--distribution', type=str, default='even')
     parser.add_argument('--spec-dir', type=str, default='sim_specs')
     parser.add_argument('--ql-theta', type=float, default=0.87)
