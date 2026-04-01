@@ -175,19 +175,39 @@ def _select_diverse_dcs(num_dcs: int, spec_dir: str = "sim_specs") -> list:
     if num_dcs >= n_total:
         return all_dc_ids[:num_dcs]
 
-    # Extract per-DC feature vectors [carbon, cost, pue]
+    # Extract per-DC feature vectors [carbon, effective_cost, pue]
     features = {}
     for dc_id in all_dc_ids:
         dc = sim.datacenters[dc_id]
         ci = float(getattr(dc, 'carbon_intensity_g_per_kwh', 400.0))
-        # Average TOU price across hours as a single cost proxy
+
+        # Average TOU price across hours as electricity cost baseline.
+        # Handle numpy arrays, lists, and tuples (isinstance misses numpy).
         tou = getattr(dc, 'tou_price', None)
-        if isinstance(tou, (list, tuple)) and len(tou) > 0:
-            cost_val = float(np.mean(tou))
+        if tou is not None and hasattr(tou, '__len__') and len(tou) > 0:
+            mean_tou = float(np.mean(tou))
+        elif tou is not None:
+            mean_tou = float(np.asarray(tou).flat[0])
         else:
-            cost_val = float(tou) if tou is not None else 0.10
-        pue = float(getattr(dc, 'pue_value', 1.18))
-        features[dc_id] = np.array([ci, cost_val, pue])
+            mean_tou = 0.10
+
+        # Bug fix: read PUE with the same attribute chain used in get_rich_state.
+        # The old code used 'pue_value' which doesn't exist on DC objects —
+        # every DC silently returned the 1.18 default, collapsing the PUE
+        # dimension to a flat line and making diversity selection ignore it.
+        pue = float(getattr(dc, 'pue',
+                    getattr(dc, 'power_usage_effectiveness',
+                    getattr(dc, 'pue_value', 1.18))))
+
+        # Bug fix: cost proxy must be mean_tou * PUE, not mean_tou alone.
+        # Actual energy bill = tokens * energy_per_token * PUE * tou_price.
+        # Using raw tou_price as the cost anchor selects the cheapest
+        # electricity DC, which may have a PUE so high it is actually the
+        # most expensive DC to run workloads on.  Multiplying by PUE makes
+        # the selection metric match what the simulator will charge.
+        effective_cost = mean_tou * max(pue, 1.0)
+
+        features[dc_id] = np.array([ci, effective_cost, pue])
 
     # Step 1: find the extreme (best = lowest) DC for each metric
     selected = set()
@@ -227,7 +247,7 @@ def _select_diverse_dcs(num_dcs: int, spec_dir: str = "sim_specs") -> list:
 
     # Print the selection with characteristics
     print(f"[DC-SELECT] Chose {len(result)} of {n_total} DCs for max diversity:")
-    print(f"  {'DC':>4}  {'Carbon':>8}  {'AvgCost':>8}  {'PUE':>6}  {'Reason'}")
+    print(f"  {'DC':>4}  {'Carbon':>8}  {'EffCost':>8}  {'PUE':>6}  {'Reason'}")
     extremes = {}
     for dim, mname in enumerate(metric_names):
         best = min(result, key=lambda d: features[d][dim])
@@ -552,13 +572,33 @@ if __name__ == "__main__":
                         help="Binary-search steps for autoscale drop-constrained tuning.")
     parser.add_argument('--autoscale-max-rows', type=int, default=AUTOSCALE_MAX_EXPANDED_ROWS,
                         help="Max expanded row count per epoch during autoscaling.")
-    parser.add_argument('--num-dcs', type=int, default=8)
+    parser.add_argument('--num-dcs', type=int, default=12)
     parser.add_argument('--distribution', type=str, default='even')
     parser.add_argument('--spec-dir', type=str, default='sim_specs')
     parser.add_argument('--ql-theta', type=float, default=0.87)
     parser.add_argument('--ql-alpha', type=float, default=0.1)
     parser.add_argument('--ql-gamma', type=float, default=0.9)
     parser.add_argument('--ql-epsilon', type=float, default=0.1)
+    parser.add_argument('--offline-train', type=int, default=0,
+                        help="Offline training: randomly sample this many epochs from the "
+                             "workload and train agents without running inference. "
+                             "Saves model to --model-dir when done. 0 = disabled (default).")
+    parser.add_argument('--model-dir', type=str, default='models/gtarl',
+                        help="Directory for saving/loading GTARL agent checkpoints.")
+    parser.add_argument('--load-model', action='store_true',
+                        help="Load pre-trained agents from --model-dir before running. "
+                             "Agents will be used for inference (online adjustment still applies).")
+    parser.add_argument('--transfer-from', type=str, default='',
+                        help="Path to a source checkpoint for transfer learning. "
+                             "Transfers compatible weights (hidden layers, FiLM, normalizer) "
+                             "from a model trained on a different DC count. "
+                             "Combine with --offline-train for fine-tuning after transfer.")
+    parser.add_argument('--ablation', type=str, default='',
+                        choices=['', 'no-film', 'no-veto', 'no-dual-buffer',
+                                 'no-her', 'no-capital', 'no-source-routing',
+                                 'no-heuristic', 'no-phase2', 'no-sgd',
+                                 'no-exploration'],
+                        help="Ablation mode: disable one GTARL component for study.")
     args = parser.parse_args()
 
     workload_path = "simulator_ready_trace.csv"
@@ -650,8 +690,8 @@ if __name__ == "__main__":
             import Splitwise
             return Splitwise.Splitwise
         elif fw == 'hybrid':
-            import Hybrid
-            return Hybrid
+            import Hybrid_Scheduler_LLM
+            return Hybrid_Scheduler_LLM
         elif fw == 'parliament':
             import Game_Theoretic_RL
             return Game_Theoretic_RL
@@ -660,6 +700,14 @@ if __name__ == "__main__":
 
 
     FW = get_framework(framework)
+
+    # Pass ablation mode to GTARL if applicable
+    ablation = getattr(args, 'ablation', '')
+    if ablation and framework.lower() == "parliament":
+        FW.ABLATION_MODE = ablation
+        print(f"[ABLATION] Mode: {ablation}")
+    elif framework.lower() == "parliament":
+        FW.ABLATION_MODE = ""
     autoscale_dry_sim = None
     autoscale_mode = str(getattr(args, "autoscale_mode", "global_peak")).strip().lower()
     global_autoscale_plan: Optional[Dict[str, Any]] = None
@@ -710,6 +758,239 @@ if __name__ == "__main__":
                 )
             else:
                 print(f"[Auto-Scale] Global plan unavailable: {str(global_autoscale_plan.get('reason', 'unknown'))}.")
+
+    # ── Model loading (before offline training or inference) ──────────────
+    if getattr(args, 'load_model', False) and framework.lower() == "parliament":
+        model_path = os.path.join(args.model_dir, "gtarl_agents.pt")
+        if os.path.exists(model_path):
+            FW.load_agents(model_path, num_dcs=args.num_dcs)
+            print(f"[MODEL] Loaded pre-trained agents from {model_path}")
+        else:
+            print(f"[MODEL] No checkpoint found at {model_path} — starting fresh.")
+
+    # ── Transfer learning (from a model trained on different DC count) ────
+    transfer_from = getattr(args, 'transfer_from', '')
+    if transfer_from and framework.lower() == "parliament":
+        if os.path.exists(transfer_from):
+            FW.transfer_agents(transfer_from, target_num_dcs=args.num_dcs)
+        else:
+            print(f"[TRANSFER] Source checkpoint not found: {transfer_from}")
+
+    # ── Offline training mode ─────────────────────────────────────────────
+    # Randomly sample epochs from the workload and train agents offline.
+    # No inference results are reported — this is purely for pre-training.
+    # After training, agents are saved to --model-dir for later inference.
+    offline_train_epochs = int(getattr(args, 'offline_train', 0))
+    if offline_train_epochs > 0 and framework.lower() == "parliament":
+        # Free the autoscale dry simulator — we only need the plan dict
+        if autoscale_dry_sim is not None:
+            del autoscale_dry_sim
+            autoscale_dry_sim = None
+            import gc; gc.collect()
+
+        print(f"[OFFLINE] Baseline memory freed. Starting training...")
+
+        available_epochs = sorted([
+            int(e) for e in grouped_trace.groups.keys()
+            if len(grouped_trace.get_group(int(e))) > 0
+        ])
+        if not available_epochs:
+            print("[OFFLINE] No non-empty epochs in workload — cannot train.")
+        else:
+            # Sample with replacement if requesting more epochs than available
+            rng = np.random.default_rng(seed=42)
+            sampled_epochs = rng.choice(
+                available_epochs,
+                size=min(offline_train_epochs, len(available_epochs)),
+                replace=False
+            ).tolist()
+            # If user wants more epochs than unique ones, add repeated passes
+            if offline_train_epochs > len(available_epochs):
+                extra = rng.choice(
+                    available_epochs,
+                    size=offline_train_epochs - len(available_epochs),
+                    replace=True
+                ).tolist()
+                sampled_epochs += extra
+            rng.shuffle(sampled_epochs)
+
+            print(f"[OFFLINE] Training on {len(sampled_epochs)} randomly sampled epochs "
+                  f"({len(available_epochs)} unique epochs available)")
+
+            # ── Set up log files ──────────────────────────────────────────────
+            os.makedirs(args.model_dir, exist_ok=True)
+            log_path = os.path.join(args.model_dir, "training_log.txt")
+            csv_path = os.path.join(args.model_dir, "training_metrics.csv")
+            _log_file = open(log_path, "w")
+            _csv_file = open(csv_path, "w")
+            _csv_file.write("step,epoch,elapsed_s,step_time_s,"
+                            "ttft_reward,carbon_reward,water_reward,cost_reward,"
+                            "ttft_loss,carbon_loss,water_loss,cost_loss,"
+                            "ttft_buf,carbon_buf,water_buf,cost_buf,"
+                            "ttft_alpha,carbon_alpha,water_alpha,cost_alpha\n")
+
+            def _log(msg: str):
+                """Print to console and write to log file."""
+                print(msg)
+                _log_file.write(msg + "\n")
+                _log_file.flush()
+
+            _log(f"[OFFLINE] Training on {len(sampled_epochs)} randomly sampled epochs "
+                 f"({len(available_epochs)} unique epochs available)")
+            _log(f"[OFFLINE] Log file: {log_path}")
+            _log(f"[OFFLINE] CSV metrics: {csv_path}")
+
+            # Rolling averages for convergence detection
+            _reward_history = {ag: [] for ag in ["TTFT", "Carbon", "Water", "Cost"]}
+            _loss_history   = {ag: [] for ag in ["TTFT", "Carbon", "Water", "Cost"]}
+            _window = 20  # Rolling window size for convergence check
+            _train_start = time.time()
+
+            for train_step, epoch_idx in enumerate(sampled_epochs):
+                step_start = time.time()
+
+                epoch_data = grouped_trace.get_group(epoch_idx).copy()
+
+                # Apply autoscaling if configured
+                if getattr(args, "target_util", 0.0) > 0.0:
+                    if autoscale_mode == "global_peak" and global_autoscale_plan \
+                            and bool(global_autoscale_plan.get("enabled", False)):
+                        epoch_data, count_mult, remainder_scale = _apply_autoscale_multiplier(
+                            epoch_data,
+                            float(global_autoscale_plan.get("chosen_multiplier", 1.0)),
+                            epoch_idx,
+                            epoch_length_s=int(getattr(autoscale_dry_sim, "epoch_length", 900))
+                                if autoscale_dry_sim else 900,
+                            count_cap=int(global_autoscale_plan.get("count_cap",
+                                          AUTOSCALE_MAX_COUNT_MULT)),
+                        )
+
+                epoch_data["arrival_ms"] = _derive_arrival_ms(epoch_data, epoch_length_s=900)
+
+                stats = FW.offline_train_epoch(
+                    epoch_data=epoch_data,
+                    epoch_idx=train_step,
+                    node_properties=node_properties,
+                    epoch_summary={
+                        "node_types": [0, 1, 2, 3, 4, 5],
+                        "datacenters": active_dc_ids,
+                        "avg_input_tokens": 100,
+                        "avg_output_tokens": 100,
+                        "spec_dir": args.spec_dir,
+                        "epoch_length": 900,
+                    }
+                )
+
+                # Free autoscaled epoch data immediately (can be 500K+ rows)
+                del epoch_data
+                import gc; gc.collect()
+
+                step_time = time.time() - step_start
+                elapsed = time.time() - _train_start
+
+                # Track per-agent reward and loss history
+                if stats:
+                    for ag in _reward_history:
+                        if ag in stats:
+                            _reward_history[ag].append(stats[ag]["avg_reward"])
+                            _loss_history[ag].append(stats[ag]["avg_loss"])
+
+                # Write CSV row every step (lightweight, enables plotting)
+                if stats:
+                    csv_vals = [
+                        str(train_step + 1), str(epoch_idx),
+                        f"{elapsed:.1f}", f"{step_time:.1f}",
+                    ]
+                    for ag in ["TTFT", "Carbon", "Water", "Cost"]:
+                        csv_vals.append(f"{stats.get(ag, {}).get('avg_reward', 0):.4f}")
+                    for ag in ["TTFT", "Carbon", "Water", "Cost"]:
+                        csv_vals.append(f"{stats.get(ag, {}).get('avg_loss', 0):.6f}")
+                    for ag in ["TTFT", "Carbon", "Water", "Cost"]:
+                        csv_vals.append(str(stats.get(ag, {}).get('buffer_size', 0)))
+                    for ag in ["TTFT", "Carbon", "Water", "Cost"]:
+                        csv_vals.append(f"{stats.get(ag, {}).get('alpha', 0):.6f}")
+                    _csv_file.write(",".join(csv_vals) + "\n")
+                    _csv_file.flush()
+
+                # Log every 10 steps or on the last step
+                if (train_step + 1) % 10 == 0 or train_step == len(sampled_epochs) - 1:
+                    eta = (elapsed / (train_step + 1)) * (len(sampled_epochs) - train_step - 1)
+
+                    # Build per-agent reward summary
+                    rew_parts = []
+                    for ag in ["TTFT", "Carbon", "Water", "Cost"]:
+                        recent = _reward_history[ag][-_window:]
+                        if recent:
+                            rew_parts.append(f"{ag}={np.mean(recent):+.3f}")
+                    rew_str = "  ".join(rew_parts) if rew_parts else "n/a"
+
+                    # Build per-agent loss summary
+                    loss_parts = []
+                    for ag in ["TTFT", "Carbon", "Water", "Cost"]:
+                        recent = _loss_history[ag][-_window:]
+                        if recent:
+                            loss_parts.append(f"{ag}={np.mean(recent):.4f}")
+                    loss_str = "  ".join(loss_parts) if loss_parts else "n/a"
+
+                    # Buffer sizes
+                    buf_str = ""
+                    if stats:
+                        buf_sizes = [f"{ag}={stats[ag]['buffer_size']}" for ag in ["TTFT", "Carbon", "Water", "Cost"] if ag in stats]
+                        buf_str = f"  buf=[{', '.join(buf_sizes)}]"
+
+                    _log(f"[OFFLINE] Step {train_step + 1:>4}/{len(sampled_epochs)}  "
+                         f"({step_time:.1f}s/step  elapsed={elapsed:.0f}s  eta={eta:.0f}s)  "
+                         f"wkld_epoch={epoch_idx}")
+                    _log(f"         avg_reward: {rew_str}")
+                    _log(f"         avg_loss:   {loss_str}{buf_str}")
+
+                    # Convergence check: compare last window to previous window
+                    if train_step + 1 >= 2 * _window:
+                        converged_agents = 0
+                        for ag in ["TTFT", "Carbon", "Water", "Cost"]:
+                            hist = _reward_history[ag]
+                            if len(hist) >= 2 * _window:
+                                prev_mean = np.mean(hist[-2*_window:-_window])
+                                curr_mean = np.mean(hist[-_window:])
+                                pct_change = abs(curr_mean - prev_mean) / (abs(prev_mean) + 1e-8) * 100
+                                if pct_change < 5.0:
+                                    converged_agents += 1
+                        if converged_agents == 4:
+                            _log(f"[OFFLINE] ★ All 4 agents converged "
+                                 f"(<5% reward change over last {_window} steps)")
+                        elif converged_agents >= 2:
+                            _log(f"[OFFLINE]   {converged_agents}/4 agents converging")
+
+            # Final summary
+            total_time = time.time() - _train_start
+            _log(f"\n[OFFLINE] ═══ Training Summary ═══")
+            _log(f"  Steps: {len(sampled_epochs)}  |  Total time: {total_time:.0f}s  "
+                 f"|  Avg: {total_time/max(1,len(sampled_epochs)):.1f}s/step")
+            for ag in ["TTFT", "Carbon", "Water", "Cost"]:
+                hist = _reward_history[ag]
+                if len(hist) >= _window:
+                    first_w = np.mean(hist[:_window])
+                    last_w  = np.mean(hist[-_window:])
+                    delta   = last_w - first_w
+                    _log(f"  {ag:>8}: reward {first_w:+.3f} → {last_w:+.3f}  "
+                         f"(Δ={delta:+.3f}{'  ✓ improved' if delta > 0 else ''})")
+                elif hist:
+                    _log(f"  {ag:>8}: reward {np.mean(hist):+.3f} (too few steps for trend)")
+
+            _csv_file.close()
+            _log_file.close()
+
+            # Save trained agents
+            os.makedirs(args.model_dir, exist_ok=True)
+            model_path = os.path.join(args.model_dir, "gtarl_agents.pt")
+            FW.save_agents(model_path)
+            print(f"[OFFLINE] Training complete. Agents saved to {model_path}")
+            print(f"[OFFLINE] Logs saved to {log_path}")
+            print(f"[OFFLINE] Metrics CSV saved to {csv_path}")
+            print("[OFFLINE] Exiting after offline training. "
+                  "Use --load-model to run inference with trained agents.")
+            print("[DONE]")
+            exit(0)
 
     for epoch_idx in range(number_of_epoch):
         if epoch_idx not in grouped_trace.groups:
@@ -848,14 +1129,16 @@ if __name__ == "__main__":
             }
         )
 
-        # Parliament returns dict-of-dicts {scheme_name: metrics_dict}.
-        # Extract the Parliament (consensus) metrics for the simulator's
-        # cumulative tracking; other frameworks return a flat metrics dict.
-        if isinstance(stats, dict) and "Parliament" in stats:
-            flat_stats = stats["Parliament"]
-        elif isinstance(stats, dict) and any(isinstance(v, dict) for v in stats.values()):
-            # Fallback: grab the first scheme's metrics
-            flat_stats = next((v for v in stats.values() if isinstance(v, dict)), stats)
+        # GTARL (parliament) returns dict-of-dicts {scheme_name: metrics_dict}.
+        # All other frameworks return a flat metrics dict that may contain nested
+        # dicts like 'by_datacenter' — so we must guard on framework name, not
+        # just on the presence of nested dict values.
+        if framework.lower() == "parliament" and isinstance(stats, dict) and any(isinstance(v, dict) for v in stats.values()):
+            # For parliament: use Balanced if available, else first scheme
+            if "Balanced" in stats:
+                flat_stats = stats["Balanced"]
+            else:
+                flat_stats = next((v for v in stats.values() if isinstance(v, dict)), stats)
         else:
             flat_stats = stats
 
@@ -901,6 +1184,11 @@ if __name__ == "__main__":
     # ── Parliament per-scheme run summary ─────────────────────────────────
     if framework.lower() == "parliament" and hasattr(FW, "print_run_summary"):
         FW.print_run_summary()
+        # Auto-save agents after inference run (enables resume / warm-start)
+        os.makedirs(args.model_dir, exist_ok=True)
+        model_path = os.path.join(args.model_dir, "gtarl_agents.pt")
+        FW.save_agents(model_path)
+        print(f"[MODEL] Agents auto-saved to {model_path}")
 
     print("\n=== Final Report ===")
     print(f"Epochs: {epoch_counter}")

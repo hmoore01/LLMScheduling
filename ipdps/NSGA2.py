@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 import random
 import math
+import gc
 
 import pandas as pd
 
@@ -100,6 +101,13 @@ def _normalize_sim_output(
     )
     stats.setdefault("requests_dropped", float(metrics.get("requests_dropped", 0.0)))
 
+    # Remove any nested-dict fields (e.g. by_datacenter) from the returned stats.
+    # simulator_LLM.py detects Parliament-style multi-scheme output by checking
+    # whether any value in the stats dict is itself a dict. If by_datacenter is
+    # present it triggers that check, causing the caller to treat per-DC utilization
+    # dicts as the metrics and read all scalar fields as zero.
+    stats = {k: v for k, v in stats.items() if not isinstance(v, dict)}
+
     if not isinstance(details, list):
         details = []
 
@@ -144,7 +152,7 @@ def _build_power_plan(
             if idx < idle_types:
                 dc_power[nt] = "IDLE"
             else:
-                dc_power[nt] = "OFF"
+                dc_power[nt] = "ON"
         power_plan[int(dc)] = {"unit": dc_power}
 
     return power_plan
@@ -325,6 +333,7 @@ class NSGA2:
         """
 
         # 0) Normalize epoch rows to ensure required columns exist
+        print(f"[NSGA2] milp_optimizer called: epoch={epoch_idx}, rows={len(epoch_data) if hasattr(epoch_data, '__len__') else '?'}")
         if hasattr(epoch_data, "iterrows") and hasattr(epoch_data, "columns"):
             df = _ensure_epoch_columns(epoch_data, DEFAULT_EPOCH_LEN)
         else:
@@ -383,7 +392,6 @@ class NSGA2:
 
         # 2) Build simulator and discover DCs
         try:
-            # Read spec_dir from epoch_summary if available
             if isinstance(epoch_summary, dict):
                 spec_dir = epoch_summary.get("spec_dir", "sim_specs")
                 epoch_len = int(epoch_summary.get("epoch_length", DEFAULT_EPOCH_LEN))
@@ -391,20 +399,14 @@ class NSGA2:
                 spec_dir = "sim_specs"
                 epoch_len = DEFAULT_EPOCH_LEN
 
-            sim = LLM_Simulator(
-                spec_dir=spec_dir,
-                epoch_length=epoch_len,
-                debug=False,
-            )
-            dcs = sorted(int(dc_id) for dc_id in sim.datacenters.keys())
+            _discovery_sim = LLM_Simulator(
+                spec_dir=spec_dir, epoch_length=epoch_len, debug=False)
+            dcs = sorted(int(dc_id) for dc_id in _discovery_sim.datacenters.keys())
+            del _discovery_sim
         except Exception:
-            # Fallback: infer DCs from epoch_data if something goes really wrong
+            spec_dir = "sim_specs"
+            epoch_len = DEFAULT_EPOCH_LEN
             dcs = sorted(df["source_dc_id"].unique().astype(int).tolist() or [0])
-            sim = LLM_Simulator(
-                spec_dir="sim_specs",
-                epoch_length=DEFAULT_EPOCH_LEN,
-                debug=False,
-            )
 
         if not dcs:
             dcs = [0]
@@ -413,12 +415,13 @@ class NSGA2:
         num_dcs = len(dcs)
         gene_length = num_pairs * num_dcs
 
-        # 3) NSGA-II hyperparameters (tweak directly in this file if desired)
-        pop_size = 16
-        generations = 8
+        # 3) NSGA-II hyperparameters
+        # pop_size=4, generations=1 → 8 search evals + 1 final = 9 sim calls
+        pop_size = 4
+        generations = 1
         crossover_prob = 0.9
-        mutation_prob = 0.1
-        mutation_sigma = 0.1
+        mutation_prob = 0.15
+        mutation_sigma = 0.15
 
         # Deterministic seed per epoch
         random.seed(12345 + int(epoch_idx))
@@ -430,14 +433,43 @@ class NSGA2:
             else list(DEFAULT_NODE_TYPES)
         )
 
-        # ----- Helper: gene -> (routed_tokens_by_dc, power_plan, requests_df, schedule_plan) -----
+        # ----- Helper: gene -> (power_plan, requests_df, schedule_plan) -----
+        # Pre-build the requests DataFrame ONCE — the request data (source_dc,
+        # model, tokens, arrival_ms) never changes between evaluations.  Only
+        # the routing assignment (plan_map) changes based on the gene.
+        import numpy as np
+
+        FIXED_VARIANT = "_FP16 (Base)_B16"
+        _src_dc_arr = df["source_dc_id"].values.astype(int)
+        _model_arr  = df["model_type"].values.astype(str)
+        _tokens_arr = df["num_tokens"].values.astype(float).clip(min=0)
+        _arrival_arr = df["arrival_ms"].values.astype(float)
+
+        # Build the shared requests DataFrame once
+        _requests_df = pd.DataFrame({
+            "source_dc": _src_dc_arr,
+            "model": [f"{m}{FIXED_VARIANT}" for m in _model_arr],
+            "arrival_ms": _arrival_arr,
+            "tokens": _tokens_arr.astype(int),
+        })
+
+        # Pre-compute per-row pair index for vectorized plan_map construction
+        # Map each (src_dc, model) pair to its index in `pairs`
+        _pair_to_idx = {(src_dc, model): idx for idx, (src_dc, model, _) in enumerate(pairs)}
+        _row_pair_idx = np.full(len(df), -1, dtype=int)
+        for row_i in range(len(df)):
+            key = (int(_src_dc_arr[row_i]), str(_model_arr[row_i]))
+            _row_pair_idx[row_i] = _pair_to_idx.get(key, -1)
+
+        # Default DC for rows with no routing info
+        _default_dc = int(dcs[0])
+        _dcs_arr = np.array(dcs, dtype=int)
+
         def build_plans_from_gene(gene: List[float]):
-            # Normalize per-pair blocks to fractions and accumulate DC loads
             routed_tokens_by_dc: Dict[int, float] = {int(dc): 0.0 for dc in dcs}
 
-            # Per-(src,model) → {dc: frac}
-            frac_plan: Dict[Tuple[int, str], Dict[int, float]] = {}
-
+            # Decode gene into per-pair fractions and find argmax DC per pair
+            pair_best_dc = np.empty(num_pairs, dtype=int)
             for p_idx, (src_dc, model, tokens) in enumerate(pairs):
                 start = p_idx * num_dcs
                 end = start + num_dcs
@@ -449,16 +481,11 @@ class NSGA2:
                 else:
                     block = [x / s for x in block]
 
-                key = (src_dc, model)
-                dmap: Dict[int, float] = {}
+                best_j = max(range(num_dcs), key=lambda j: (block[j], -dcs[j]))
+                pair_best_dc[p_idx] = int(dcs[best_j])
+
                 for j, dc in enumerate(dcs):
-                    frac = block[j]
-                    if frac <= 0.0:
-                        continue
-                    d_id = int(dc)
-                    dmap[d_id] = frac
-                    routed_tokens_by_dc[d_id] += tokens * frac
-                frac_plan[key] = dmap
+                    routed_tokens_by_dc[int(dc)] += tokens * block[j]
 
             power_plan = _build_power_plan(
                 routed_tokens_by_dc=routed_tokens_by_dc,
@@ -466,65 +493,56 @@ class NSGA2:
                 all_dcs=[int(dc) for dc in dcs],
             )
 
-            # Per-request mapping: preserve original arrivals/tokens, routed by argmax fraction.
-            req_rows: List[Dict[str, Any]] = []
+            # Vectorized plan_map: look up each row's pair → argmax DC
             plan_map: Dict[int, int] = {}
-            FIXED_VARIANT = "_FP16 (Base)_B16"
-            for row_idx, row in enumerate(df.itertuples(index=False)):
-                src_dc = int(getattr(row, "source_dc_id"))
-                model = str(getattr(row, "model_type"))
-                arrival_ms = float(getattr(row, "arrival_ms"))
-                tokens = int(max(0.0, round(float(getattr(row, "num_tokens")))))
-
-                choices = frac_plan.get((src_dc, model), {})
-                if choices:
-                    best_j = max(
-                        range(num_dcs),
-                        key=lambda j: (float(choices.get(int(dcs[j]), 0.0)), -int(dcs[j])),
-                    )
-                    tgt_dc = int(dcs[best_j])
+            for row_i in range(len(df)):
+                p_idx = _row_pair_idx[row_i]
+                if p_idx >= 0:
+                    plan_map[row_i] = int(pair_best_dc[p_idx])
                 else:
-                    tgt_dc = src_dc if src_dc in dcs_set else int(dcs[0])
+                    src = int(_src_dc_arr[row_i])
+                    plan_map[row_i] = src if src in dcs_set else _default_dc
 
-                full_model = f"{model}{FIXED_VARIANT}"
-                req_rows.append(
-                    {
-                        "source_dc": src_dc,
-                        "model": full_model,
-                        "arrival_ms": arrival_ms,
-                        "tokens": tokens,
-                    }
-                )
-                plan_map[row_idx] = int(tgt_dc)
-
-            requests_df = pd.DataFrame(req_rows)
             schedule_plan = {"map": plan_map}
-            return power_plan, requests_df, schedule_plan
+            return power_plan, _requests_df, schedule_plan
 
         # ----- Helper: evaluate individual (fills objs) -----
         def evaluate(ind: _Individual) -> None:
             if ind.objs is not None:
                 return
             power_plan, requests_df, schedule_plan = build_plans_from_gene(ind.gene)
-            metrics, _, _ = sim.run_epoch(
+            # Fresh simulator per evaluation — reusing a single instance causes
+            # progressive slowdown as internal state accumulates across run_epoch calls
+            eval_sim = LLM_Simulator(spec_dir=spec_dir, epoch_length=epoch_len, debug=False)
+            metrics, _, _ = eval_sim.run_epoch(
                 epoch_idx, requests_df, schedule_plan, power_plan
             )
+            del eval_sim
             avg_ttft = float(metrics.get("avg_ttft", metrics.get("avg_ttft_sec", 0.0)))
             carbon = float(metrics.get("carbon_emissions", 0.0))
             water = float(metrics.get("water_usage", 0.0))
             cost = float(metrics.get("energy_cost", 0.0))
             ind.objs = (avg_ttft, carbon, water, cost)
 
-        # ----- Initialize population -----
+        # ----- Initialize population with smart seeds -----
         population: List[_Individual] = []
 
-        # Seed 1: uniform distribution across DCs
-        base_gene: List[float] = []
-        for _ in range(num_pairs):
-            base_gene.extend([1.0 / float(num_dcs)] * num_dcs)
-        population.append(_Individual(base_gene))
+        # Seed 1: route to source DC (locality-first)
+        src_gene: List[float] = []
+        for (src_dc, model, tokens) in pairs:
+            block = [0.0] * num_dcs
+            if src_dc in dcs_set:
+                block[dcs.index(src_dc)] = 1.0
+            else:
+                block = [1.0 / float(num_dcs)] * num_dcs
+            src_gene.extend(block)
+        population.append(_Individual(src_gene))
 
-        # Rest: random feasible genes
+        # Seed 2: uniform distribution
+        uni_gene: List[float] = [1.0 / float(num_dcs)] * gene_length
+        population.append(_Individual(uni_gene))
+
+        # Seeds 3+: random feasible genes
         while len(population) < pop_size:
             gene: List[float] = []
             for _ in range(num_pairs):
@@ -592,6 +610,7 @@ class NSGA2:
                 if len(new_pop) >= pop_size:
                     break
             population = new_pop
+            gc.collect()  # Free sim instances and discarded individuals
 
         # ----- Final selection from first front -----
         fronts = _non_dominated_sort(population)
@@ -621,13 +640,61 @@ class NSGA2:
 
         best = population[best_idx]
 
-        # ----- Rebuild plans for the best individual and run once more to collect details -----
+        # ----- Execute ALL Pareto front members on fresh simulators -----
+        # The search-phase objectives are from a reused sim (potentially stale).
+        # Re-execute each front member to get clean metrics for PHV computation.
+        front_results = []
+        for fi, front_idx in enumerate(first_front):
+            ind = population[front_idx]
+            front_sim = LLM_Simulator(spec_dir=spec_dir, epoch_length=epoch_len, debug=False)
+            pp, rdf, sp = build_plans_from_gene(ind.gene)
+            fm, _, _ = front_sim.run_epoch(epoch_idx, rdf, sp, pp)
+            front_metrics = {
+                "avg_ttft": float(fm.get("avg_ttft", fm.get("avg_ttft_sec", 0.0))),
+                "carbon_emissions": float(fm.get("carbon_emissions", 0.0)),
+                "water_usage": float(fm.get("water_usage", 0.0)),
+                "energy_cost": float(fm.get("energy_cost", 0.0)),
+            }
+            front_results.append(front_metrics)
+            del front_sim
+            # Parseable line for PHV extraction from logs
+            print(f"[NSGA2-FRONT] epoch={epoch_idx} member={fi} "
+                  f"ttft={front_metrics['avg_ttft']:.6f} "
+                  f"carbon={front_metrics['carbon_emissions']:.4f} "
+                  f"water={front_metrics['water_usage']:.4f} "
+                  f"cost={front_metrics['energy_cost']:.4f}")
+
+        print(f"[NSGA2] Epoch {epoch_idx}: Pareto front has {len(front_results)} "
+              f"members (all re-executed on fresh sims)")
+
+        # Use the "best" individual's results as the primary return
+        best_fm = front_results[first_front.index(best_idx)] if best_idx in first_front \
+                  else front_results[0]
+
+        # But also run the best on a fully fresh sim for the detailed results
+        reporting_sim = LLM_Simulator(spec_dir=spec_dir, epoch_length=epoch_len, debug=False)
         power_plan, requests_df, schedule_plan = build_plans_from_gene(best.gene)
-        metrics, details, leftovers = sim.run_epoch(
+        metrics, details, leftovers = reporting_sim.run_epoch(
             epoch_idx, requests_df, schedule_plan, power_plan
         )
+        print(f"[NSGA2] Epoch {epoch_idx}: best -> ttft={metrics.get('avg_ttft',0):.4f}s  "
+              f"carbon={metrics.get('carbon_emissions',0):.1f}  "
+              f"cost={metrics.get('energy_cost',0):.2f}  "
+              f"completed={metrics.get('requests_completed',0)}")
 
         stats, results, leftovers_norm = _normalize_sim_output(
             (metrics, details, leftovers)
         )
+
+        # Attach front results for downstream PHV computation
+        stats["pareto_front"] = [
+            (fr["avg_ttft"], fr["carbon_emissions"], fr["water_usage"], fr["energy_cost"])
+            for fr in front_results
+        ]
+
+        # Aggressive cleanup — prevent cross-epoch memory accumulation
+        del reporting_sim, population, best, _requests_df
+        del _src_dc_arr, _model_arr, _tokens_arr, _arrival_arr, _row_pair_idx
+        gc.collect()
+
         return stats, results, leftovers_norm
