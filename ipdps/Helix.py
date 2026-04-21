@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 import pandas as pd
 
-from Rate_Flow_Sim import LLM_Simulator
+from Rate_Flow_Sim_v2 import LLM_Simulator
 
 # -----------------------------
 # Defaults / knobs

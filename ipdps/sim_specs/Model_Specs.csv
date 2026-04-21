@@ -1,0 +1,7 @@
+Model_Name,Head,Layers,Dimension,Parameters,Parameter_Mem,Mem_per_Token,Architecture
+Llama7b,32,32,4096,7B,13,0.000262,
+Llama70b,64,80,8192,70B,138,0.00131,
+Llama2_70B,64,80,8192,70B,138,0.00131,
+Llama31_405B,128,126,16384,405B,810,0.00524,
+Mixtral_8x7B,32,32,4096,46.7B,93,0.00089,MoE_8x7B
+DeepSeek_R1,128,61,7168,671B,1342,0.00915,MoE_256x8B

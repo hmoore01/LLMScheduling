@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import random
 import collections
-import Rate_Flow_Sim
+import Rate_Flow_Sim_v2 as Rate_Flow_Sim
 
 REPLAY_BUFFER_MAXLEN = 10_000
 FIXED_VARIANT = "_FP16 (Base)_B16"

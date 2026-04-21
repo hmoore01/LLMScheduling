@@ -10,7 +10,7 @@ import hashlib
 import os
 import gc
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import Rate_Flow_Sim
+import Rate_Flow_Sim_v2 as Rate_Flow_Sim
 import threading
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1200,7 +1200,7 @@ def get_rich_state(sim, dc_ids, epoch_data, epoch_idx: int) -> np.ndarray:
     n_reqs = len(epoch_data) if epoch_data is not None else 0
 
     try:
-        epoch_len = float(next(iter(sim.datacenters.values()))._epoch_length_s)
+        epoch_len = float(next(iter(sim.datacenters.values()))._epoch_len_s)
     except Exception:
         epoch_len = 900.0
 
@@ -1252,7 +1252,7 @@ def get_rich_state(sim, dc_ids, epoch_data, epoch_idx: int) -> np.ndarray:
             # Without PUE, MinCost routes to the cheapest $/kWh DC even if its
             # PUE is so high that actual energy cost (tokens × energy × PUE × price)
             # is more expensive than a slightly pricier DC with lower PUE.
-            pue  = float(getattr(dc, 'pue', getattr(dc, 'power_usage_effectiveness', 1.0)))
+            pue  = float(getattr(dc, 'pue_value', getattr(dc, 'pue', 1.0)))
             cost = cost * max(pue, 1.0)   # multiply in-place; floor PUE at 1.0
 
         # Per-DC load: fraction of total epoch requests originating from this DC,

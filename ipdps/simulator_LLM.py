@@ -92,14 +92,33 @@ def condor_optimizer(epoch_data, epoch_idx: int, node_properties: Dict[str, Any]
 
 
 def _map_model_to_llama(m: str) -> str:
-    s = str(m).strip().lower()
-    if ("chatgpt" in s) or ("gpt-3.5" in s) or ("gpt3.5" in s):
+    """
+    Normalize a raw model-type string to a v2 simulator base model name.
+
+    If the string is already a recognized v2 base model (e.g. 'Llama7b',
+    'Mixtral_8x7B', 'Llama70b') it is returned unchanged — this preserves
+    the richer vocabulary output by BurstGPT_process.py v2.
+
+    Legacy BurstGPT raw names (ChatGPT, GPT-4) are still mapped for backward
+    compatibility with older trace files.
+    """
+    s = str(m).strip()
+    s_lower = s.lower()
+
+    # Already a recognized v2 base model — preserve as-is
+    _V2_BASES = ("Llama7b", "Llama70b", "Llama2_70B", "Llama31_405B",
+                 "Mixtral_8x7B", "DeepSeek_R1")
+    if s.startswith(_V2_BASES):
+        return s
+
+    # Legacy BurstGPT raw names
+    if ("chatgpt" in s_lower) or ("gpt-3.5" in s_lower) or ("gpt3.5" in s_lower):
         return "Llama7b"
-    if ("gpt-4" in s) or ("gpt4" in s):
+    if ("gpt-4" in s_lower) or ("gpt4" in s_lower):
         return "Llama70b"
-    if "70" in s or "70b" in s or "llama-2-70b" in s or "llama2-70b" in s:
+    if "70" in s_lower or "70b" in s_lower or "llama-2-70b" in s_lower:
         return "Llama70b"
-    if "7" in s or "7b" in s or "llama-2-7b" in s or "llama2-7b" in s:
+    if "7" in s_lower or "7b" in s_lower or "llama-2-7b" in s_lower:
         return "Llama7b"
     return str(m)
 
@@ -152,20 +171,14 @@ def _time_based_src_dc(df: pd.DataFrame, num_dcs: int, timezone_offsets: dict = 
 
 def _select_diverse_dcs(num_dcs: int, spec_dir: str = "sim_specs") -> list:
     """
-    Select `num_dcs` datacenters from the simulator's full roster, keeping the
-    most extreme (best) DC on each metric dimension to maximise differentiation.
+    Select `num_dcs` datacenters from the v2 simulator's full roster, keeping
+    the most extreme (best) DC on each metric dimension to maximise diversity.
 
-    Strategy:
-      1. Probe the simulator for all DC characteristics (carbon, cost, PUE).
-      2. For each metric, mark the DC with the best (lowest) value as "must-keep".
-      3. Fill remaining slots by maximising diversity (farthest-first from kept set).
-      4. Return sorted list of selected DC IDs.
-
-    If the simulator cannot be probed (e.g. Rate_Flow_Sim not available), falls
-    back to range(num_dcs).
+    Uses Rate_Flow_Sim_v2.  Falls back to range(num_dcs) if the simulator
+    cannot be probed.
     """
     try:
-        from Rate_Flow_Sim import LLM_Simulator
+        from Rate_Flow_Sim_v2 import LLM_Simulator
         sim = LLM_Simulator(debug=False, spec_dir=spec_dir)
         all_dc_ids = sorted(int(d) for d in sim.datacenters.keys())
         n_total = len(all_dc_ids)
@@ -175,14 +188,12 @@ def _select_diverse_dcs(num_dcs: int, spec_dir: str = "sim_specs") -> list:
     if num_dcs >= n_total:
         return all_dc_ids[:num_dcs]
 
-    # Extract per-DC feature vectors [carbon, effective_cost, pue]
+    # Feature vectors: [carbon_intensity, effective_cost, wue_l_per_kwh]
     features = {}
     for dc_id in all_dc_ids:
         dc = sim.datacenters[dc_id]
         ci = float(getattr(dc, 'carbon_intensity_g_per_kwh', 400.0))
 
-        # Average TOU price across hours as electricity cost baseline.
-        # Handle numpy arrays, lists, and tuples (isinstance misses numpy).
         tou = getattr(dc, 'tou_price', None)
         if tou is not None and hasattr(tou, '__len__') and len(tou) > 0:
             mean_tou = float(np.mean(tou))
@@ -191,46 +202,36 @@ def _select_diverse_dcs(num_dcs: int, spec_dir: str = "sim_specs") -> list:
         else:
             mean_tou = 0.10
 
-        # Bug fix: read PUE with the same attribute chain used in get_rich_state.
-        # The old code used 'pue_value' which doesn't exist on DC objects —
-        # every DC silently returned the 1.18 default, collapsing the PUE
-        # dimension to a flat line and making diversity selection ignore it.
-        pue = float(getattr(dc, 'pue',
-                    getattr(dc, 'power_usage_effectiveness',
-                    getattr(dc, 'pue_value', 1.18))))
+        # v2 sim exposes pue_value directly
+        pue = float(getattr(dc, 'pue_value', 1.18))
 
-        # Bug fix: cost proxy must be mean_tou * PUE, not mean_tou alone.
-        # Actual energy bill = tokens * energy_per_token * PUE * tou_price.
-        # Using raw tou_price as the cost anchor selects the cheapest
-        # electricity DC, which may have a PUE so high it is actually the
-        # most expensive DC to run workloads on.  Multiplying by PUE makes
-        # the selection metric match what the simulator will charge.
+        # v2 sim's Water Usage Effectiveness (L/kWh IT) — lower is better.
+        # Falls back to a PUE-derived proxy if the attribute is absent.
+        wue = float(getattr(dc, 'wue_l_per_kwh', pue * 0.8))
+
+        # Cost = tou * PUE so cooling overhead is baked in
         effective_cost = mean_tou * max(pue, 1.0)
 
-        features[dc_id] = np.array([ci, effective_cost, pue])
+        features[dc_id] = np.array([ci, effective_cost, wue])
 
-    # Step 1: find the extreme (best = lowest) DC for each metric
+    # Must-keep: one DC with the best value on each metric dimension
     selected = set()
-    metric_names = ["carbon", "cost", "PUE/water"]
+    metric_names = ["carbon", "cost", "water"]
     for dim in range(3):
-        best_dc = min(all_dc_ids, key=lambda d: features[d][dim])
-        selected.add(best_dc)
+        selected.add(min(all_dc_ids, key=lambda d: features[d][dim]))
 
-    # Step 2: farthest-first fill to maximise diversity
-    # Normalise features to [0,1] so all dimensions contribute equally
-    feat_matrix = np.array([features[d] for d in all_dc_ids])
-    mins = feat_matrix.min(axis=0)
-    maxs = feat_matrix.max(axis=0)
-    ranges = np.where(maxs - mins > 1e-9, maxs - mins, 1.0)
+    # Farthest-first diversity fill
+    feat_matrix  = np.array([features[d] for d in all_dc_ids])
+    mins         = feat_matrix.min(axis=0)
+    maxs         = feat_matrix.max(axis=0)
+    ranges       = np.where(maxs - mins > 1e-9, maxs - mins, 1.0)
     norm_features = {d: (features[d] - mins) / ranges for d in all_dc_ids}
 
     while len(selected) < num_dcs:
-        best_candidate = None
-        best_min_dist = -1.0
+        best_candidate, best_min_dist = None, -1.0
         for d in all_dc_ids:
             if d in selected:
                 continue
-            # Minimum distance to any already-selected DC
             min_dist = min(
                 float(np.linalg.norm(norm_features[d] - norm_features[s]))
                 for s in selected
@@ -238,16 +239,14 @@ def _select_diverse_dcs(num_dcs: int, spec_dir: str = "sim_specs") -> list:
             if min_dist > best_min_dist:
                 best_min_dist = min_dist
                 best_candidate = d
-        if best_candidate is not None:
-            selected.add(best_candidate)
-        else:
+        if best_candidate is None:
             break
+        selected.add(best_candidate)
 
     result = sorted(selected)
 
-    # Print the selection with characteristics
     print(f"[DC-SELECT] Chose {len(result)} of {n_total} DCs for max diversity:")
-    print(f"  {'DC':>4}  {'Carbon':>8}  {'EffCost':>8}  {'PUE':>6}  {'Reason'}")
+    print(f"  {'DC':>4}  {'Carbon':>8}  {'EffCost':>8}  {'WUE(L/kWh)':>10}  {'Reason'}")
     extremes = {}
     for dim, mname in enumerate(metric_names):
         best = min(result, key=lambda d: features[d][dim])
@@ -256,7 +255,7 @@ def _select_diverse_dcs(num_dcs: int, spec_dir: str = "sim_specs") -> list:
     for d in result:
         f = features[d]
         reason = ", ".join(extremes.get(d, ["diversity fill"]))
-        print(f"  {d:>4}  {f[0]:>8.1f}  {f[1]:>8.4f}  {f[2]:>6.3f}  {reason}")
+        print(f"  {d:>4}  {f[0]:>8.1f}  {f[1]:>8.4f}  {f[2]:>10.3f}  {reason}")
 
     del sim
     return result
@@ -628,6 +627,9 @@ if __name__ == "__main__":
 
     if "model_type" not in trace.columns: trace["model_type"] = "Llama7b"
     trace["model_type"] = trace["model_type"].astype(str).map(_map_model_to_llama)
+    # Preserve scenario column if present (output by BurstGPT_process v2)
+    if "scenario" not in trace.columns:
+        trace["scenario"] = "Chat"   # safe default for legacy traces
     trace["num_tokens"] = _ensure_num_tokens(trace, default_tokens=400)
     if "time_index" not in trace.columns: trace["time_index"] = 0
     trace["arrival_ms"] = _derive_arrival_ms(trace, epoch_length_s=900)
@@ -720,7 +722,7 @@ if __name__ == "__main__":
             f"search_steps={int(getattr(args, 'autoscale_search_steps', AUTOSCALE_SEARCH_STEPS))}, "
             f"max_rows={int(getattr(args, 'autoscale_max_rows', AUTOSCALE_MAX_EXPANDED_ROWS))}"
         )
-        from Rate_Flow_Sim import LLM_Simulator
+        from Rate_Flow_Sim_v2 import LLM_Simulator
         autoscale_dry_sim = LLM_Simulator(debug=False, spec_dir=args.spec_dir)
         if autoscale_mode == "global_peak":
             global_autoscale_plan = _build_global_peak_plan(
@@ -1020,7 +1022,7 @@ if __name__ == "__main__":
                     print(f"  [Auto-Scale] Dry-running Epoch {epoch_idx} to calculate target multiplier...")
                     dry_sim = autoscale_dry_sim
                     if dry_sim is None:
-                        from Rate_Flow_Sim import LLM_Simulator
+                        from Rate_Flow_Sim_v2 import LLM_Simulator
                         dry_sim = LLM_Simulator(debug=False, spec_dir=args.spec_dir)
                         autoscale_dry_sim = dry_sim
 
@@ -1171,7 +1173,7 @@ if __name__ == "__main__":
             cumulative_ttft_weight += req_weight
 
         cumulative_carbon += float(flat_stats.get("carbon_emissions", 0.0)) / 1000.0
-        cumulative_water += float(flat_stats.get("water_usage", 0.0)) / 100
+        cumulative_water  += float(flat_stats.get("water_usage", 0.0))   # v2 sim: native m³
         cumulative_energy += float(flat_stats.get("energy_cost", 0.0))
         cumulative_total_energy += float(flat_stats.get('total_energy', 0.0))
 
@@ -1192,16 +1194,16 @@ if __name__ == "__main__":
 
     print("\n=== Final Report ===")
     print(f"Epochs: {epoch_counter}")
-    print(f"Average TTFT (s): {final_avg_ttft:.6f}")
-    print(f"Total Carbon (kg): {cumulative_carbon:.3f}")
-    print(f"Total Water (L): {cumulative_water:.3f}")
-    print(f"Total Energy ($): {cumulative_energy:.3f}")
-    print(f"Total Energy (kWh): {cumulative_total_energy:.3f}")
+    print(f"Average TTFT (s):    {final_avg_ttft:.6f}")
+    print(f"Total Carbon (kg):   {cumulative_carbon:.3f}")
+    print(f"Total Water (m³):    {cumulative_water:.4f}")
+    print(f"Total Energy ($):    {cumulative_energy:.3f}")
+    print(f"Total Energy (kWh):  {cumulative_total_energy:.3f}")
 
     if framework.lower() == "lahyper" and lahyper_scheme_sums:
         print("\n=== LA_HYPER MULTI-AGENT SUMMARY (Run Totals) ===")
         # [FIX] Table formatted to indicate Summation
-        header = f"{'Mode':<18} | {'Avg TTFT(s)':<11} | {'Total Carb(kg)':<14} | {'Total Wat(L)':<12} | {'Total Cost($)':<13} | {'Total Energy(kWh)'}"
+        header = f"{'Mode':<18} | {'Avg TTFT(s)':<11} | {'Total Carb(kg)':<14} | {'Total Wat(m³)':<13} | {'Total Cost($)':<13} | {'Total Energy(kWh)'}"
         print(header)
         print("-" * len(header))
 

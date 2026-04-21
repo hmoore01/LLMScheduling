@@ -4,7 +4,7 @@ import torch.optim as optim
 import torch.nn.functional as F
 import pandas as pd
 import numpy as np
-import Rate_Flow_Sim
+import Rate_Flow_Sim_v2 as Rate_Flow_Sim
 
 FIXED_VARIANT = "_FP16 (Base)_B16"
 DEFAULT_NODE_TYPES = [0, 1, 2, 3, 4, 5]

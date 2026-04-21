@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-import Rate_Flow_Sim
+import Rate_Flow_Sim_v2 as Rate_Flow_Sim
 
 GAMMA = 0.9
 THETA_DEFAULT = 0.87

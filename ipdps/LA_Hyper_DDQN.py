@@ -1,5 +1,6 @@
 """
-LA_Hyper_DDQN.py  —  Offline-Online Hybrid PSL-MORL Framework
+LA_Hyper_GPCH.py  —  Gradient-Projected Constrained Hypernetwork (GPCH)
+                      Offline-Online Hybrid C-MORL Framework  ·  v2
 ═══════════════════════════════════════════════════════════════════════════════
 
 Architecture overview
@@ -8,40 +9,34 @@ This framework separates learning into two distinct phases that run every epoch:
 
   OFFLINE BASE (OfflineBaseAgent)
   ─────────────────────────────────
-  • Large Transformer actor + critic (hidden_dim=128, n_layers=3, n_heads=4).
-  • Trained with GAMMA=0.9 and full target networks — temporal credit
-    assignment is active and meaningful here because the offline buffer
-    accumulates transitions from many epochs, giving the network a genuine
-    multi-step value signal to bootstrap from.
-  • Persistent cross-epoch replay buffer (OFFLINE_MEMORY_SIZE=100k).
-    Transitions from both the online exploration and exploitation phases are
-    pushed here, so the offline model continuously learns from a growing,
-    diverse experience set.
-  • Offline training runs concurrently with the exploitation parallel
-    evaluation (ThreadPoolExecutor I/O), hiding most of its wall-clock cost.
+  • Graph Attention Network (GAT) actor + CriticEnsemble (K=5 critics).
+    The GAT encoder biases attention by inter-DC network proximity derived
+    from the live latency matrix, giving the model explicit topology awareness.
+  • FOMAML meta-learning: the offline actor is trained not just for asymptotic
+    performance but to produce weights that are positioned for fast online
+    adaptation.  Inner loop simulates K online gradient steps on a support
+    batch; outer loop (meta-loss) runs on a held-out query batch.
+  • Ensemble critics (K=5): epistemic uncertainty over Q-values, used for
+    gradient computation and Pareto confidence reporting.
+  • Prioritized replay weighted by gradient projection magnitude: transitions
+    near the constraint boundary are replayed more often.
+  • GAMMA=0.9, soft target-network updates.
 
   ONLINE ADAPTER (OnlineAdapterAgent)
   ────────────────────────────────────
-  • Identical architecture but initialized from offline weights at the start
-    of every epoch (a direct weight copy, not distillation).
-  • Adapted with GAMMA=0.0 (contextual bandit) — no target networks needed —
-    so each gradient step is fast and converges quickly to current conditions.
-  • Small per-epoch buffer (ONLINE_MEMORY_SIZE=5k) is cleared each epoch;
-    the adapter only sees the current epoch's data, giving it strong
-    inductive bias toward the present state without being contaminated by
-    stale history.
-  • ONLINE_OPTIM_STEPS=200 sim calls × ONLINE_GRAD_STEPS_PER_ENV=4 =
-    800 online gradient steps, keeping wall-clock cost firmly in budget.
+  • Identical GAT architecture warm-started from offline weights each epoch.
+  • Contextual bandit (GAMMA=0.0); actor update uses counterfactual credit
+    assignment — per-DC advantages are computed via a single batched critic
+    call over N counterfactual actions, giving cleaner per-DC gradient signal.
+  • Gradient-projected constraint enforcement (§2.4) applied to both agents.
 
-  SEPARATION OF CONCERNS
-  ──────────────────────
-  The offline model answers: "What is the generally optimal policy for this
-  DC topology, given the full history of conditions?"
-  The online adapter answers: "Given the offline prior, how should I adjust
-  for the specific carbon intensities, TOU prices, and traffic load right now?"
-
-  This is analogous to a pre-trained foundation model (offline) being
-  fine-tuned on a specific downstream task (online).
+  CONSTRAINT-AWARE PARETO FRONT (§3)
+  ────────────────────────────────────
+  • Preference cloud oversamples near constraint-active regions using
+    historical violation rates tracked across epochs.
+  • A priori constraint bounding (§3.2) prunes infeasible candidates before
+    non-domination sorting.
+  • Secondary farthest-point sampling in objective space for spread.
 
 Wall-clock budget (15 min / epoch)
 ────────────────────────────────────
@@ -53,6 +48,11 @@ Wall-clock budget (15 min / epoch)
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
+
+from __future__ import annotations
+
+
+import collections
 import copy
 import hashlib
 import math
@@ -67,7 +67,7 @@ import torch.nn as nn
 import torch.optim as optim
 from tqdm import tqdm
 
-import Rate_Flow_Sim
+import Rate_Flow_Sim_v2 as Rate_Flow_Sim
 
 # ── CONFIGURATION ─────────────────────────────────────────────────────────────
 # Sim / action space
@@ -81,37 +81,49 @@ ONLINE_OPTIM_STEPS        = 200   # sim calls per epoch
 ONLINE_GRAD_STEPS_PER_ENV = 4     # 200 × 4 = 800 online gradient steps
 ONLINE_BATCH_SIZE         = 64
 ONLINE_MEMORY_SIZE        = 5_000
-ONLINE_LR_ACTOR           = 3e-4  # slightly higher LR for fast adaptation
+ONLINE_LR_ACTOR           = 3e-4
 ONLINE_LR_CRITIC          = 6e-4
 GAMMA_ONLINE              = 0.0   # contextual bandit; no target networks needed
 
 # Offline base (thorough, temporal credit assignment)
-OFFLINE_GRAD_STEPS        = 350   # gradient steps; runs during exploitation eval
-OFFLINE_BATCH_SIZE        = 128   # larger batches for offline stability
+OFFLINE_GRAD_STEPS        = 350
+OFFLINE_BATCH_SIZE        = 128
 OFFLINE_MEMORY_SIZE       = 100_000
-OFFLINE_LR_ACTOR          = 5e-5  # conservative LR; offline model should be stable
+OFFLINE_LR_ACTOR          = 5e-5
 OFFLINE_LR_CRITIC         = 1e-4
-GAMMA_OFFLINE             = 0.9   # full Bellman bootstrapping
-TAU_OFFLINE               = 0.005  # soft target-update coefficient
+GAMMA_OFFLINE             = 0.9
+TAU_OFFLINE               = 0.005
 
-# Transformer dimensions
-HIDDEN_DIM_OFFLINE = 128    # offline: 3-layer Transformer
+# GAT / Transformer dimensions (shared by both agents)
+HIDDEN_DIM_OFFLINE = 128
 N_LAYERS_OFFLINE   = 3
-HIDDEN_DIM_ONLINE  = 128    # online adapter: 2-layer Transformer (same width, fewer layers)
+HIDDEN_DIM_ONLINE  = 128
 N_LAYERS_ONLINE    = 2
-N_HEADS            = 4      # shared; must divide hidden_dim evenly
+N_HEADS            = 4      # must divide hidden_dim evenly
+
+# FOMAML meta-learning (offline agent)
+MAML_INNER_LR    = 3e-4    # inner-loop SGD learning rate
+MAML_INNER_STEPS = 3       # K inner gradient steps on support set
+
+# Ensemble critics (offline agent)
+N_CRITICS        = 5       # epistemic uncertainty over Q-values
+
+# Counterfactual credit assignment (online adapter)
+CF_CREDIT_ALPHA  = 0.4     # weight of advantage-weighted term in actor loss
+
+# Prioritized replay (offline buffer)
+PRIORITY_ALPHA     = 0.6   # prioritization exponent
+PRIORITY_BETA_INIT = 0.4   # IS correction exponent (annealed toward 1.0)
+PRIORITY_EPS       = 1e-6  # floor to prevent zero priority
 
 # Exploration
 NOISE_INIT  = 0.5
 NOISE_FLOOR = 0.10
-NOISE_DECAY = 0.9975   # per online gradient step; 800 steps → approaches floor near epoch end
+NOISE_DECAY = 0.9975
 
-REWARD_CLIP = 5.0    # clip raw (pre-0.01-scale) reward to ±5 before buffer push
+REWARD_CLIP = 5.0
 
 # Per-DC-node-type request capacity.
-# Calibrated to auto-scale prediction: 64.9% utilization at 250k req / 72 nodes
-# → per-node throughput ≈ 250k/(72×0.649) ≈ 5 350.  Use 5 000 as a round floor.
-# Routing and slider enforcement both use this constant so they stay consistent.
 REQUESTS_PER_NODE_CAP = 5_000
 
 
@@ -194,9 +206,9 @@ class MetricNormalizer:
                 max(self.cost,   self.FLOOR))
 
 
-# ── FAST REPLAY BUFFER ────────────────────────────────────────────────────────
+# ── FAST REPLAY BUFFER (online adapter) ──────────────────────────────────────
 class ReplayBuffer:
-    """Pre-allocated ring buffer. Uses np.random.randint (no Fisher-Yates shuffle)."""
+    """Pre-allocated ring buffer for the online adapter (uniform sampling)."""
 
     def __init__(self, capacity: int):
         self.capacity = capacity
@@ -226,56 +238,179 @@ class ReplayBuffer:
         return self._len
 
 
-# ── TRANSFORMER-BASED NETWORKS ────────────────────────────────────────────────
-class AttentionPSLActor(nn.Module):
+# ── PRIORITIZED REPLAY BUFFER (offline agent) ─────────────────────────────────
+class PrioritizedReplayBuffer:
     """
-    Transformer actor conditioned on preference/constraint vector.
+    Prioritized experience replay weighted by gradient projection magnitude.
 
-    Per-DC token sequence: state features + preference broadcast → Transformer
-    encoder → FiLM preference gating → three output heads (small routing,
-    large routing, power sliders).
+    Transitions where the projection step was active (high |∇J_R · ∇J_C|) sit
+    near the constraint boundary and are the most informative for learning the
+    feasibility boundary.  These are replayed more often via a softmax over
+    stored priorities.
 
-    hidden_dim and n_layers are parameterised so the offline (3-layer) and
-    online (2-layer) variants share exactly this class.
+    Falls back to TD-error priorities when projection magnitude is unavailable
+    (e.g. during the first offline training call of an epoch).
     """
 
-    def __init__(self, num_dcs, state_feat_per_dc,
-                 pref_dim=COND_DIM, hidden_dim=128, n_heads=N_HEADS, n_layers=2):
+    def __init__(self, capacity: int):
+        self.capacity    = capacity
+        self._buf        = [None] * capacity
+        self.position    = 0
+        self._len        = 0
+        self._priorities = np.zeros(capacity, dtype=np.float32)
+        self._max_prio   = 1.0
+
+    def push(self, state, pref, action, reward, next_state, done, priority: float = None):
+        self._buf[self.position]        = (state, pref, action, reward, next_state, done)
+        self._priorities[self.position] = float(priority) if priority is not None else self._max_prio
+        self.position = (self.position + 1) % self.capacity
+        self._len     = min(self._len + 1, self.capacity)
+
+    def sample(self, batch_size: int, beta: float = PRIORITY_BETA_INIT):
+        prios = self._priorities[:self._len]
+        probs = prios ** PRIORITY_ALPHA
+        probs /= probs.sum()
+
+        idx     = np.random.choice(self._len, size=batch_size, replace=True, p=probs)
+        weights = (self._len * probs[idx]) ** (-beta)
+        weights /= weights.max()
+
+        batch = [self._buf[i] for i in idx]
+        state, pref, action, reward, next_state, done = map(np.stack, zip(*batch))
+        return (
+            torch.FloatTensor(state),
+            torch.FloatTensor(pref),
+            torch.FloatTensor(action),
+            torch.FloatTensor(reward),
+            torch.FloatTensor(next_state),
+            torch.FloatTensor(done),
+            idx,
+            torch.FloatTensor(weights),
+        )
+
+    def update_priorities(self, indices, priorities):
+        for i, p in zip(indices, np.asarray(priorities).flatten()):
+            self._priorities[int(i)] = float(p) + PRIORITY_EPS
+            self._max_prio = max(self._max_prio, self._priorities[int(i)])
+
+    def __len__(self):
+        return self._len
+
+
+# ── GRAPH ATTENTION NETWORK COMPONENTS ───────────────────────────────────────
+class GATLayer(nn.Module):
+    """
+    Single graph attention layer with latency-biased pairwise attention.
+
+    Rather than treating all DC pairs equally (as a flat Transformer does),
+    attention between DC i and DC j is modulated by their network proximity
+    derived from the live latency matrix: closer DCs get higher base attention,
+    mirroring the real cost structure of geo-distributed routing.
+
+    The residual connection uses a projection when dimensions differ so the
+    layer is safe to use at any depth.
+    """
+
+    def __init__(self, in_dim: int, out_dim: int, n_heads: int = 4):
+        super().__init__()
+        assert out_dim % n_heads == 0
+        self.n_heads  = n_heads
+        self.head_dim = out_dim // n_heads
+        self.W        = nn.Linear(in_dim, out_dim, bias=False)
+        # Learnable attention vector: applied to concatenated head features [h_i ‖ h_j]
+        self.attn_vec = nn.Parameter(torch.empty(n_heads, 2 * self.head_dim))
+        nn.init.xavier_uniform_(self.attn_vec.unsqueeze(0))
+        self.norm     = nn.LayerNorm(out_dim)
+        self.res_proj = nn.Linear(in_dim, out_dim, bias=False) if in_dim != out_dim else nn.Identity()
+
+    def forward(self, h: torch.Tensor, adj: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        h   : (B, N, in_dim)
+        adj : (N, N) normalized proximity in (0, 1] — higher = closer DCs
+        Returns: (B, N, out_dim)
+        """
+        B, N, _ = h.shape
+        Wh      = self.W(h)                                          # (B, N, out_dim)
+        heads   = Wh.view(B, N, self.n_heads, self.head_dim)        # (B, N, H, d)
+
+        # Pair-wise attention logits: e_{ij,h} = LeakyReLU(a_h^T [Wh_i ‖ Wh_j])
+        hi = heads.unsqueeze(2).expand(-1, -1, N, -1, -1)           # (B, N, N, H, d)
+        hj = heads.unsqueeze(1).expand(-1, N, -1, -1, -1)           # (B, N, N, H, d)
+        e  = torch.cat([hi, hj], dim=-1)                            # (B, N, N, H, 2d)
+        e  = (e * self.attn_vec.view(1, 1, 1, self.n_heads, -1)).sum(-1)  # (B, N, N, H)
+        e  = torch.nn.functional.leaky_relu(e, negative_slope=0.2)
+
+        # Bias by topology: add log-proximity so nearby DCs receive more attention
+        if adj is not None:
+            log_adj = torch.log(adj.to(h.device).clamp(min=1e-6))   # (N, N)
+            e = e + log_adj.unsqueeze(0).unsqueeze(-1)               # broadcast to (B,N,N,H)
+
+        alpha = torch.softmax(e, dim=2)                              # (B, N, N, H)
+
+        # Aggregate neighbour features
+        out = (alpha.unsqueeze(-1) * heads.unsqueeze(1)).sum(2)      # (B, N, H, d)
+        out = out.view(B, N, -1)                                     # (B, N, out_dim)
+        return self.norm(torch.relu(out) + self.res_proj(h))
+
+
+class GATDCEncoder(nn.Module):
+    """Stack of GATLayers with initial linear embedding."""
+
+    def __init__(self, token_dim: int, hidden_dim: int, n_heads: int, n_layers: int):
+        super().__init__()
+        self.embed      = nn.Linear(token_dim, hidden_dim)
+        self.gat_layers = nn.ModuleList([
+            GATLayer(hidden_dim, hidden_dim, n_heads) for _ in range(n_layers)
+        ])
+
+    def forward(self, tokens: torch.Tensor, adj: torch.Tensor | None = None) -> torch.Tensor:
+        """tokens: (B, N, token_dim) → (B, N, hidden_dim)"""
+        h = torch.relu(self.embed(tokens))
+        for layer in self.gat_layers:
+            h = layer(h, adj)
+        return h
+
+
+class GATActor(nn.Module):
+    """
+    Topology-aware actor conditioned on preference/constraint vector via FiLM.
+
+    The GATDCEncoder replaces the flat TransformerEncoder, using latency-biased
+    graph attention so the policy can naturally prefer routing to nearby,
+    low-latency DCs.  The FiLM gate and output heads are unchanged.
+    """
+
+    def __init__(self, num_dcs: int, state_feat_per_dc: int,
+                 pref_dim: int = COND_DIM, hidden_dim: int = 128,
+                 n_heads: int = N_HEADS, n_layers: int = 2):
         super().__init__()
         self.num_dcs   = num_dcs
-        self.token_dim = state_feat_per_dc + pref_dim   # input dim per DC token
+        self.token_dim = state_feat_per_dc + pref_dim
 
-        self.state_embed = nn.Linear(self.token_dim, hidden_dim)
-        encoder_layer    = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=n_heads,
-            dim_feedforward=hidden_dim * 2, batch_first=True, dropout=0.0,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
-        # FiLM modulation — scales transformer output by a preference-derived gate
+        self.encoder   = GATDCEncoder(self.token_dim, hidden_dim, n_heads, n_layers)
+        # FiLM: H_gated = E(S) ⊙ (2·σ(W_pref·w + b_pref))
         self.pref_gate = nn.Sequential(nn.Linear(pref_dim, hidden_dim), nn.Sigmoid())
-
         self.action_head = nn.Sequential(
             nn.Linear(hidden_dim + pref_dim, 256), nn.ReLU(),
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, 64),  nn.ReLU(),
+            nn.Linear(256, 128),                   nn.ReLU(),
+            nn.Linear(128, 64),                    nn.ReLU(),
         )
         self.out_small = nn.Linear(64, 1)
         self.out_large = nn.Linear(64, 1)
         self.out_power = nn.Linear(64, 1)
 
-    def forward(self, state: torch.Tensor, pref: torch.Tensor) -> torch.Tensor:
-        B              = state.size(0)
-        state_seq      = state.view(B, self.num_dcs, -1)
-        pref_expanded  = pref.unsqueeze(1).expand(-1, self.num_dcs, -1)
-        tokens         = torch.cat([state_seq, pref_expanded], dim=-1)
+    def forward(self, state: torch.Tensor, pref: torch.Tensor,
+                adj: torch.Tensor | None = None) -> torch.Tensor:
+        B             = state.size(0)
+        state_seq     = state.view(B, self.num_dcs, -1)
+        pref_exp      = pref.unsqueeze(1).expand(-1, self.num_dcs, -1)
+        tokens        = torch.cat([state_seq, pref_exp], dim=-1)
 
-        emb    = torch.relu(self.state_embed(tokens))
-        enc    = self.transformer(emb)                               # (B, num_dcs, H)
-        gate   = self.pref_gate(pref).unsqueeze(1).expand_as(enc)   # FiLM gate
-        gated  = enc * (gate * 2.0)
+        enc   = self.encoder(tokens, adj)                            # (B, N, H)
+        gate  = self.pref_gate(pref).unsqueeze(1).expand_as(enc)    # FiLM gate
+        gated = enc * (gate * 2.0)
 
-        h      = self.action_head(torch.cat([gated, pref_expanded], dim=-1))
+        h = self.action_head(torch.cat([gated, pref_exp], dim=-1))
         return torch.cat([
             torch.softmax(self.out_small(h).squeeze(2), dim=1),
             torch.softmax(self.out_large(h).squeeze(2), dim=1),
@@ -283,143 +418,282 @@ class AttentionPSLActor(nn.Module):
         ], dim=1)
 
 
-class AttentionPSLCritic(nn.Module):
-    """
-    Transformer critic conditioned on preference/constraint vector.
-    Maps (state, pref, action) → scalar Q-value.
-    """
+class GATCritic(nn.Module):
+    """Topology-aware critic: (state, pref, action) → scalar Q-value."""
 
-    def __init__(self, num_dcs, state_feat_per_dc, action_dim,
-                 pref_dim=COND_DIM, hidden_dim=128, n_heads=N_HEADS, n_layers=2):
+    def __init__(self, num_dcs: int, state_feat_per_dc: int, action_dim: int,
+                 pref_dim: int = COND_DIM, hidden_dim: int = 128,
+                 n_heads: int = N_HEADS, n_layers: int = 2):
         super().__init__()
         self.num_dcs   = num_dcs
         self.token_dim = state_feat_per_dc + pref_dim
 
-        self.state_embed = nn.Linear(self.token_dim, hidden_dim)
-        encoder_layer    = nn.TransformerEncoderLayer(
-            d_model=hidden_dim, nhead=n_heads,
-            dim_feedforward=hidden_dim * 2, batch_first=True, dropout=0.0,
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
-
-        self.sa_net  = nn.Sequential(
+        self.encoder  = GATDCEncoder(self.token_dim, hidden_dim, n_heads, n_layers)
+        self.sa_net   = nn.Sequential(
             nn.Linear(num_dcs * hidden_dim + action_dim, 512), nn.ReLU(),
             nn.Linear(512, 256), nn.ReLU(),
         )
         self.pref_net = nn.Sequential(nn.Linear(pref_dim, 256), nn.ReLU())
-        self.out_net  = nn.Sequential(
-            nn.Linear(256, 128), nn.ReLU(),
-            nn.Linear(128, 1),
-        )
+        self.out_net  = nn.Sequential(nn.Linear(256, 128), nn.ReLU(), nn.Linear(128, 1))
 
-    def forward(self, state: torch.Tensor, pref: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        B             = state.size(0)
-        state_seq     = state.view(B, self.num_dcs, -1)
-        pref_expanded = pref.unsqueeze(1).expand(-1, self.num_dcs, -1)
-        tokens        = torch.cat([state_seq, pref_expanded], dim=-1)
+    def forward(self, state: torch.Tensor, pref: torch.Tensor, action: torch.Tensor,
+                adj: torch.Tensor | None = None) -> torch.Tensor:
+        B         = state.size(0)
+        state_seq = state.view(B, self.num_dcs, -1)
+        pref_exp  = pref.unsqueeze(1).expand(-1, self.num_dcs, -1)
+        tokens    = torch.cat([state_seq, pref_exp], dim=-1)
 
-        emb      = torch.relu(self.state_embed(tokens))
-        enc      = self.transformer(emb).view(B, -1)                # (B, num_dcs*H)
-
-        sa_feat  = self.sa_net(torch.cat([enc, action], dim=1))
-        pf_feat  = self.pref_net(pref)
+        enc     = self.encoder(tokens, adj).view(B, -1)              # (B, N*H)
+        sa_feat = self.sa_net(torch.cat([enc, action], dim=1))
+        pf_feat = self.pref_net(pref)
         return self.out_net(sa_feat * pf_feat)
+
+
+class CriticEnsemble(nn.Module):
+    """
+    Ensemble of K independent GATCritics for epistemic uncertainty quantification.
+
+    Each critic is trained on independent mini-batches from the same buffer,
+    producing a distribution over Q-values used both for gradient computation
+    (pessimistic mean) and Pareto confidence reporting.
+    """
+
+    def __init__(self, num_dcs: int, state_feat_per_dc: int, action_dim: int,
+                 pref_dim: int = COND_DIM, hidden_dim: int = 128,
+                 n_heads: int = N_HEADS, n_layers: int = 2, k: int = N_CRITICS):
+        super().__init__()
+        self.k       = k
+        self.critics = nn.ModuleList([
+            GATCritic(num_dcs, state_feat_per_dc, action_dim,
+                      pref_dim, hidden_dim, n_heads, n_layers)
+            for _ in range(k)
+        ])
+
+    def forward_mean(self, state, pref, action, adj=None) -> torch.Tensor:
+        """Mean Q-value across ensemble: (B, 1)."""
+        return torch.stack([c(state, pref, action, adj) for c in self.critics]).mean(0)
+
+    def forward_all(self, state, pref, action, adj=None) -> torch.Tensor:
+        """All K Q-values stacked: (K, B, 1)."""
+        return torch.stack([c(state, pref, action, adj) for c in self.critics])
+
+    def uncertainty(self, state, pref, action, adj=None) -> torch.Tensor:
+        """Std across ensemble: (B, 1) — proxy for epistemic uncertainty."""
+        return self.forward_all(state, pref, action, adj).std(dim=0)
 
 
 # ── OFFLINE BASE AGENT ────────────────────────────────────────────────────────
 class OfflineBaseAgent:
     """
-    Larger Transformer (3 encoder layers) trained across epochs on accumulated
+    3-layer GAT actor + K-critic ensemble trained across epochs on accumulated
     experience with GAMMA=0.9 and soft target-network updates.
 
-    The offline agent answers "what is the generally optimal policy given all
-    historical transitions?".  It is never used for action selection — only
-    as a weight source for the online adapter.
+    Key enhancements over the plain TD actor-critic:
+
+    FOMAML meta-learning
+        The actor is optimized to produce weights that are good *initialization
+        points* for fast online adaptation, not just asymptotically optimal.
+        Each train_step splits the batch into support (inner loop) and query
+        (outer/meta loop).  K SGD steps are simulated on a fast_actor clone;
+        the meta-gradient is computed from the query loss through the updated
+        clone and copied back to self.actor.
+
+    CriticEnsemble (K=5)
+        Five independent GATCritics each see different random mini-batches
+        from the prioritized replay buffer.  Mean Q drives the actor gradient;
+        uncertainty (std across critics) is reported in the Pareto front.
+
+    Prioritized replay
+        Transition priority = max(projection_dot, td_error) so both constraint-
+        boundary transitions and high-Bellman-error transitions get replayed more.
+
+    Gradient projection (§2.4)
+        Applied to the outer-loop meta-gradient (not the inner loop) to ensure
+        the weight initialization is also constraint-respecting.
     """
 
     def __init__(self, num_dcs: int, state_feat_per_dc: int, cond_dim: int = COND_DIM):
-        self.num_dcs        = num_dcs
-        self.action_dim     = (num_dcs * NUM_MODEL_CLASSES) + num_dcs
+        self.num_dcs    = num_dcs
+        self.action_dim = (num_dcs * NUM_MODEL_CLASSES) + num_dcs
 
-        self.actor         = AttentionPSLActor(
-            num_dcs, state_feat_per_dc, pref_dim=cond_dim,
-            hidden_dim=HIDDEN_DIM_OFFLINE, n_layers=N_LAYERS_OFFLINE,
-        )
-        self.actor_target  = copy.deepcopy(self.actor)
-        self.critic        = AttentionPSLCritic(
-            num_dcs, state_feat_per_dc, self.action_dim, pref_dim=cond_dim,
-            hidden_dim=HIDDEN_DIM_OFFLINE, n_layers=N_LAYERS_OFFLINE,
-        )
-        self.critic_target = copy.deepcopy(self.critic)
+        self.actor        = GATActor(num_dcs, state_feat_per_dc, pref_dim=cond_dim,
+                                     hidden_dim=HIDDEN_DIM_OFFLINE, n_layers=N_LAYERS_OFFLINE)
+        self.actor_target = copy.deepcopy(self.actor)
 
-        self.actor_opt  = optim.Adam(self.actor.parameters(),  lr=OFFLINE_LR_ACTOR)
-        self.critic_opt = optim.Adam(self.critic.parameters(), lr=OFFLINE_LR_CRITIC)
-        self.buffer     = ReplayBuffer(OFFLINE_MEMORY_SIZE)
+        self.critics        = CriticEnsemble(num_dcs, state_feat_per_dc, self.action_dim,
+                                             pref_dim=cond_dim, hidden_dim=HIDDEN_DIM_OFFLINE,
+                                             n_layers=N_LAYERS_OFFLINE, k=N_CRITICS)
+        self.critics_target = copy.deepcopy(self.critics)
 
-    def train_step(self, batch_size: int = OFFLINE_BATCH_SIZE):
-        if len(self.buffer) < batch_size:
+        self.actor_opt   = optim.Adam(self.actor.parameters(), lr=OFFLINE_LR_ACTOR)
+        self.critic_opts = [optim.Adam(c.parameters(), lr=OFFLINE_LR_CRITIC)
+                            for c in self.critics.critics]
+
+        self.buffer = PrioritizedReplayBuffer(OFFLINE_MEMORY_SIZE)
+        self._beta  = PRIORITY_BETA_INIT   # annealed toward 1.0 during training
+
+    def train_step(self, batch_size: int = OFFLINE_BATCH_SIZE,
+                   adj: torch.Tensor | None = None) -> float | None:
+        if len(self.buffer) < batch_size * 2:
             return None
 
-        state, pref, action, reward, next_state, done = self.buffer.sample(batch_size)
-        reward = reward.unsqueeze(1)
-        done   = done.unsqueeze(1)
+        # Anneal importance-sampling correction toward unbiased
+        self._beta = min(1.0, self._beta + 1e-5)
+
+        n_sup = batch_size // 2
+        n_qry = batch_size - n_sup
+
+        # ── Sample support (inner) and query (outer/meta) batches ─────────────
+        sup = self.buffer.sample(n_sup, beta=self._beta)
+        qry = self.buffer.sample(n_qry, beta=self._beta)
+
+        s_st, s_pr, s_ac, s_rw, s_nx, s_dn, s_idx, s_wt = sup
+        q_st, q_pr, q_ac, q_rw, q_nx, q_dn, q_idx, q_wt = qry
+        s_rw = s_rw.unsqueeze(1); s_dn = s_dn.unsqueeze(1)
+        q_rw = q_rw.unsqueeze(1); q_dn = q_dn.unsqueeze(1)
+
+        # ── Critic ensemble update (query batch) ──────────────────────────────
+        with torch.no_grad():
+            nx_a  = self.actor_target(q_nx, q_pr, adj)
+            q_tgt = q_rw + (1 - q_dn) * GAMMA_OFFLINE * self.critics_target.forward_mean(
+                        q_nx, q_pr, nx_a, adj)
+
+        total_closs = 0.0
+        for critic, c_opt in zip(self.critics.critics, self.critic_opts):
+            q_pred = critic(q_st, q_pr, q_ac, adj)
+            # IS-weighted MSE
+            closs  = (q_wt.unsqueeze(1) * (q_pred - q_tgt) ** 2).mean()
+            c_opt.zero_grad(); closs.backward()
+            nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
+            c_opt.step()
+            total_closs += closs.item()
+
+        # Update replay priorities from TD errors
+        with torch.no_grad():
+            td_err = (self.critics.forward_mean(q_st, q_pr, q_ac, adj) - q_tgt).abs()
+        self.buffer.update_priorities(q_idx, td_err.cpu().numpy().flatten())
+
+        # ── FOMAML actor update ───────────────────────────────────────────────
+        # Inner loop: simulate K adaptation steps on support set using a fast clone
+        fast_actor = copy.deepcopy(self.actor)
+        fast_opt   = optim.SGD(fast_actor.parameters(), lr=MAML_INNER_LR, momentum=0.9)
 
         with torch.no_grad():
-            next_action  = self.actor_target(next_state, pref)
-            target_value = reward + (1 - done) * GAMMA_OFFLINE * self.critic_target(next_state, pref, next_action)
+            s_nx_a  = self.actor_target(s_nx, s_pr, adj)
+            s_tgt   = s_rw + (1 - s_dn) * GAMMA_OFFLINE * self.critics_target.forward_mean(
+                          s_nx, s_pr, s_nx_a, adj)
 
-        closs = nn.MSELoss()(self.critic(state, pref, action), target_value)
-        self.critic_opt.zero_grad()
-        closs.backward()
-        nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
-        self.critic_opt.step()
+        for _ in range(MAML_INNER_STEPS):
+            fa_out     = fast_actor(s_st, s_pr, adj)
+            inner_loss = -self.critics.forward_mean(s_st, s_pr, fa_out, adj).mean()
+            fast_opt.zero_grad(); inner_loss.backward()
+            nn.utils.clip_grad_norm_(fast_actor.parameters(), 1.0)
+            fast_opt.step()
 
-        aloss = -self.critic(state, pref, self.actor(state, pref)).mean()
+        # Outer (meta) loop: compute loss on query using the adapted fast_actor
+        # FOMAML: backprop only through the fast_actor's current (post-inner) parameters
+        meta_act    = fast_actor(q_st, q_pr, adj)
+        utility_loss = -self.critics.forward_mean(q_st, q_pr, meta_act, adj).mean()
+
+        fast_opt.zero_grad()
+        utility_loss.backward(retain_graph=True)
+        grad_utility = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+                        for p in fast_actor.parameters()]
+
+        # Constraint gradient: weighted by slack-channel violation magnitude (§2.4)
+        slack           = q_pr[:, PREF_DIM:]
+        violation       = torch.clamp(1.0 - slack, min=0.0).mean(dim=1, keepdim=True)
+        constraint_loss = (violation * self.critics.forward_mean(q_st, q_pr, meta_act, adj)).mean()
+        fast_opt.zero_grad(); constraint_loss.backward()
+        grad_constraint = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+                           for p in fast_actor.parameters()]
+
+        # Gradient projection (§2.4)
+        u_flat = torch.cat([g.flatten() for g in grad_utility])
+        c_flat = torch.cat([g.flatten() for g in grad_constraint])
+        dot    = (u_flat * c_flat).sum()
+
+        if dot > 0:
+            c_norm_sq = (c_flat * c_flat).sum().clamp(min=1e-8)
+            proj_flat = u_flat - (dot / c_norm_sq) * c_flat
+        else:
+            proj_flat = u_flat
+
+        # Copy projected meta-gradient into self.actor and step
         self.actor_opt.zero_grad()
-        aloss.backward()
+        offset = 0
+        for p_orig, p_fast in zip(self.actor.parameters(), fast_actor.parameters()):
+            numel  = p_fast.numel()
+            p_orig.grad = proj_flat[offset:offset + numel].view_as(p_orig).clone()
+            offset += numel
         nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_opt.step()
 
-        # Soft target update
-        for p, tp in zip(self.critic.parameters(), self.critic_target.parameters()):
-            tp.data.copy_(TAU_OFFLINE * p.data + (1 - TAU_OFFLINE) * tp.data)
+        # Boost priority of support transitions by projection activity (boundary proximity)
+        dot_prio = float(dot.abs().item()) + PRIORITY_EPS
+        self.buffer.update_priorities(s_idx, np.full(len(s_idx), dot_prio))
+
+        # ── Soft target updates ───────────────────────────────────────────────
+        for critic, t_critic in zip(self.critics.critics, self.critics_target.critics):
+            for p, tp in zip(critic.parameters(), t_critic.parameters()):
+                tp.data.copy_(TAU_OFFLINE * p.data + (1 - TAU_OFFLINE) * tp.data)
         for p, tp in zip(self.actor.parameters(), self.actor_target.parameters()):
             tp.data.copy_(TAU_OFFLINE * p.data + (1 - TAU_OFFLINE) * tp.data)
 
-        return closs.item()
+        return total_closs / max(1, N_CRITICS)
 
-    def run_offline_training(self, n_steps: int = OFFLINE_GRAD_STEPS):
-        """Run n_steps gradient steps. Called while exploitation eval runs in parallel."""
+    def q_uncertainty(self, state: np.ndarray, pref: np.ndarray, action: np.ndarray,
+                      adj: torch.Tensor | None = None) -> float:
+        """Return critic ensemble std for a single (s, pref, a) as uncertainty proxy."""
+        with torch.no_grad():
+            s = torch.FloatTensor(state).unsqueeze(0)
+            p = torch.FloatTensor(pref).unsqueeze(0)
+            a = torch.FloatTensor(action).unsqueeze(0)
+            return float(self.critics.uncertainty(s, p, a, adj).item())
+
+    def run_offline_training(self, n_steps: int = OFFLINE_GRAD_STEPS,
+                             adj: torch.Tensor | None = None):
         losses = []
         for _ in range(n_steps):
-            l = self.train_step()
+            l = self.train_step(adj=adj)
             if l is not None:
                 losses.append(l)
         if losses:
             print(f"  [Offline] {len(losses)} grad steps — avg critic loss: {np.mean(losses):.4f}")
 
 
+
 # ── ONLINE ADAPTER AGENT ──────────────────────────────────────────────────────
 class OnlineAdapterAgent:
     """
-    2-layer Transformer initialized fresh from offline weights every epoch.
-    Trained with GAMMA=0.0 (contextual bandit) for fast, stable convergence
-    to the current epoch's conditions without target networks.
+    2-layer GAT actor initialized fresh from offline weights every epoch.
+    Trained as a contextual bandit (GAMMA=0.0).
 
-    Holds its own small per-epoch buffer that is cleared at epoch start —
-    the adapter only adapts on what it has seen this epoch.
+    Enhancements over plain actor-critic:
+
+    Counterfactual credit assignment
+        For each DC i, the Q-value is recomputed with DC i's routing weights
+        replaced by a uniform baseline.  Per-DC advantages (global_Q - CF_Q_i)
+        are computed in a single batched critic call (stacking N counterfactual
+        actions), providing much cleaner per-DC gradient signal than attributing
+        the joint reward uniformly across all DCs.
+
+    Gradient projection (§2.4)
+        Same constraint-enforcement mechanism as the offline agent, applied
+        to the advantage-weighted actor gradient.
     """
 
     def __init__(self, num_dcs: int, state_feat_per_dc: int, cond_dim: int = COND_DIM):
+        super().__init__()
         self.num_dcs    = num_dcs
         self.cond_dim   = cond_dim
         self.action_dim = (num_dcs * NUM_MODEL_CLASSES) + num_dcs
 
-        self.actor  = AttentionPSLActor(
+        self.actor  = GATActor(
             num_dcs, state_feat_per_dc, pref_dim=cond_dim,
             hidden_dim=HIDDEN_DIM_ONLINE, n_layers=N_LAYERS_ONLINE,
         )
-        self.critic = AttentionPSLCritic(
+        self.critic = GATCritic(
             num_dcs, state_feat_per_dc, self.action_dim, pref_dim=cond_dim,
             hidden_dim=HIDDEN_DIM_ONLINE, n_layers=N_LAYERS_ONLINE,
         )
@@ -432,34 +706,43 @@ class OnlineAdapterAgent:
         """
         Warm-start from offline base weights.
 
-        The offline model has 3 encoder layers; the online adapter has 2.
-        We copy the embedding layer, the first 2 encoder layers, all action
-        heads, and the pref_gate exactly. This gives the adapter a strong
-        prior without requiring identical architectures.
+        The offline actor has 3 GAT layers; the online adapter has 2.
+        We copy the embedding layer, the first 2 GAT layers, and all action
+        heads / pref_gate exactly — shape-matched keys only.
+        The offline CriticEnsemble's first critic seeds the online critic.
+        Optimizers and noise are reset so offline momentum does not bias
+        the first online gradient steps.
         """
         o_actor  = offline.actor.state_dict()
-        o_critic = offline.critic.state_dict()
+        # Seed from first ensemble member for a single-critic warm-start
+        o_critic = offline.critics.critics[0].state_dict()
 
         def _transfer(src_sd: dict, dst: nn.Module):
-            dst_sd   = dst.state_dict()
-            to_load  = {}
-            for k, v in src_sd.items():
-                if k in dst_sd and dst_sd[k].shape == v.shape:
-                    to_load[k] = v
+            dst_sd  = dst.state_dict()
+            to_load = {k: v for k, v in src_sd.items()
+                       if k in dst_sd and dst_sd[k].shape == v.shape}
             dst_sd.update(to_load)
             dst.load_state_dict(dst_sd)
 
         _transfer(o_actor,  self.actor)
         _transfer(o_critic, self.critic)
 
-        # Reset optimisers so momentum from offline training doesn't distort
-        # the first online gradient steps
         self.actor_opt  = optim.Adam(self.actor.parameters(),  lr=ONLINE_LR_ACTOR)
         self.critic_opt = optim.Adam(self.critic.parameters(), lr=ONLINE_LR_CRITIC)
         self.buffer     = ReplayBuffer(ONLINE_MEMORY_SIZE)
         self.noise_std  = NOISE_INIT
 
-    def _bootstrap_action(self, state: np.ndarray, pref: np.ndarray) -> np.ndarray:
+    def _bootstrap_action(self, state: np.ndarray, pref: np.ndarray,
+                      exploration: bool = True,
+                      adj: torch.Tensor | None = None) -> np.ndarray:
+        pref = np.asarray(pref, dtype=np.float32)
+        if pref.shape[-1] != self.cond_dim:
+            raise ValueError(f"Expected cond dim {self.cond_dim}, got {pref.shape[-1]}")
+
+        state_t = torch.FloatTensor(state).unsqueeze(0)
+        pref_t  = torch.FloatTensor(pref).unsqueeze(0)
+        with torch.no_grad():
+            action = self.actor(state_t, pref_t, adj).cpu().numpy()[0]
         """
         Quality-based routing for cold start (before the network has seen enough
         data to produce meaningful preference-conditioned outputs).
@@ -512,7 +795,9 @@ class OnlineAdapterAgent:
         action[2*n:] = sliders
         return action
 
-    def select_action(self, state: np.ndarray, pref: np.ndarray, exploration: bool = True) -> np.ndarray:
+    def select_action(self, state: np.ndarray, pref: np.ndarray,
+                      exploration: bool = True,
+                      adj: torch.Tensor | None = None) -> np.ndarray:
         pref = np.asarray(pref, dtype=np.float32)
         if pref.shape[-1] != self.cond_dim:
             raise ValueError(f"Expected cond dim {self.cond_dim}, got {pref.shape[-1]}")
@@ -520,20 +805,14 @@ class OnlineAdapterAgent:
         state_t = torch.FloatTensor(state).unsqueeze(0)
         pref_t  = torch.FloatTensor(pref).unsqueeze(0)
         with torch.no_grad():
-            action = self.actor(state_t, pref_t).cpu().numpy()[0]
+            action = self.actor(state_t, pref_t, adj).cpu().numpy()[0]
 
-        # ── Cold-start bootstrap blend ─────────────────────────────────────
-        # When the online buffer is small, the network output is near-uniform
-        # (random init → uniform softmax).  Blend with a DC-quality heuristic
-        # that uses state features to route toward DCs that suit the preference.
-        # Bootstrap weight fades linearly to 0 as the buffer reaches 4× batch size.
         buf_fill     = len(self.buffer)
         blend_thresh = ONLINE_BATCH_SIZE * 4
         if buf_fill < blend_thresh:
             bootstrap_w = 1.0 - buf_fill / blend_thresh
             bootstrap   = self._bootstrap_action(state, pref)
             action      = (1.0 - bootstrap_w) * action + bootstrap_w * bootstrap
-            # Re-normalise routing weight softmaxes after blending
             for k in range(NUM_MODEL_CLASSES):
                 s_i, e_i = k * self.num_dcs, (k + 1) * self.num_dcs
                 seg      = np.maximum(action[s_i:e_i], 0.0)
@@ -544,52 +823,102 @@ class OnlineAdapterAgent:
         if exploration:
             alpha        = random.choice([0.1, 0.3, 1.0])
             noise_weight = min(0.6, self.noise_std)
-
-            # Routing noise: Dirichlet perturbation on allocation weights
             for k in range(NUM_MODEL_CLASSES):
                 s, e        = k * self.num_dcs, (k + 1) * self.num_dcs
                 noise       = np.random.dirichlet([alpha] * self.num_dcs)
                 action[s:e] = (1 - noise_weight) * action[s:e] + noise_weight * noise
-
-            # Power slider noise: Gaussian perturbation
             pw = 2 * self.num_dcs
             action[pw:] = np.clip(
                 action[pw:] + np.random.normal(0, self.noise_std, self.num_dcs), 0.0, 1.0
             )
-
-            # DC power shutdown exploration (30% of steps).
-            # Explicitly zeros power sliders on 1–3 DCs chosen by LOWEST routing weight.
-            # This seeds the replay buffer with eco examples even before the network
-            # has learned to prefer them — breaking the cold-start catch-22.
-            # We target LOW-weight DCs (not random ones) so we don't zero a DC that the
-            # routing weights are sending traffic to, which would cause drops.
             if random.random() < 0.30 and self.num_dcs > 2:
-                combined_w = (action[0:self.num_dcs] + action[self.num_dcs:2*self.num_dcs]) / 2.0
-                combined_w = np.maximum(combined_w, 0.0)
-                n_shutdown = random.randint(1, min(3, self.num_dcs - 2))
-                # Pick lowest-weighted DCs to shut down
+                combined_w    = (action[0:self.num_dcs] + action[self.num_dcs:2*self.num_dcs]) / 2.0
+                combined_w    = np.maximum(combined_w, 0.0)
+                n_shutdown    = random.randint(1, min(3, self.num_dcs - 2))
                 shutdown_idxs = np.argsort(combined_w)[:n_shutdown]
                 action[pw + shutdown_idxs] = 0.0
 
         return action
 
-    def train_step(self, batch_size: int = ONLINE_BATCH_SIZE):
+    def train_step(self, batch_size: int = ONLINE_BATCH_SIZE,
+                   adj: torch.Tensor | None = None) -> float | None:
         if len(self.buffer) < batch_size:
             return None
 
         state, pref, action, reward, _, done = self.buffer.sample(batch_size)
-        # GAMMA=0.0 → target is immediate reward; no target network needed
-        target = reward.unsqueeze(1)
+        target = reward.unsqueeze(1)   # GAMMA=0; no bootstrapping
 
-        closs = nn.MSELoss()(self.critic(state, pref, action), target)
+        # ── Critic update ─────────────────────────────────────────────────────
+        closs = nn.MSELoss()(self.critic(state, pref, action, adj), target)
         self.critic_opt.zero_grad()
         closs.backward()
         nn.utils.clip_grad_norm_(self.critic.parameters(), 1.0)
         self.critic_opt.step()
 
-        aloss = -self.critic(state, pref, self.actor(state, pref)).mean()
+        # ── Actor update: counterfactual credit assignment + gradient projection
+        actor_action = self.actor(state, pref, adj)
+        B, n         = state.size(0), self.num_dcs
+
+        # Global Q for the joint action
+        global_q = self.critic(state, pref, actor_action, adj)   # (B, 1)
+
+        # Per-DC counterfactual Q in one batched forward pass.
+        # For each DC i we replace its routing weights with uniform (1/n) and
+        # query the critic.  Advantage_i = Q(joint) − Q(counterfactual_i).
+        with torch.no_grad():
+            cf = actor_action.detach().unsqueeze(1).expand(B, n, -1).clone()  # (B,n,3n)
+            for i in range(n):
+                cf[:, i, i]     = 1.0 / n   # small routing DC i → uniform
+                cf[:, i, n + i] = 1.0 / n   # large routing DC i → uniform
+                for k in range(NUM_MODEL_CLASSES):
+                    si, ei = k * n, (k + 1) * n
+                    seg = cf[:, i, si:ei].clamp(min=0)
+                    cf[:, i, si:ei] = seg / seg.sum(-1, keepdim=True).clamp(min=1e-8)
+
+            # Stack into (B*n, 3n) for a single batched critic call
+            cf_flat = cf.reshape(B * n, -1)
+            s_exp   = state.unsqueeze(1).expand(B, n, n, -1).reshape(B * n, -1)
+            p_exp   = pref.unsqueeze(1).expand(B, n, -1).reshape(B * n, -1)
+            cf_q    = self.critic(s_exp, p_exp, cf_flat, adj).view(B, n)   # (B, n)
+
+        advantages  = global_q.detach() - cf_q          # (B, n) positive = DC i helps
+        adv_weight  = torch.softmax(advantages * 5.0, dim=1)          # (B, n)
+        adv_scalar  = (adv_weight * advantages).sum(dim=1, keepdim=True)  # (B, 1)
+
+        # Advantage-weighted actor loss: boost DCs where the agent's action matters
+        utility_loss = -(global_q * (1.0 + CF_CREDIT_ALPHA * adv_scalar.detach())).mean()
+
         self.actor_opt.zero_grad()
-        aloss.backward()
+        utility_loss.backward(retain_graph=True)
+        grad_utility = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+                        for p in self.actor.parameters()]
+
+        # Gradient projection: constraint enforcement (§2.4)
+        slack           = pref[:, PREF_DIM:]
+        violation       = torch.clamp(1.0 - slack, min=0.0).mean(dim=1, keepdim=True)
+        constraint_loss = (violation * self.critic(state, pref, actor_action, adj)).mean()
+        self.actor_opt.zero_grad()
+        constraint_loss.backward()
+        grad_constraint = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
+                           for p in self.actor.parameters()]
+
+        u_flat = torch.cat([g.flatten() for g in grad_utility])
+        c_flat = torch.cat([g.flatten() for g in grad_constraint])
+        dot    = (u_flat * c_flat).sum()
+
+        if dot > 0:
+            c_norm_sq = (c_flat * c_flat).sum().clamp(min=1e-8)
+            proj_flat = u_flat - (dot / c_norm_sq) * c_flat
+        else:
+            proj_flat = u_flat
+
+        self.actor_opt.zero_grad()
+        offset = 0
+        for p in self.actor.parameters():
+            numel  = p.numel()
+            p.grad = proj_flat[offset:offset + numel].view_as(p).clone()
+            offset += numel
+
         nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_opt.step()
 
@@ -602,6 +931,8 @@ class HybridPSLAgent:
     """
     Top-level agent. Owns the offline base and online adapter.
     Manages the offline→online weight transfer and dual-buffer experience routing.
+    The latency adjacency tensor (adj) flows through all forward passes so the
+    GAT encoder always has access to the current DC topology.
     """
 
     def __init__(self, num_dcs: int, state_feat_per_dc: int, cond_dim: int = COND_DIM):
@@ -613,32 +944,31 @@ class HybridPSLAgent:
         """Call at the start of every epoch: sync offline → online."""
         self.online.load_from_offline(self.offline)
 
-    def select_action(self, state, pref, exploration=True):
-        return self.online.select_action(state, pref, exploration)
+    def select_action(self, state, pref, exploration=True, adj=None):
+        return self.online.select_action(state, pref, exploration, adj)
 
     def push(self, state, pref, action, reward, next_state, done):
         """Push transition to BOTH buffers so offline learns from online experience."""
         self.online.buffer.push(state, pref, action, reward, next_state, done)
         self.offline.buffer.push(state, pref, action, reward, next_state, done)
 
-    def train_online(self, n_steps: int):
+    def train_online(self, n_steps: int, adj=None):
         for _ in range(n_steps):
-            self.online.train_step()
+            self.online.train_step(adj=adj)
 
-    def train_offline_concurrent(self, futures, fut_to_idx, candidate_solutions):
+    def train_offline_concurrent(self, futures, fut_to_idx, candidate_solutions, adj=None):
         """
-        Run offline gradient steps while waiting on exploitation simulation futures.
-        This hides most of the offline training cost behind I/O-bound simulator calls.
-        Two nested bars are shown: one for candidates evaluated, one for offline steps.
+        Run offline gradient steps interleaved with exploitation simulation futures.
+        Offline training cost is hidden behind I/O-bound simulator calls.
         """
-        steps_done   = 0
-        steps_target = OFFLINE_GRAD_STEPS
-        losses       = []
+        steps_done    = 0
+        steps_target  = OFFLINE_GRAD_STEPS
+        losses        = []
         batch_per_fut = max(1, steps_target // max(1, len(futures)))
 
         eval_bar    = tqdm(total=len(futures),  desc="  Phase 2 │ Exploit eval",
                            unit="cand", leave=False, dynamic_ncols=True)
-        offline_bar = tqdm(total=steps_target, desc="  Phase 3 │ Offline train",
+        offline_bar = tqdm(total=steps_target, desc="  Phase 3 │ Offline train (MAML)",
                            unit="step", leave=False, dynamic_ncols=True)
         offline_bar.set_postfix(loss=0.0)
 
@@ -649,19 +979,20 @@ class HybridPSLAgent:
 
             for _ in range(batch_per_fut):
                 if steps_done < steps_target:
-                    l = self.offline.train_step()
+                    l = self.offline.train_step(adj=adj)
                     if l is not None:
                         losses.append(l)
-                        offline_bar.set_postfix(loss=round(float(np.mean(losses[-20:])), 4), refresh=False)
+                        offline_bar.set_postfix(
+                            loss=round(float(np.mean(losses[-20:])), 4), refresh=False)
                     offline_bar.update(1)
                     steps_done += 1
 
-        # Drain remaining offline steps
         while steps_done < steps_target:
-            l = self.offline.train_step()
+            l = self.offline.train_step(adj=adj)
             if l is not None:
                 losses.append(l)
-                offline_bar.set_postfix(loss=round(float(np.mean(losses[-20:])), 4), refresh=False)
+                offline_bar.set_postfix(
+                    loss=round(float(np.mean(losses[-20:])), 4), refresh=False)
             offline_bar.update(1)
             steps_done += 1
 
@@ -669,7 +1000,7 @@ class HybridPSLAgent:
         offline_bar.close()
 
         if losses:
-            tqdm.write(f"  [Offline] {steps_done} grad steps — avg critic loss: {np.mean(losses):.4f}")
+            tqdm.write(f"  [Offline/MAML] {steps_done} steps — avg critic loss: {np.mean(losses):.4f}")
 
         return candidate_solutions
 
@@ -737,12 +1068,58 @@ class ParallelParetoTracker:
 # ── GLOBALS ───────────────────────────────────────────────────────────────────
 _PARETO_TRACKER = ParallelParetoTracker()
 _GLOBAL_AGENT: HybridPSLAgent = None
-_NORM           = MetricNormalizer()    # persistent across epochs; seeded from first observations
+_NORM           = MetricNormalizer()
+
+# Latency adjacency tensor — (N, N) proximity matrix derived from the simulator's
+# inter-DC latency matrix.  Rebuilt whenever the agent is (re)initialised.
+_GLOBAL_ADJ: torch.Tensor | None = None
+
+# Constraint-aware preference sampling: tracks per-bucket violation rates across
+# epochs so build_preference_cloud can oversample constraint-active regions.
+_VIOLATION_HISTORY: dict = collections.defaultdict(lambda: [0, 0])  # [viol, total]
 
 
 # ── UTILITIES ─────────────────────────────────────────────────────────────────
 def _stable_hash_int(s: str) -> int:
     return int(hashlib.sha256(s.encode()).hexdigest()[:16], 16)
+
+
+def _build_adjacency(lat_matrix, dc_ids: list) -> torch.Tensor:
+    """
+    Convert the simulator's inter-DC latency matrix into a normalized proximity
+    adjacency tensor for the GAT encoder.
+
+    proximity[i][j] = 1 / (1 + latency_ms[i][j])   (self-loops = 1.0)
+    Row-normalized so attention weights sum to 1 before the softmax in GATLayer.
+
+    Falls back to a uniform identity-like matrix when the latency data is missing
+    or mismatched so the GAT degrades gracefully to unbiased attention.
+    """
+    N = len(dc_ids)
+    try:
+        lat = np.array(
+            [[float(lat_matrix[i][j]) for j in range(N)] for i in range(N)],
+            dtype=np.float32
+        )
+        prox = 1.0 / (1.0 + lat)
+        np.fill_diagonal(prox, 1.0)
+        row_sums = prox.sum(axis=1, keepdims=True)
+        prox /= np.maximum(row_sums, 1e-8)
+    except Exception:
+        prox = np.eye(N, dtype=np.float32)   # fallback: uniform self-attention
+    return torch.FloatTensor(prox)
+
+
+def _record_preference_outcome(pref_vec: np.ndarray, violated: bool):
+    """
+    Track constraint violations per coarse preference bucket (rounded to 0.1).
+    Called after every Phase-1 sim step so build_preference_cloud can oversample
+    the regions of preference space where the constraint boundary is active.
+    """
+    key = tuple(np.round(np.asarray(pref_vec[:PREF_DIM], dtype=np.float32), 1).tolist())
+    _VIOLATION_HISTORY[key][1] += 1
+    if violated:
+        _VIOLATION_HISTORY[key][0] += 1
 
 
 def _normalize_weights(w: np.ndarray) -> np.ndarray:
@@ -758,19 +1135,19 @@ def get_rich_state(sim, dc_ids, epoch_data, epoch_idx: int,
                    prev_utilisation: np.ndarray = None,
                    prev_power_sliders: np.ndarray = None) -> np.ndarray:
     """
-    Build the per-DC state tensor.  Now 6 features per DC (was 4):
+    Build the per-DC state tensor — 6 features per DC:
 
       [0] carbon_intensity_norm   ci / 1000
       [1] tou_price_norm          price × 5
-      [2] pue_norm                pue / 2
-      [3] req_intensity           min(total_req / 50k, 1.0)  — rescaled from /1000
-      [4] active_nodes_frac       active_nodes / NUM_NODE_TYPES  (0 if unknown)
-      [5] prev_utilisation        last epoch's DC utilisation (0 if first epoch)
+      [2] water_efficiency_norm   wue_l_per_kwh / 2.0   (v2 sim attribute;
+                                  falls back to pue_value / 2 for compatibility)
+      [3] req_intensity           min(total_req / 50k, 1.0)
+      [4] active_nodes_frac       active_nodes / NUM_NODE_TYPES
+      [5] prev_utilisation        last epoch's DC utilisation (0 if first)
 
-    The req_intensity normalisation is corrected from /1000 to /50000 so that a
-    250k-request epoch reads ~1.0 instead of the previous value of 250 (clipped to 1).
-    The extra features give the Transformer direct visibility into per-DC capacity
-    and utilisation, enabling it to learn load-aware routing.
+    Feature [2] now uses the v2 simulator's wue_l_per_kwh (Water Usage
+    Effectiveness in litres/kWh) instead of PUE so the state directly encodes
+    water efficiency — the metric the water_agent and water_saver modes optimise.
     """
     num_dcs = len(dc_ids)
     state   = np.zeros((num_dcs, 6), dtype=np.float32)
@@ -778,14 +1155,13 @@ def get_rich_state(sim, dc_ids, epoch_data, epoch_idx: int,
     total_requests = len(epoch_data) if epoch_data is not None else 0
     epoch_hour     = int(epoch_idx % 24)
 
-    # Active nodes per DC from previous power plan (0 if unavailable)
     if prev_power_sliders is not None:
         active_fracs = _active_nodes_per_dc(prev_power_sliders) / max(NUM_NODE_TYPES, 1)
     else:
         active_fracs = np.zeros(num_dcs, dtype=np.float32)
 
     for idx, dc_id in enumerate(dc_ids):
-        ci, cost, water_val = 400.0, 0.10, 1.18
+        ci, cost, water_eff = 400.0, 0.10, 1.18
         if hasattr(sim, "datacenters") and dc_id in sim.datacenters:
             dc = sim.datacenters[dc_id]
             ci = float(getattr(dc, "carbon_intensity_g_per_kwh", 400.0))
@@ -797,17 +1173,19 @@ def get_rich_state(sim, dc_ids, epoch_data, epoch_idx: int,
                     cost = float(getattr(dc, "tou_price", [0.10])[0])
             except Exception:
                 pass
-            water_val = float(getattr(dc, "pue_value", 1.18))
+            # Prefer wue_l_per_kwh (v2 sim); fall back to pue_value (v1 compat)
+            water_eff = float(
+                getattr(dc, "wue_l_per_kwh",
+                        getattr(dc, "pue_value", 1.18))
+            )
 
         util = float(prev_utilisation[idx]) if prev_utilisation is not None else 0.0
-
-        # req_intensity: fraction of a comfortable per-epoch max (~50k req/epoch)
         req_intensity = min(total_requests / 50_000.0, 1.0)
 
         state[idx] = [
             ci / 1000.0,
             cost * 5.0,
-            water_val / 2.0,
+            water_eff / 2.0,
             req_intensity,
             float(active_fracs[idx]),
             np.clip(util, 0.0, 1.0),
@@ -1017,6 +1395,20 @@ def _farthest_point_sample(points: np.ndarray, k: int, seed_points=None) -> np.n
 
 
 def build_preference_cloud(population, target_size: int = 40) -> list:
+    """
+    Generate a maximally diverse set of preference vectors for Phase-2 exploitation.
+
+    Constraint-aware oversampling (new):
+        Regions of preference space that historically produced constraint violations
+        sit near the constraint boundary — the most informative part of the Pareto
+        front.  _VIOLATION_HISTORY tracks violation rates per coarse preference
+        bucket.  Before FPS we duplicate points from high-violation buckets, biasing
+        the sampling pool so FPS is more likely to select from those regions.
+
+    Base strategy (unchanged):
+        Simplex lattice + Dirichlet noise → farthest-point sampling seeded with
+        population corners, edges, and the balanced point.
+    """
     base    = [np.array(c["pref"], dtype=np.float32) for c in population]
     corners = [np.eye(PREF_DIM, dtype=np.float32)[i] for i in range(PREF_DIM)]
     edges   = []
@@ -1029,6 +1421,22 @@ def build_preference_cloud(population, target_size: int = 40) -> list:
     rand_pool = np.random.dirichlet(np.ones(PREF_DIM), size=300).astype(np.float32)
     all_pts   = np.vstack([lattice, rand_pool])
 
+    # ── Constraint-aware oversampling ────────────────────────────────────────
+    if _VIOLATION_HISTORY:
+        def _viol_rate(p):
+            key = tuple(np.round(p[:PREF_DIM], 1).tolist())
+            counts = _VIOLATION_HISTORY.get(key, [0, 1])
+            return counts[0] / max(counts[1], 1)
+
+        viol_rates = np.array([_viol_rate(p) for p in all_pts], dtype=np.float32)
+        # Sample weights: violation rate + small uniform base so no region is excluded
+        sample_w = viol_rates + 0.1
+        sample_w /= sample_w.sum()
+        # Draw extra candidates from violation-heavy regions and append to pool
+        n_extra   = min(len(all_pts), 200)
+        extra_idx = np.random.choice(len(all_pts), size=n_extra, replace=True, p=sample_w)
+        all_pts   = np.vstack([all_pts, all_pts[extra_idx]])
+
     seed    = np.vstack(corners + edges + base + [np.full(PREF_DIM, 0.25, dtype=np.float32)])
     sampled = _farthest_point_sample(all_pts, target_size, seed_points=seed)
 
@@ -1038,6 +1446,33 @@ def build_preference_cloud(population, target_size: int = 40) -> list:
         if key not in seen:
             result.append(p.astype(np.float32)); seen.add(key)
     return [p.astype(np.float32) for p in sorted(result, key=lambda v: tuple(v))]
+
+
+def _constraints_satisfied(cand: dict) -> bool:
+    """
+    A Priori Constraint Bounding (§3.2).
+
+    Returns True if the candidate lies within all hard constraint limits.
+    Any policy where C(A_k) > C_max is pruned *before* Pareto sorting so the
+    orchestrator is only presented with the feasible manifold F.
+
+    Metric units are normalised to match the budget values stored in the
+    constraints dict (which use the same per-epoch units as _score_solution).
+    """
+    metrics     = cand["metrics"]
+    constraints = cand.get("constraints", {})
+    checks = [
+        ("carbon",       float(metrics.get("carbon_emissions", 0.0)) / 1000.0),
+        ("water",        float(metrics.get("water_usage",      0.0)) / 100.0),
+        ("cost",         float(metrics.get("energy_cost",      0.0))),
+        ("total_energy", float(metrics.get("total_energy",     0.0))),
+    ]
+    for key, val in checks:
+        cfg    = constraints.get(key, {})
+        budget = float(cfg.get("budget", 0.0)) if isinstance(cfg, dict) else 0.0
+        if budget > 0.0 and val > budget:
+            return False
+    return True
 
 
 def _is_dominated(candidate: dict, others: list) -> bool:
@@ -1279,7 +1714,7 @@ def _build_training_schedule(population, n_steps: int) -> list:
 
 # ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
 def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
-    global _PARETO_TRACKER, _GLOBAL_AGENT
+    global _PARETO_TRACKER, _GLOBAL_AGENT, _GLOBAL_ADJ
 
     spec_dir  = epoch_summary.get("spec_dir", "sim_specs")
     epoch_len = int(epoch_summary.get("epoch_length", 900))
@@ -1291,15 +1726,24 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
     dc_to_idx    = {int(dc_id): idx for idx, dc_id in enumerate(dc_ids)}
 
     if _GLOBAL_AGENT is None or _GLOBAL_AGENT.num_dcs != real_num_dcs:
-        print(f"[INIT] Booting HybridPSLAgent ({real_num_dcs} DCs) — offline 3-layer / online 2-layer Transformer")
+        print(f"[INIT] Booting HybridPSLAgent ({real_num_dcs} DCs) — "
+              f"GAT offline 3-layer / online 2-layer | FOMAML | K={N_CRITICS} critics")
         _GLOBAL_AGENT = HybridPSLAgent(real_num_dcs, 6, cond_dim=COND_DIM)
 
-    agent = _GLOBAL_AGENT
+    # ── Build latency adjacency for GAT topology-aware attention ─────────────
+    lat_raw = getattr(getattr(temp_sim, "network", None), "lat", None)
+    if lat_raw is not None and len(lat_raw) >= real_num_dcs:
+        _GLOBAL_ADJ = _build_adjacency(lat_raw, dc_ids)
+    else:
+        _GLOBAL_ADJ = None   # GAT falls back to uniform attention
 
-    # Sync offline → online at epoch start (warm-start)
+    agent = _GLOBAL_AGENT
+    adj   = _GLOBAL_ADJ
+
+    # Sync offline → online at epoch start (FOMAML warm-start)
     agent.prepare_epoch()
-    print(f"[EPOCH {epoch_idx}] Online adapter warm-started from offline base. "
-          f"Offline buffer size: {len(agent.offline.buffer)}")
+    print(f"[EPOCH {epoch_idx}] Online adapter warm-started from offline base (FOMAML). "
+          f"Offline buffer: {len(agent.offline.buffer)} | adj: {'✓' if adj is not None else '—'}")
 
     # ── Clean epoch data ──────────────────────────────────────────────────────
     clean_data = epoch_data.copy() if isinstance(epoch_data, pd.DataFrame) else pd.DataFrame(epoch_data)
@@ -1381,7 +1825,7 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
     phase1_bar.set_postfix(reward=0.0, noise=NOISE_INIT, pref="?")
 
     for pref_vec, cond_vec, constraints in phase1_bar:
-        full_action = agent.select_action(current_state, cond_vec, exploration=True)
+        full_action = agent.select_action(current_state, cond_vec, exploration=True, adj=adj)
 
         w_small       = _normalize_weights(full_action[0:real_num_dcs])
         w_large       = _normalize_weights(full_action[real_num_dcs:2 * real_num_dcs])
@@ -1396,20 +1840,22 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
 
         metrics, _, dc_usage = temp_sim.run_epoch(epoch_idx, clean_data, schedule_plan, power_plan)
 
-        # Seed the normalizer before scoring so denominators are correct from step 1
         _NORM.update(metrics)
         reward = np.clip(
             _score_solution(metrics, power_sliders, dc_usage, pref_vec, constraints, dc_to_idx),
             -REWARD_CLIP, REWARD_CLIP
         ) * 0.01
 
-        # Push to BOTH buffers via HybridPSLAgent
+        # Record whether this preference vector caused a constraint violation
+        # (used by build_preference_cloud for constraint-aware oversampling)
+        _record_preference_outcome(
+            pref_vec,
+            violated=not _constraints_satisfied({"metrics": metrics, "constraints": constraints})
+        )
+
         agent.push(current_state, cond_vec, full_action, reward, current_state, False)
+        agent.train_online(ONLINE_GRAD_STEPS_PER_ENV, adj=adj)
 
-        # Online gradient steps (fast adaptation, GAMMA=0)
-        agent.train_online(ONLINE_GRAD_STEPS_PER_ENV)
-
-        # Update postfix: dominant preference dimension label for readability
         dom   = int(np.argmax(pref_vec))
         label = ["time", "carbon", "water", "cost"][dom]
         phase1_bar.set_postfix(
@@ -1503,7 +1949,7 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
             if forced_action is not None:
                 full_action = forced_action.copy()
             else:
-                full_action = agent.select_action(current_state, cond_vec, exploration=False)
+                full_action = agent.select_action(current_state, cond_vec, exploration=False, adj=adj)
                 if variant_tag == "perturb":
                     for k in range(NUM_MODEL_CLASSES):
                         s_i, e_i = k * real_num_dcs, (k + 1) * real_num_dcs
@@ -1556,7 +2002,7 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
             candidate_solutions[i] = _evaluate_candidate(cand)
             steps_per_cand = max(1, OFFLINE_GRAD_STEPS // max(1, len(candidate_inputs)))
             for _ in range(steps_per_cand):
-                l = agent.offline.train_step()
+                l = agent.offline.train_step(adj=adj)
                 if l is not None:
                     offline_losses_seq.append(l)
             if offline_losses_seq:
@@ -1567,7 +2013,7 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
             fut_to_idx = {ex.submit(_evaluate_candidate, c): i for i, c in enumerate(candidate_inputs)}
             candidate_solutions = agent.train_offline_concurrent(
-                list(fut_to_idx.keys()), fut_to_idx, candidate_solutions
+                list(fut_to_idx.keys()), fut_to_idx, candidate_solutions, adj=adj
             )
 
     # Push exploitation solutions into both buffers
@@ -1644,11 +2090,15 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
     # ══════════════════════════════════════════════════════════════════════════
     # PARETO SAMPLE SELECTION — maximally spread non-dominated front
     # ══════════════════════════════════════════════════════════════════════════
-    # Run non-domination filter over the ENTIRE candidate pool (not just
-    # "unassigned" candidates — that filter was artificially shrinking the pool).
+    # §3.2 A Priori Constraint Bounding: prune infeasible solutions *before*
+    # Pareto sorting so only the feasible manifold F is presented.
+    feasible_solutions = [c for c in candidate_solutions if _constraints_satisfied(c)]
+    pareto_source      = feasible_solutions if len(feasible_solutions) >= 3 else candidate_solutions
+
+    # Run non-domination filter over the feasible candidate pool.
     keys     = ["avg_ttft", "carbon_emissions", "water_usage", "energy_cost"]
-    non_dom  = [c for c in candidate_solutions if not _is_dominated(c, candidate_solutions)]
-    pareto_pool = non_dom if len(non_dom) >= 3 else candidate_solutions
+    non_dom  = [c for c in pareto_source if not _is_dominated(c, pareto_source)]
+    pareto_pool = non_dom if len(non_dom) >= 3 else pareto_source
 
     if pareto_pool:
         obj_vecs = np.array([[c["metrics"].get(k, 0.0) for k in keys] for c in pareto_pool], dtype=np.float32)
