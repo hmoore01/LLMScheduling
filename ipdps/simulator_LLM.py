@@ -95,31 +95,51 @@ def _map_model_to_llama(m: str) -> str:
     """
     Normalize a raw model-type string to a v2 simulator base model name.
 
-    If the string is already a recognized v2 base model (e.g. 'Llama7b',
-    'Mixtral_8x7B', 'Llama70b') it is returned unchanged — this preserves
-    the richer vocabulary output by BurstGPT_process.py v2.
+    If the string already starts with a recognized v2 base model name it is
+    returned unchanged, preserving the richer vocabulary from BurstGPT_process v2.
 
-    Legacy BurstGPT raw names (ChatGPT, GPT-4) are still mapped for backward
-    compatibility with older trace files.
+    Legacy BurstGPT raw names (ChatGPT, GPT-3.5, GPT-4) are mapped to large-class
+    models — Llama7b is no longer used since the pipeline focuses on 70B+ models.
     """
-    s = str(m).strip()
+    s       = str(m).strip()
     s_lower = s.lower()
 
-    # Already a recognized v2 base model — preserve as-is
+    # Already a recognized v2 base model — preserve as-is (covers all 6 sim models)
     _V2_BASES = ("Llama7b", "Llama70b", "Llama2_70B", "Llama31_405B",
                  "Mixtral_8x7B", "DeepSeek_R1")
     if s.startswith(_V2_BASES):
         return s
 
-    # Legacy BurstGPT raw names
-    if ("chatgpt" in s_lower) or ("gpt-3.5" in s_lower) or ("gpt3.5" in s_lower):
-        return "Llama7b"
+    # Frontier GPT-4 variants → large frontier tier
+    if "gpt-4o" in s_lower or "gpt-4-turbo" in s_lower or "gpt-4-32k" in s_lower:
+        return "Llama31_405B"
     if ("gpt-4" in s_lower) or ("gpt4" in s_lower):
         return "Llama70b"
-    if "70" in s_lower or "70b" in s_lower or "llama-2-70b" in s_lower:
+
+    # GPT-3.5 / ChatGPT — map to large tier (Llama70b) since 7B class is removed
+    if ("chatgpt" in s_lower) or ("gpt-3.5" in s_lower) or ("gpt3.5" in s_lower):
         return "Llama70b"
-    if "7" in s_lower or "7b" in s_lower or "llama-2-7b" in s_lower:
+
+    # Mistral / Mixtral
+    if "mixtral" in s_lower or "mistral" in s_lower:
+        return "Mixtral_8x7B"
+
+    # DeepSeek
+    if "deepseek" in s_lower:
+        return "DeepSeek_R1"
+
+    # Explicit large-class size patterns (must come before generic digit checks)
+    if "405b" in s_lower:
+        return "Llama31_405B"
+    if "70b" in s_lower or "llama-2-70b" in s_lower or "llama2-70b" in s_lower:
+        return "Llama70b"
+
+    # Explicit small-class size pattern — kept for backward compatibility with
+    # traces that still have 7B labels; rare after the pipeline migration
+    if "llama-2-7b" in s_lower or "llama2-7b" in s_lower:
         return "Llama7b"
+
+    # Unknown — pass through; the v2 sim will attempt substring fallback
     return str(m)
 
 
@@ -128,11 +148,28 @@ DEFAULT_POPULATION_WEIGHTS = {0: 0.12, 1: 0.10, 2: 0.08, 3: 0.15, 4: 0.10, 5: 0.
 DEFAULT_TIMEZONE_OFFSETS = {0: -5, 1: -8, 2: -6, 3: 0, 4: 1, 5: 2, 6: 8, 7: 9, 8: 7, 9: -3, 10: 3, 11: 2}
 DEFAULT_BASE_POPULATION = DEFAULT_POPULATION_WEIGHTS
 AUTOSCALE_MAX_MULTIPLIER = 700000.0
-AUTOSCALE_COUNT_SHARE = 0.95
+# Fraction of the autoscale multiplier assigned to ROW replication; the
+# remainder goes to token scaling (then hard-clamped at AUTOSCALE_MAX_TOKEN_SCALE).
+# Lowered from 0.95 -> 0.90 to favour token scaling slightly: fewer replicated
+# rows means fewer per-request scheduling operations, so the simulator runs
+# faster.  The token multiplier is still clamped at AUTOSCALE_MAX_TOKEN_SCALE
+# (2.0x) — request sizes cannot exceed the realistic range no matter what this
+# value is.  This trims count_mult by roughly 20%; it is a modest speedup, not
+# a substitute for reducing run scale or profiling the simulator hot path.
+AUTOSCALE_COUNT_SHARE = 0.90
 AUTOSCALE_MAX_COUNT_MULT = 1000
 AUTOSCALE_MAX_DROP_FRAC = 0.05
 AUTOSCALE_SEARCH_STEPS = 7
 AUTOSCALE_MAX_EXPANDED_ROWS = 250000
+# Maximum factor by which per-request token counts may be inflated during
+# autoscaling.  Load should be scaled primarily by REPLICATING requests (more
+# arrivals = realistic "more traffic"), NOT by multiplying token counts (which
+# turns every request into an unrealistic mega-prompt and inflates TTFT, since
+# TTFT = ms_per_token x tokens).  A modest token bump (<=2x) gives the
+# autoscaler headroom to hit utilisation targets without distorting request
+# sizes the way the old uncapped behaviour did (100x+ token inflation).  Beyond
+# 2x, request-size realism degrades — so row replication must carry the rest.
+AUTOSCALE_MAX_TOKEN_SCALE = 2.0
 
 
 def _even_src_dc(df: pd.DataFrame, num_dcs: int) -> pd.Series:
@@ -270,7 +307,7 @@ def _remap_source_dc(df: pd.DataFrame, active_dc_ids: list,
     redistributed using the chosen distribution strategy.
 
     This is the key function that makes --num-dcs work dynamically without
-    re-running BurstGPT_process.py.
+    re-running trace_process.py.
     """
     num_dcs = len(active_dc_ids)
     dc_set = set(active_dc_ids)
@@ -382,6 +419,59 @@ def _derive_arrival_ms(df: pd.DataFrame, epoch_length_s: int = 900) -> pd.Series
     return pd.Series(0.0, index=df.index, dtype=float)
 
 
+def _apply_prediction_noise(df: pd.DataFrame, noise_level: float, epoch_idx: int) -> pd.DataFrame:
+    """
+    Return a perturbed copy of epoch_data to simulate workload forecast inaccuracy.
+
+    The framework receives this noisy forecast and makes scheduling decisions based
+    on it; the caller retains the original clean epoch_data for any ground-truth
+    bookkeeping.  Three axes of noise are applied jointly:
+
+      token_noise   — each request's token count is scaled by
+                      clip(1 + noise_level * N(0,1), 0.1, ∞)
+      volume_noise  — total request count is scaled by
+                      clip(1 + noise_level * N(0,1), 0.1, ∞) via sample/replicate
+      origin_noise  — fraction `noise_level` of source_dc_id values are
+                      randomly shuffled among the rows (misrouted origins)
+
+    The RNG is seeded from epoch_idx and noise_level for reproducibility.
+    """
+    if noise_level <= 0.0:
+        return df
+    rng = np.random.default_rng(seed=int(epoch_idx) * 997 + int(noise_level * 10_000))
+    out = df.copy()
+
+    # ── Token noise ───────────────────────────────────────────────────────────
+    if "num_tokens" in out.columns:
+        n             = len(out)
+        token_factors = np.maximum(0.1, 1.0 + noise_level * rng.standard_normal(n))
+        out["num_tokens"] = (
+            pd.to_numeric(out["num_tokens"], errors="coerce").fillna(0).to_numpy() * token_factors
+        ).round().astype(int).clip(1)
+
+    # ── Volume noise (request count) ─────────────────────────────────────────
+    n             = len(out)
+    vol_factor    = max(0.1, 1.0 + noise_level * float(rng.standard_normal()))
+    target_n      = max(1, int(round(n * vol_factor)))
+    if target_n < n:
+        out = out.sample(n=target_n, random_state=int(epoch_idx)).reset_index(drop=True)
+    elif target_n > n:
+        extra = out.sample(n=target_n - n, replace=True, random_state=int(epoch_idx) + 1)
+        out   = pd.concat([out, extra], ignore_index=True)
+
+    # ── Origin noise (source DC misassignment) ────────────────────────────────
+    if "source_dc_id" in out.columns and len(out) > 1:
+        n_noisy = max(0, int(len(out) * noise_level))
+        if n_noisy > 0:
+            noisy_idx        = rng.choice(len(out), size=n_noisy, replace=False)
+            dc_vals          = out["source_dc_id"].to_numpy().copy()
+            src_pool         = dc_vals[rng.permutation(len(dc_vals))][:n_noisy]
+            dc_vals[noisy_idx] = src_pool
+            out["source_dc_id"] = dc_vals
+
+    return out
+
+
 def summarize_epoch_rate(df: pd.DataFrame):
     if len(df) == 0:
         return pd.DataFrame(columns=["source_dc_id", "model_type", "tokens"])
@@ -391,6 +481,18 @@ def summarize_epoch_rate(df: pd.DataFrame):
 
 
 def _split_autoscale_multiplier(multiplier: float, count_cap: Optional[int] = None) -> Tuple[int, float]:
+    """Split a total autoscale multiplier into (row-replication, token-scale).
+
+    Load is scaled primarily by replicating rows (realistic: more arrivals).
+    The token multiplier is HARD-CAPPED at AUTOSCALE_MAX_TOKEN_SCALE so the
+    workload never degenerates into a few unrealistically huge requests.
+
+    If row replication is capped (by count_cap) and the token cap is also hit,
+    the effective multiplier achieved (count_mult * remainder_scale) will be
+    LESS than the requested multiplier.  That is intentional and honest — the
+    run will reach a lower utilisation rather than fabricate a token-heavy
+    workload to hit the target.
+    """
     m = max(0.0, float(multiplier))
     if m <= 1.0:
         return 1, m
@@ -398,6 +500,17 @@ def _split_autoscale_multiplier(multiplier: float, count_cap: Optional[int] = No
     count_mult = int(math.floor(m * AUTOSCALE_COUNT_SHARE))
     count_mult = max(1, min(count_mult, cap))
     remainder_scale = m / float(count_mult)
+    # Cap token inflation.  Realistic LLM requests are hundreds-to-thousands of
+    # tokens; multiplying that by 100x produces a workload no real system sees.
+    if remainder_scale > AUTOSCALE_MAX_TOKEN_SCALE:
+        achieved = count_mult * AUTOSCALE_MAX_TOKEN_SCALE
+        print(f"[Auto-Scale] WARNING: token scale clamped "
+              f"{remainder_scale:.2f}x -> {AUTOSCALE_MAX_TOKEN_SCALE:.2f}x. "
+              f"Requested multiplier {m:.1f}x, achievable only {achieved:.1f}x "
+              f"(rows x{count_mult}, tokens x{AUTOSCALE_MAX_TOKEN_SCALE:.2f}). "
+              f"Target utilisation may not be reached — raise --autoscale-max-rows "
+              f"to allow more row replication if higher load is needed.")
+        remainder_scale = AUTOSCALE_MAX_TOKEN_SCALE
     return count_mult, remainder_scale
 
 
@@ -408,30 +521,46 @@ def _apply_autoscale_multiplier(
         epoch_length_s: int = 900,
         count_cap: Optional[int] = None,
 ) -> Tuple[pd.DataFrame, int, float]:
+    """Scale an epoch's load by (row replication x token scaling).
+
+    Memory-light builder: the previous implementation held `count_mult`
+    separate DataFrame copies in a Python list AND the concatenated result
+    simultaneously (~2x peak memory), which OOM-killed runs at large
+    count_mult.  This version tiles the underlying numpy arrays once and
+    builds the result frame in a single allocation.  The output is
+    row-equivalent to the old builder (same rows, same token counts, same
+    arrival distribution); row ORDER differs (block-tiled vs interleaved),
+    which does not affect the simulation — Rate_Flow_Sim schedules by each
+    request's arrival_ms against a node-availability heap, not by row order,
+    and post-jitter arrival times are unique.
+    """
     out = epoch_data.copy()
     count_mult, remainder_scale = _split_autoscale_multiplier(multiplier, count_cap=count_cap)
 
     if count_mult > 1:
+        n_base = len(out)
         base_arrival_ms = _derive_arrival_ms(out, epoch_length_s=epoch_length_s).to_numpy(copy=True)
-        repeated_parts = []
-        for rep in range(count_mult):
-            part = out.copy()
-            part["_dup_id"] = rep
-            part["_base_arrival_ms"] = base_arrival_ms
-            repeated_parts.append(part)
-        out = pd.concat(repeated_parts, ignore_index=True)
+
+        # Tile every column count_mult times in one pass — no per-copy list.
+        # np.tile on each column array, then build the frame once.
+        tiled = {}
+        for col in out.columns:
+            tiled[col] = np.tile(out[col].to_numpy(), count_mult)
+        out = pd.DataFrame(tiled)
+
+        # dup_idx: which replica each row belongs to.  Block-tiled order means
+        # rows [0:n_base] are replica 0, [n_base:2*n_base] replica 1, etc.
+        dup_idx = np.repeat(np.arange(count_mult, dtype=float), n_base)
+        base_arr = np.tile(base_arrival_ms, count_mult)
 
         epoch_window_ms = float(max(1, int(epoch_length_s))) * 1000.0
         rng = np.random.default_rng(100000 + int(epoch_idx))
         slot_ms = epoch_window_ms / float(count_mult)
-        dup_idx = pd.to_numeric(out["_dup_id"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
-        base_arr = pd.to_numeric(out["_base_arrival_ms"], errors="coerce").fillna(0.0).to_numpy(dtype=float)
         jitter_ms = rng.uniform(0.0, slot_ms, size=len(out))
         new_arrival_ms = (base_arr + (dup_idx * slot_ms) + jitter_ms) % epoch_window_ms
         out["arrival_ms"] = new_arrival_ms
         if "time_index" in out.columns:
             out["time_index"] = np.floor(new_arrival_ms / 1000.0).astype(int)
-        out.drop(columns=["_dup_id", "_base_arrival_ms"], inplace=True, errors="ignore")
 
     out["num_tokens"] = (
         pd.to_numeric(out["num_tokens"], errors="coerce").fillna(0.0) * max(0.0, remainder_scale)
@@ -454,7 +583,20 @@ def _evaluate_autoscale_candidate(
         count_cap=count_cap,
     )
     dry_df = scaled_df.copy()
-    dry_df.rename(columns={"source_dc_id": "source_dc", "model_type": "model", "num_tokens": "tokens"}, inplace=True)
+    # Rename to the canonical column names the v2 sim accepts.
+    # source_dc_id/model_type/num_tokens are also accepted natively by the v2 sim,
+    # but renaming keeps this dry-run path consistent with the framework's own
+    # data-cleaning step and avoids any ambiguity in the fallback lookup chain.
+    dry_df.rename(
+        columns={
+            "source_dc_id":  "source_dc",
+            "model_type":    "model",
+            "num_tokens":    "tokens",
+            "prompt_tokens": "prefill_tokens",   # informational; sim ignores unknown cols
+            "gen_tokens":    "decode_tokens",    # informational; sim ignores unknown cols
+        },
+        inplace=True,
+    )
     dry_stats, dry_details, _ = dry_sim.run_epoch(epoch_idx, dry_df, schedule_plan={}, power_plan={"all": "ON"})
 
     epoch_ms = float(getattr(dry_sim, "epoch_length", 900)) * 1000.0
@@ -510,23 +652,75 @@ def _build_global_peak_plan(
     desired_multiplier = min(float(max_multiplier), float(raw_multiplier))
 
     count_cap_global = max(1, int(max_rows // max(1, int(max_epoch_rows))))
-    high_eval = _evaluate_autoscale_candidate(
-        dry_sim, int(peak_epoch), peak_df, float(desired_multiplier), count_cap=count_cap_global
+
+    # ── Memory-safe util estimate via linear extrapolation ───────────────────
+    # The peak epoch needs count_mult in the thousands to reach target_util.
+    # Building that full ~14M-row frame just to MEASURE util OOM-kills the run
+    # (the autoscaler co-resides with the framework agent in the same process).
+    # STEP-3 diagnostics showed util scales ~linearly with the load multiplier
+    # in the regime where count_mult is free to grow, so: measure util at a
+    # small, cheap multiplier (PROBE_MULT below -> ~PROBE_MULT x base rows,
+    # well within memory), then extrapolate linearly.  The REAL epoch loop
+    # still builds the true full frame once with the chosen multiplier.
+    PROBE_MULT = 100.0   # ~100x base epoch rows for the probe — cheap, safe
+    probe_eval = _evaluate_autoscale_candidate(
+        dry_sim, int(peak_epoch), peak_df, PROBE_MULT, count_cap=count_cap_global
     )
+    probe_util = float(probe_eval.get("util", 0.0))
+    probe_drop = float(probe_eval.get("drop_frac", 0.0))
+    # util-per-unit-multiplier from the probe; fall back to the 1x baseline
+    # ratio if the probe somehow returned zero.
+    if probe_util > 0.0:
+        util_per_mult = probe_util / PROBE_MULT
+    else:
+        util_per_mult = peak_util  # baseline ratio (util at multiplier 1)
+    # Multiplier predicted to hit target_util under the linear model.
+    extrapolated_multiplier = float(target_util) / max(util_per_mult, 1e-12)
+    desired_multiplier = min(float(max_multiplier), float(extrapolated_multiplier))
+
+    # Predict util/drop at the chosen multiplier WITHOUT building the full
+    # frame: util extrapolates linearly; drop is taken from the probe (a
+    # conservative proxy — if the small probe already drops, the full run will
+    # too, and the drop-search below will pull the multiplier back).
+    predicted_util = min(1.0, util_per_mult * desired_multiplier)
+    high_eval = {
+        "multiplier": desired_multiplier,
+        "count_mult": _split_autoscale_multiplier(desired_multiplier,
+                                                  count_cap=count_cap_global)[0],
+        "remainder_scale": _split_autoscale_multiplier(desired_multiplier,
+                                                       count_cap=count_cap_global)[1],
+        "util": predicted_util,
+        "drop_frac": probe_drop,
+    }
     chosen_eval = high_eval
     drop_limited = False
 
-    if float(high_eval.get("drop_frac", 0.0)) > float(max_drop) and float(desired_multiplier) > 1.0:
+    # If the probe already shows drops above the limit, the workload is
+    # over-subscribed even at PROBE_MULT — binary-search DOWN for a multiplier
+    # whose probe-scaled drop is acceptable.  Each search eval uses the small
+    # PROBE_MULT-scaled frame, so the search itself stays memory-safe.
+    if probe_drop > float(max_drop) and desired_multiplier > 1.0:
         low = 1.0
         high = float(desired_multiplier)
-        best = _evaluate_autoscale_candidate(dry_sim, int(peak_epoch), peak_df, 1.0, count_cap=count_cap_global)
-        if float(best.get("drop_frac", 1.0)) > float(max_drop):
-            best = high_eval
+        best = high_eval
         for _ in range(max(1, int(search_steps))):
             mid = (low + high) / 2.0
-            mid_eval = _evaluate_autoscale_candidate(dry_sim, int(peak_epoch), peak_df, mid, count_cap=count_cap_global)
-            if float(mid_eval.get("drop_frac", 1.0)) <= float(max_drop):
-                best = mid_eval
+            # Probe at a multiplier proportional to mid but capped small for
+            # memory: scale the probe to mid only if mid is itself small,
+            # otherwise probe at PROBE_MULT and extrapolate the drop estimate.
+            probe_at = min(mid, PROBE_MULT)
+            mid_probe = _evaluate_autoscale_candidate(
+                dry_sim, int(peak_epoch), peak_df, probe_at, count_cap=count_cap_global
+            )
+            mid_drop = float(mid_probe.get("drop_frac", 1.0))
+            if mid_drop <= float(max_drop):
+                best = {
+                    "multiplier": mid,
+                    "count_mult": _split_autoscale_multiplier(mid, count_cap=count_cap_global)[0],
+                    "remainder_scale": _split_autoscale_multiplier(mid, count_cap=count_cap_global)[1],
+                    "util": min(1.0, util_per_mult * mid),
+                    "drop_frac": mid_drop,
+                }
                 low = mid
             else:
                 high = mid
@@ -538,6 +732,8 @@ def _build_global_peak_plan(
         "peak_epoch": int(peak_epoch),
         "peak_util_baseline": float(peak_util),
         "raw_multiplier": float(raw_multiplier),
+        "extrapolated_multiplier": float(extrapolated_multiplier),
+        "probe_util": float(probe_util),
         "desired_multiplier": float(desired_multiplier),
         "chosen_multiplier": float(chosen_eval.get("multiplier", desired_multiplier)),
         "chosen_count_mult": int(chosen_eval.get("count_mult", 1)),
@@ -598,6 +794,14 @@ if __name__ == "__main__":
                                  'no-heuristic', 'no-phase2', 'no-sgd',
                                  'no-exploration'],
                         help="Ablation mode: disable one GTARL component for study.")
+    parser.add_argument('--prediction-noise', type=float, default=0.0,
+                        help="Workload forecast inaccuracy level [0.0–1.0]. "
+                             "When > 0, the epoch data passed to the framework is "
+                             "perturbed (token counts, request volume, source DC "
+                             "assignments) while the structure seen by internal "
+                             "simulator calls is unchanged at the OS level. "
+                             "Measures how framework performance degrades when "
+                             "its workload forecast is inaccurate.")
     args = parser.parse_args()
 
     workload_path = "simulator_ready_trace.csv"
@@ -625,7 +829,7 @@ if __name__ == "__main__":
         distribution=args.distribution,
         active_dc_ids=active_dc_ids)
 
-    if "model_type" not in trace.columns: trace["model_type"] = "Llama7b"
+    if "model_type" not in trace.columns: trace["model_type"] = "Llama70b"
     trace["model_type"] = trace["model_type"].astype(str).map(_map_model_to_llama)
     # Preserve scenario column if present (output by BurstGPT_process v2)
     if "scenario" not in trace.columns:
@@ -725,6 +929,11 @@ if __name__ == "__main__":
         from Rate_Flow_Sim_v2 import LLM_Simulator
         autoscale_dry_sim = LLM_Simulator(debug=False, spec_dir=args.spec_dir)
         if autoscale_mode == "global_peak":
+            print(f"[DEBUG] calling _build_global_peak_plan — "
+                  f"number_of_epoch={number_of_epoch} "
+                  f"grouped_trace type={type(grouped_trace).__name__} "
+                  f"n_groups={len(grouped_trace.groups)} "
+                  f"key sample={list(grouped_trace.groups)[:5]}", flush=True)
             global_autoscale_plan = _build_global_peak_plan(
                 dry_sim=autoscale_dry_sim,
                 grouped_trace=grouped_trace,
@@ -735,6 +944,9 @@ if __name__ == "__main__":
                 max_drop=min(1.0, max(0.0, float(getattr(args, "autoscale_max_drop", AUTOSCALE_MAX_DROP_FRAC)))),
                 search_steps=max(1, int(getattr(args, "autoscale_search_steps", AUTOSCALE_SEARCH_STEPS))),
             )
+            print(f"[DEBUG] _build_global_peak_plan RETURNED — "
+                  f"enabled={global_autoscale_plan.get('enabled')} "
+                  f"reason={global_autoscale_plan.get('reason', 'n/a')}", flush=True)
             if bool(global_autoscale_plan.get("enabled", False)):
                 print(
                     f"[Auto-Scale] Global peak epoch {int(global_autoscale_plan['peak_epoch'])} baseline "
@@ -994,7 +1206,11 @@ if __name__ == "__main__":
             print("[DONE]")
             exit(0)
 
+    print(f"[DEBUG] entering main epoch loop — number_of_epoch={number_of_epoch} "
+          f"framework={framework} grouped n_groups={len(grouped_trace.groups)}", flush=True)
     for epoch_idx in range(number_of_epoch):
+        print(f"[DEBUG] epoch loop iter epoch_idx={epoch_idx} "
+              f"in_groups={epoch_idx in grouped_trace.groups}", flush=True)
         if epoch_idx not in grouped_trace.groups:
             print(f"\n--- Epoch {epoch_idx} ({framework}) [ZERO TRAFFIC] ---")
             epoch_data = pd.DataFrame(columns=trace.columns)
@@ -1031,7 +1247,35 @@ if __name__ == "__main__":
                     max_rows = max(1, int(getattr(args, "autoscale_max_rows", AUTOSCALE_MAX_EXPANDED_ROWS)))
                     count_cap_by_rows = max(1, int(max_rows // base_req_count))
                     min_count_for_target = max(1, int(math.ceil((float(args.target_util) * float(total_nodes)) / float(base_req_count))))
-                    count_cap_dynamic = min(count_cap_by_rows, max(AUTOSCALE_MAX_COUNT_MULT, min_count_for_target))
+
+                    # ── Row replication must carry the load ──────────────────
+                    # Token inflation is now hard-capped at AUTOSCALE_MAX_TOKEN_SCALE
+                    # (realistic request sizes).  That means row replication must
+                    # supply the rest of the multiplier.  A do-a-quick-probe to
+                    # estimate the multiplier the peak epoch needs, then ensure
+                    # count_cap is large enough that replication (not token
+                    # scaling) can deliver it.
+                    _probe = _evaluate_autoscale_candidate(
+                        dry_sim, epoch_idx, epoch_data, 1.0, count_cap=1
+                    )
+                    _probe_util = float(_probe.get("util", 0.0))
+                    if _probe_util > 0.0:
+                        _needed_mult = float(args.target_util) / max(_probe_util, 1e-9)
+                        # count_mult must reach ~ needed_mult / token_cap so that
+                        # row replication alone (x token cap) covers the target.
+                        _needed_count = int(math.ceil(_needed_mult / max(1.0, AUTOSCALE_MAX_TOKEN_SCALE)))
+                    else:
+                        _needed_count = AUTOSCALE_MAX_COUNT_MULT
+                    # count_cap is the largest of: the row-budget cap, the static
+                    # floor, the target-coverage estimate, and the replication
+                    # needed for the workload.  The row budget (max_rows) still
+                    # bounds memory — if it is too small to reach target_util via
+                    # replication, _split_autoscale_multiplier will warn and the
+                    # run honestly reaches a lower utilisation.
+                    count_cap_dynamic = min(
+                        count_cap_by_rows,
+                        max(AUTOSCALE_MAX_COUNT_MULT, min_count_for_target, _needed_count),
+                    )
 
                     base_eval = _evaluate_autoscale_candidate(
                         dry_sim, epoch_idx, epoch_data, 1.0, count_cap=count_cap_dynamic
@@ -1117,8 +1361,17 @@ if __name__ == "__main__":
 
         epoch_counter += 1
 
+        # ── Prediction noise: give the framework a perturbed forecast ─────────
+        _pred_noise = float(getattr(args, "prediction_noise", 0.0))
+        if _pred_noise > 0.0:
+            framework_epoch_data = _apply_prediction_noise(epoch_data, _pred_noise, epoch_idx)
+            print(f"  [PredNoise] noise={_pred_noise:.2f} | "
+                  f"real_reqs={len(epoch_data)} → forecast_reqs={len(framework_epoch_data)}")
+        else:
+            framework_epoch_data = epoch_data
+
         stats, results, leftovers = FW.milp_optimizer(
-            epoch_data=epoch_data,
+            epoch_data=framework_epoch_data,
             epoch_idx=epoch_idx,
             node_properties=node_properties,
             epoch_summary={

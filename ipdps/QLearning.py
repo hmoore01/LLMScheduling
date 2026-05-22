@@ -86,7 +86,16 @@ def milp_optimizer(epoch_data: pd.DataFrame, epoch_idx: int, **kwargs):
     target_dc = int(dc_ids[action_idx])
 
     dc_capacity = _dc_token_capacity(sim, epoch_length)
-    target_cap = dc_capacity.get(target_dc, 1.0)
+
+    # ── Target SET: the agent's chosen DC plus the next-highest-capacity DCs,
+    # totalling half of all DCs (rounded up).  Routing across a set instead of
+    # a single DC keeps queues shallow — a single target forces every request
+    # onto one DC until it saturates, producing deep queues and high TTFT.
+    n_targets = max(1, (len(dc_ids) + 1) // 2)
+    others = sorted((d for d in dc_ids if d != target_dc),
+                    key=lambda d: dc_capacity.get(d, 0.0), reverse=True)
+    target_set = [target_dc] + others[:n_targets - 1]
+    set_cap = {d: dc_capacity.get(d, 1.0) for d in target_set}
 
     plan_map = {}
     req_rows = []
@@ -94,11 +103,13 @@ def milp_optimizer(epoch_data: pd.DataFrame, epoch_idx: int, **kwargs):
 
     for idx, row in enumerate(sim_data.itertuples(index=False)):
         tokens = max(1, int(row.tokens))
-        if routed_tokens[target_dc] + tokens <= target_cap:
-            tgt = target_dc
-        else:
-            available_caps = {d: dc_capacity.get(d, 0.0) - routed_tokens[d] for d in dc_ids if d != target_dc}
-            tgt = max(available_caps, key=available_caps.get) if available_caps and max(available_caps.values()) > 0 else target_dc
+        # Least-loaded-relative-to-capacity placement within the target set
+        # (the same rule Helix uses).  Falls back to any DC with spare capacity.
+        best = min(target_set, key=lambda d: routed_tokens[d] / set_cap[d])
+        if routed_tokens[best] + tokens > set_cap[best]:
+            spare = {d: dc_capacity.get(d, 0.0) - routed_tokens[d] for d in dc_ids}
+            best = max(spare, key=spare.get) if max(spare.values()) > 0 else best
+        tgt = best
 
         routed_tokens[tgt] += tokens
         plan_map[idx] = tgt
@@ -115,10 +126,10 @@ def milp_optimizer(epoch_data: pd.DataFrame, epoch_idx: int, **kwargs):
     active_dcs = {dc for dc, load in routed_tokens.items() if load > 0}
     power_plan = {}
     for dc in dc_ids:
-        dc_power = {}
-        for nt in node_types:
-            dc_power[nt] = "ON" if dc in active_dcs else "OFF"
-        power_plan[dc] = {"unit": dc_power}
+        # Use {"all": ...} so every unit in the DC is addressed regardless of
+        # its node type ID.  The v2 sim assigns DC-specific type ID ranges, so
+        # a {"unit": {0-5: state}} plan silently fails for most DCs.
+        power_plan[dc] = {"all": "ON" if dc in active_dcs else "OFF"}
 
     sim_out = sim.run_epoch(epoch_idx, requests_df, schedule_plan, power_plan)
     stats, results, leftovers = _normalize_sim_output(sim_out)

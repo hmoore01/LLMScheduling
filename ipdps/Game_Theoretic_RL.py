@@ -9,6 +9,7 @@ import math
 import hashlib
 import os
 import gc
+from typing import Dict, List, Optional, Any, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import Rate_Flow_Sim_v2 as Rate_Flow_Sim
 import threading
@@ -34,7 +35,7 @@ class MetricNormalizer:
         with self.lock:
             ttft   = float(metrics.get("avg_ttft",         0.0))
             carbon = float(metrics.get("carbon_emissions", 0.0)) / 1000.0
-            water  = float(metrics.get("water_usage",      0.0)) / 100.0
+            water  = float(metrics.get("water_usage",      0.0))          # v2 sim: native m³
             cost   = float(metrics.get("energy_cost",      0.0))
 
             req_done = float(metrics.get("requests_completed",
@@ -126,7 +127,7 @@ HER_CROSS_PRIORITY    = 0.4             # Priority discount for cross-agent HER 
 # ─────────────────────────────────────────────────────────────────────────────
 METRIC_KEYS   = ["avg_ttft", "carbon_emissions", "water_usage", "energy_cost"]
 METRIC_LABELS = ["TTFT(s)", "Carbon(kg)", "Water(L)", "Cost($)"]
-METRIC_SCALE  = [1.0, 1/1000.0, 1/100.0, 1.0]  # Raw sim value → display unit
+METRIC_SCALE  = [1.0, 1/1000.0, 1.0, 1.0]  # Raw sim value → display unit  (water: native m³)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # METRIC AGENTS  — exactly 4, one per optimisation objective.
@@ -175,6 +176,22 @@ _POLITICAL_CAPITAL = {}                          # metric_name → float (person
 _EPOCH_HISTORY     = []                          # List of {epoch, metrics} dicts
 _GLOBAL_NORMALIZER = MetricNormalizer()
 ABLATION_MODE      = ""                          # Set externally: no-film, no-veto, etc.
+INFERENCE_ONLY = False
+
+# ── MARLIN integration state ──────────────────────────────────────────────────
+# The shared MARLIN state now lives in Rate_Flow_Sim_v2 (marlin_set_lmp /
+# marlin_get_p_dc) so all frameworks participate automatically via run_epoch().
+# These module-level functions are kept for backward compatibility with any
+# external callers that import them directly from Game_Theoretic_RL.
+
+def set_marlin_lmp(lmp_by_dc: dict) -> None:
+    """Inject dynamic LMP prices — delegates to the Rate_Flow_Sim shared state."""
+    Rate_Flow_Sim.marlin_set_lmp(lmp_by_dc)
+
+
+def get_marlin_p_dc() -> dict:
+    """Return per-DC power draw from the last run_epoch() call."""
+    return Rate_Flow_Sim.marlin_get_p_dc()
 
 CAPITAL_BASE  = 50.0    # Floor: every agent gets at least this much capital
 CAPITAL_TOTAL = 400.0   # Total capital budget distributed across 4 agents
@@ -319,7 +336,7 @@ def _print_epoch_table(epoch_idx: int, all_metrics: dict):
         rows[s] = [
             float(m.get("avg_ttft", 0)),
             float(m.get("carbon_emissions", 0)) / 1000.0,
-            float(m.get("water_usage", 0)) / 100.0,
+            float(m.get("water_usage", 0)),                 # v2 sim: native m³
             float(m.get("energy_cost", 0)),
             int(m.get("requests_completed", 0)),
         ]
@@ -647,7 +664,7 @@ def transfer_agents(source_path: str, target_num_dcs: int):
         print(f"[TRANSFER] Source not found: {source_path}")
         return False
 
-    checkpoint = torch.load(source_path, weights_only=False)
+    checkpoint = torch.load(source_path, map_location=torch.device('cpu'), weights_only=False)
     source_agents = checkpoint.get("agents", {})
 
     if not source_agents:
@@ -837,9 +854,9 @@ class PrioritizedReplayBuffer:
         weights /= weights.max()
 
         state, action, reward, next_state, done = map(np.stack, zip(*batch))
-        return (torch.FloatTensor(state),  torch.FloatTensor(action),
-                torch.FloatTensor(reward), torch.FloatTensor(next_state),
-                torch.FloatTensor(done),   torch.FloatTensor(weights), idxs)
+        return (torch.tensor(state, dtype=torch.float32), torch.tensor(action, dtype=torch.float32),
+                torch.tensor(reward, dtype=torch.float32), torch.tensor(next_state, dtype=torch.float32),
+                torch.tensor(done, dtype=torch.float32), torch.tensor(weights, dtype=torch.float32), idxs)
 
     def update_priorities(self, idxs, td_errors):
         for idx, td in zip(idxs, td_errors):
@@ -1125,13 +1142,18 @@ class SACAgent:
             return None
         state, action, reward, next_state, done, is_w, idxs, bufs = res
 
+        dev = next(self.actor.parameters()).device
+        state, action, reward, next_state, done, is_w = (
+            state.to(dev), action.to(dev), reward.to(dev), next_state.to(dev), done.to(dev), is_w.to(dev)
+        )
+
         bs    = state.size(0)
-        w_b   = torch.FloatTensor(self.weights).unsqueeze(0).expand(bs, -1)
-        s_aug = torch.cat([state.view(bs, -1),      w_b], dim=1)
+        w_b = torch.tensor(self.weights, dtype=torch.float32, device=dev).unsqueeze(0).expand(bs, -1)
+        s_aug = torch.cat([state.view(bs, -1), w_b], dim=1)
         n_aug = torch.cat([next_state.view(bs, -1), w_b], dim=1)
-        rw    = reward.unsqueeze(1)
-        dn    = done.unsqueeze(1)
-        is_w  = is_w.unsqueeze(1)
+        rw = reward.unsqueeze(1)
+        dn = done.unsqueeze(1)
+        is_w = is_w.unsqueeze(1)
 
         # ── Critic update (PER-weighted MSE) ─────────────────────────────
         with torch.no_grad():
@@ -1263,13 +1285,64 @@ def get_rich_state(sim, dc_ids, epoch_data, epoch_idx: int) -> np.ndarray:
     return state
 
 
-def build_power_plan_sliding(dc_ids, slider_values: np.ndarray) -> dict:
+def _get_dc_node_types(sim) -> Dict[int, List[int]]:
+    """
+    Query the simulator for the actual node type IDs used in each DC.
+
+    The v2 simulator assigns a unique node-type-ID range to each DC
+    (e.g. DC0: 0-5, DC1: 6-11, DC8: 8-13).  Power plans must be keyed on
+    these actual IDs; using a hardcoded [0-5] range silently has no effect
+    on DCs whose type IDs differ.
+
+    Returns {dc_id: [sorted list of type_ids]} for every DC in the simulator.
+    Falls back to range(NUM_NODE_TYPES) per DC if the sim cannot be queried.
+    """
+    result: Dict[int, List[int]] = {}
+    try:
+        for dc_id, dc in sim.datacenters.items():
+            type_ids = sorted({
+                getattr(u, "type_id", None)
+                for u in getattr(dc, "units", [])
+                if getattr(u, "type_id", None) is not None
+            })
+            result[int(dc_id)] = type_ids if type_ids else list(range(NUM_NODE_TYPES))
+    except Exception:
+        pass
+    return result
+
+
+def build_power_plan_sliding(dc_ids, slider_values: np.ndarray,
+                             dc_node_types: Optional[Dict[int, List[int]]] = None) -> dict:
+    """
+    Convert continuous power sliders to a per-DC power plan using the actual
+    node type IDs for each DC (queried from the simulator via _get_dc_node_types).
+
+    slider == 0          →  {"all": "OFF"}           (all units powered off)
+    0 < slider < 1       →  graduated IDLE/OFF split  (first n types IDLE, rest OFF)
+    slider == 1          →  {"all": "IDLE"}           (all units IDLE)
+
+    Using the real type IDs ensures the v2 sim's type-based lookup matches
+    the correct units in every DC regardless of its ID range.
+    """
     plan = {}
-    for i, dc_id in enumerate(dc_ids):
-        n = min(max(int(np.floor(float(slider_values[i]) * (NUM_NODE_TYPES + 0.99))), 0), NUM_NODE_TYPES)
-        plan[int(dc_id)] = ({"all": "OFF"} if n == 0 else
-                            {"unit": {str(t): "IDLE" if t < n else "OFF"
-                                      for t in range(NUM_NODE_TYPES)}})
+    for idx, dc_id in enumerate(dc_ids):
+        # Use actual type IDs for this DC; fall back to range(NUM_NODE_TYPES)
+        node_types: List[int] = (
+            dc_node_types.get(int(dc_id), list(range(NUM_NODE_TYPES)))
+            if dc_node_types else list(range(NUM_NODE_TYPES))
+        )
+        n_types = len(node_types)
+        n = min(max(int(np.floor(float(slider_values[idx]) * (n_types + 0.99))), 0), n_types)
+
+        if n == 0:
+            plan[int(dc_id)] = {"all": "OFF"}
+        elif n == n_types:
+            plan[int(dc_id)] = {"all": "IDLE"}
+        else:
+            plan[int(dc_id)] = {
+                "unit": {str(nt): "IDLE" if i < n else "OFF"
+                         for i, nt in enumerate(node_types)}
+            }
     return plan
 
 
@@ -1278,6 +1351,45 @@ def _active_nodes_per_dc(power_sliders) -> np.ndarray:
         min(max(int(np.floor(s * (NUM_NODE_TYPES + 0.99))), 0), NUM_NODE_TYPES)
         for s in np.asarray(power_sliders, dtype=np.float64)
     ], dtype=np.int32)
+
+
+# ── Per-DC throughput capacity ────────────────────────────────────────────────
+# Routing must be proportional to each DC's REAL token throughput, not to its
+# node *count*.  Two DCs with the same node count can have very different
+# token/sec capacity (different accelerators, different ms_per_token).  Routing
+# by node-count overloads slow DCs → deep queues → high TTFT.  This mirrors the
+# capacity computation the heuristic schedulers (Helix, Splitwise) already use.
+_DC_CAPACITY_CACHE: Dict[int, float] = {}
+
+
+def _compute_dc_capacity(sim, dc_ids) -> np.ndarray:
+    """Return a per-DC capacity array (tokens/epoch), aligned to dc_ids order.
+
+    Computed once from the simulator's unit model_perf tables and cached.
+    Falls back to a flat constant if the sim can't be probed.
+    """
+    global _DC_CAPACITY_CACHE
+    epoch_ms = float(getattr(sim, "epoch_length", 900)) * 1000.0
+    caps = {}
+    for dc_id, dc in getattr(sim, "datacenters", {}).items():
+        total = 0.0
+        for unit in getattr(dc, "units", []):
+            best_tpm = 0.0
+            for rec in getattr(unit, "model_perf", {}).values():
+                mpt = float(rec.get("ms_per_token", 0.0))
+                if mpt > 0:
+                    best_tpm = max(best_tpm, 1.0 / mpt)
+            total += best_tpm * epoch_ms
+        caps[int(dc_id)] = max(total, 1.0)
+    _DC_CAPACITY_CACHE = caps
+    return np.array([caps.get(int(d), 1.0) for d in dc_ids], dtype=np.float64)
+
+
+def _dc_capacity_array(dc_ids) -> np.ndarray:
+    """Per-DC capacity aligned to dc_ids, from cache.  Flat fallback if empty."""
+    if not _DC_CAPACITY_CACHE:
+        return np.full(len(dc_ids), float(REQUESTS_PER_NODE_CAP), dtype=np.float64)
+    return np.array([_DC_CAPACITY_CACHE.get(int(d), 1.0) for d in dc_ids], dtype=np.float64)
 
 
 def build_schedule_map(sim_data: pd.DataFrame, dc_ids, w_small, w_large,
@@ -1304,7 +1416,17 @@ def build_schedule_map(sim_data: pd.DataFrame, dc_ids, w_small, w_large,
     s_idx, l_idx = rows[msk].tolist(), rows[~msk].tolist()
 
     active = _active_nodes_per_dc(power_sliders)
-    cap    = active.astype(np.float64) * REQUESTS_PER_NODE_CAP
+    # Capacity = real per-DC token throughput, gated by whether the DC has any
+    # active nodes.  active>0 acts as the on/off mask; real capacity sets the
+    # magnitude.  (Previously: active * REQUESTS_PER_NODE_CAP — node count as a
+    # flat-rate proxy for capacity, which overloaded low-throughput DCs.)
+    real_cap   = _dc_capacity_array(dc_ids)
+    cap_tokens = real_cap * (active > 0).astype(np.float64)
+    # Convert token capacity → request capacity for the discrete allocation
+    # below (counts are in requests).  REQUESTS_PER_NODE_CAP * active gives the
+    # request-count ceiling per DC; we keep that as the hard cap but weight the
+    # *distribution* by real token throughput.
+    cap = active.astype(np.float64) * REQUESTS_PER_NODE_CAP
 
     # Build source_dc lookup: row index → DC index (or -1 if unknown/off)
     dc_id_to_idx = {int(d): i for i, d in enumerate(dc_ids)}
@@ -1332,35 +1454,41 @@ def build_schedule_map(sim_data: pd.DataFrame, dc_ids, w_small, w_large,
         else:
             overflow_idx = list(req_idx)
 
-        # ── Phase B: Distribute overflow by agent weights ─────────────────
+        # ── Phase B: Distribute overflow — route EVERY request (Option A) ──
         if not overflow_idx:
             return alloc
 
         n_ov = len(overflow_idx)
-        ew   = np.asarray(pref_w, np.float64) * active.astype(np.float64)
-        # Zero out DCs with no remaining capacity
-        ew   = ew * (remaining_cap > 0).astype(np.float64)
-        tot  = ew.sum()
+        # Previous behaviour clipped overflow to a hard request-count ceiling
+        # (remaining_cap) and DISCARDED whatever didn't fit — "return alloc #
+        # All DCs full" and the `counts -= max(0, counts - remaining_cap)`
+        # trim.  That silently dropped up to 60%+ of requests at the routing
+        # stage and corrupted avg_ttft (a 98%-drop plan reported the TTFT of
+        # its ~2% queue-bound survivors).
+        #
+        # Fix: route 100% of overflow.  Distribution is weighted by real
+        # throughput capacity so high-capacity DCs absorb proportionally more;
+        # the simulator then reflects genuine over-subscription as real queue
+        # wait_ms — the single source of truth for congestion, exactly as it
+        # is for Helix / Splitwise (which route 100% and never showed this).
+        ew = np.asarray(pref_w, np.float64) * cap_tokens
+        tot = ew.sum()
         if tot <= 0.0:
-            ew  = (remaining_cap > 0).astype(np.float64)
+            # No active DC with positive preference — fall back to raw capacity,
+            # then to uniform, but ALWAYS route somewhere.
+            ew = cap_tokens.astype(np.float64).copy()
             tot = ew.sum()
             if tot <= 0.0:
-                return alloc  # All DCs full
+                ew = np.ones(len(dc_ids), dtype=np.float64)
+                tot = ew.sum()
         ew /= tot
 
-        # Route overflow toward DCs with most remaining capacity to minimise
-        # queuing latency.  Agent weights bias the initial distribution but
-        # remaining_cap re-weights so requests flow to least-loaded DCs first.
-        ew_latency = remaining_cap.copy()
-        ew_latency[active == 0] = 0.0
-        lt = ew_latency.sum()
-        if lt > 0:
-            ew_latency /= lt
-            raw    = ew_latency * n_ov
-            counts = np.floor(raw).astype(np.int64)
-            rem    = n_ov - int(counts.sum())
+        # Largest-remainder split — sums to exactly n_ov, no clipping.
+        raw    = ew * n_ov
+        counts = np.floor(raw).astype(np.int64)
+        rem    = n_ov - int(counts.sum())
+        if rem > 0:
             counts[np.argsort(raw - counts)[::-1][:rem]] += 1
-            counts -= np.maximum(0, counts - remaining_cap.astype(np.int64))
 
         ordered = sorted(overflow_idx,
                          key=lambda r: _stable_hash_int(f"{epoch_idx}:{bucket}:{r}"))
@@ -1370,6 +1498,13 @@ def build_schedule_map(sim_data: pd.DataFrame, dc_ids, w_small, w_large,
                 if ptr < len(ordered):
                     alloc[int(ordered[ptr])] = int(dc_ids[di])
                     ptr += 1
+        # Safety net: any request left unassigned by rounding goes to the
+        # highest-capacity DC rather than being dropped.
+        if ptr < len(ordered):
+            fb = int(np.argmax(cap_tokens)) if cap_tokens.sum() > 0 else 0
+            while ptr < len(ordered):
+                alloc[int(ordered[ptr])] = int(dc_ids[fb])
+                ptr += 1
         return alloc
 
     m = {}
@@ -1468,7 +1603,7 @@ def _score_solution(metrics: dict, power_sliders, dc_usage: dict,
     """
     ttft   = float(metrics.get('avg_ttft',         metrics.get('avg_ttft_sec', 0.0)))
     carbon = float(metrics.get('carbon_emissions', 0.0)) / 1000.0
-    water  = float(metrics.get('water_usage',      0.0)) / 100.0
+    water  = float(metrics.get('water_usage',      0.0))          # v2 sim: native m³
     cost   = float(metrics.get('energy_cost',      0.0))
 
     if update_norm:
@@ -1645,7 +1780,7 @@ def offline_train_epoch(epoch_data, epoch_idx: int, node_properties: dict, epoch
             ps  = _ensure_feasible_power_sliders(
                 full_action[2 * real_num_dcs:], w_s, w_l,
                 has_traffic=True, num_requests=len(clean_data))
-            pp  = build_power_plan_sliding(dc_ids, ps)
+            pp  = build_power_plan_sliding(dc_ids, ps, _dc_node_types)
             sp  = build_schedule_map(clean_data, dc_ids, w_s, w_l, ps, epoch_idx)
 
             metrics, results_list, dc_usage = sim.run_epoch(epoch_idx, clean_data, sp, pp)
@@ -1737,11 +1872,18 @@ def milp_optimizer(epoch_data, epoch_idx: int, node_properties: dict, epoch_summ
     if node_properties:
         dc_id_set.update(int(d) for d in node_properties.keys())
 
-    # Source 2: probe the simulator's datacenter registry
+    # Source 2: probe the simulator's datacenter registry and collect node types
+    _dc_node_types: Dict[int, List[int]] = {}
     try:
         _probe_sim = Rate_Flow_Sim.LLM_Simulator(spec_dir=spec_dir, epoch_length=epoch_len, debug=False)
         if hasattr(_probe_sim, 'datacenters') and _probe_sim.datacenters:
             dc_id_set.update(int(d) for d in _probe_sim.datacenters.keys())
+            # Capture actual per-DC node type IDs once — they come from spec CSVs
+            # and never change across epochs.  All build_power_plan_sliding calls
+            # use these so the type-based lookup in apply_power_plan matches real units.
+            _dc_node_types = _get_dc_node_types(_probe_sim)
+            # Capture real per-DC token throughput for capacity-aware routing.
+            _compute_dc_capacity(_probe_sim, sorted(int(d) for d in _probe_sim.datacenters.keys()))
         del _probe_sim
     except Exception:
         pass
@@ -1853,6 +1995,9 @@ def milp_optimizer(epoch_data, epoch_idx: int, node_properties: dict, epoch_summ
         her_log: list = []
         last_action = last_reward = None
 
+        if INFERENCE_ONLY:
+            pass
+
         if ABLATION_MODE == "no-exploration":
             # Ablation: skip sims, just do gradient steps on stale buffer
             for _ in range(ONLINE_ADJUST_STEPS):
@@ -1867,7 +2012,7 @@ def milp_optimizer(epoch_data, epoch_idx: int, node_properties: dict, epoch_summ
                 ps   = _ensure_feasible_power_sliders(
                     full_action[2 * real_num_dcs:], w_s, w_l,
                     has_traffic=has_traffic, num_requests=len(clean_data))
-                pp   = build_power_plan_sliding(dc_ids, ps)
+                pp   = build_power_plan_sliding(dc_ids, ps, _dc_node_types)
                 sp   = build_schedule_map(clean_data, dc_ids, w_s, w_l, ps, epoch_idx)
 
                 metrics, _, dc_usage = temp_sim.run_epoch(epoch_idx, clean_data, sp, pp)
@@ -1985,7 +2130,7 @@ def milp_optimizer(epoch_data, epoch_idx: int, node_properties: dict, epoch_summ
                 consensus_action = proposals[METRIC_AGENTS[0]].copy()
 
             # ── SGD consensus refinement ──────────────────────────────────────
-            if ABLATION_MODE != "no-sgd":
+            if ABLATION_MODE != "no-sgd" and not INFERENCE_ONLY:
                 c_t   = torch.FloatTensor(consensus_action).unsqueeze(0).requires_grad_(True)
                 g_opt = optim.SGD([c_t], lr=PARLIAMENT_GRAD_LR)
 
@@ -2039,10 +2184,11 @@ def milp_optimizer(epoch_data, epoch_idx: int, node_properties: dict, epoch_summ
         ps_p = _ensure_feasible_power_sliders(
             consensus_action[2 * real_num_dcs:], w_p, wl_p,
             has_traffic=has_traffic, num_requests=len(clean_data))
-        pp_p = build_power_plan_sliding(dc_ids, ps_p)
+        pp_p = build_power_plan_sliding(dc_ids, ps_p, _dc_node_types)
         sp_p = build_schedule_map(clean_data, dc_ids, w_p, wl_p, ps_p, epoch_idx)
 
         scheme_sim = Rate_Flow_Sim.LLM_Simulator(spec_dir=spec_dir, epoch_length=epoch_len, debug=False)
+        # MARLIN: run_epoch() auto-applies LMP override and captures P_dc via Rate_Flow_Sim_v2
         mp, rp, dc_usage = scheme_sim.run_epoch(epoch_idx, clean_data, sp_p, pp_p)
         all_metrics[scheme] = mp
         all_results[scheme] = rp
@@ -2142,11 +2288,15 @@ def milp_optimizer(epoch_data, epoch_idx: int, node_properties: dict, epoch_summ
         _PREV_STATES[ag_name] = curr_state
 
     # Quick online training on fresh data
-    for ag_name in METRIC_AGENTS:
-        ag = _GLOBAL_AGENTS[ag_name]
-        for _ in range(OFFLINE_TRAIN_STEPS):
-            ag.train()
-        ag.epoch_count += 1
+    if not INFERENCE_ONLY:
+        for ag_name in METRIC_AGENTS:
+            ag = _GLOBAL_AGENTS[ag_name]
+            for _ in range(OFFLINE_TRAIN_STEPS):
+                ag.train()
+            ag.epoch_count += 1
+    else:
+        for ag_name in METRIC_AGENTS:
+            _GLOBAL_AGENTS[ag_name].epoch_count += 1
 
     # ── Print unified epoch comparison table ─────────────────────────────
     _print_epoch_table(epoch_idx, all_metrics)
@@ -2222,7 +2372,7 @@ def load_agents(path: str = "gtarl_agents.pt", num_dcs: int = None):
         print(f"[LOAD] File '{path}' not found — starting with fresh agents.")
         return False
 
-    state = torch.load(path, weights_only=False)
+    state = torch.load(path, map_location=torch.device('cpu'), weights_only=False)
 
     # Restore capital
     _POLITICAL_CAPITAL = state["capital"]

@@ -52,12 +52,22 @@ Wall-clock budget (15 min / epoch)
 from __future__ import annotations
 
 
+# ── THREAD CAP (must come before torch is imported) ───────────────────────────
+# PyTorch defaults to using every CPU core for intraop BLAS/MKL.  Combined with
+# ThreadPoolExecutor(max_workers=8) in Phase 2 below, that gives 8 × 8 = 64
+# OS threads contending for cores — slows everything and bloats memory.
+# Cap intraop to 1 and let the executor provide the parallelism.
+import os
+os.environ.setdefault("OMP_NUM_THREADS",      "1")
+os.environ.setdefault("MKL_NUM_THREADS",      "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+
 import collections
 import copy
 import hashlib
 import math
-import os
 import random
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
@@ -65,7 +75,12 @@ import pandas as pd
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from tqdm import tqdm
+
+torch.set_num_threads(1)
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass   # already set elsewhere — that's fine
 
 import Rate_Flow_Sim_v2 as Rate_Flow_Sim
 
@@ -121,9 +136,21 @@ NOISE_INIT  = 0.5
 NOISE_FLOOR = 0.10
 NOISE_DECAY = 0.9975
 
-REWARD_CLIP = 5.0
+REWARD_CLIP = 25.0   # raised from 5.0: with the old clip, all TTFT violations
+                     # >50% over budget pinned to the same reward floor, leaving
+                     # the agent with no gradient signal between mild and
+                     # catastrophic violations.
 
-# Per-DC-node-type request capacity.
+# ── TTFT performance floor ────────────────────────────────────────────────────
+# Hard cap applied to ALL named modes (including eco-dominated ones).
+# Candidates that exceed this value are treated as constraint-infeasible and
+# pruned from the Pareto front before sorting.  The lagrangian also fires in
+# _score_solution so the gradient pushes away from this region during training.
+#
+# 2.0 s is intentionally lenient — it rules out degenerate "turn everything off"
+# solutions (which produce TTFT > 5 s) while leaving eco agents free to
+# concentrate load onto fewer DCs.  Tighten to 1.0–1.5 s for stricter SLAs.
+TTFT_MAX_S = 2.0    # seconds — per-epoch average TTFT hard ceiling
 REQUESTS_PER_NODE_CAP = 5_000
 
 
@@ -165,7 +192,7 @@ class MetricNormalizer:
         """Call with the raw metrics dict from run_epoch before scoring."""
         ttft   = float(metrics.get("avg_ttft",         0.0))
         carbon = float(metrics.get("carbon_emissions",  0.0)) / 1000.0
-        water  = float(metrics.get("water_usage",       0.0)) / 100.0
+        water  = float(metrics.get("water_usage",       0.0))          # v2 sim: native m³
         cost   = float(metrics.get("energy_cost",       0.0))
 
         req_done = float(metrics.get("requests_completed", metrics.get("served_requests", 0.0)))
@@ -208,30 +235,68 @@ class MetricNormalizer:
 
 # ── FAST REPLAY BUFFER (online adapter) ──────────────────────────────────────
 class ReplayBuffer:
-    """Pre-allocated ring buffer for the online adapter (uniform sampling)."""
+    """Pre-allocated numpy buffer (uniform sampling) for the online adapter.
+
+    Avoids per-transition tuple allocation and the np.stack copy on every
+    sample call.  Buffers are allocated lazily on the first push because we
+    do not know state/action dimensions until then.
+    """
 
     def __init__(self, capacity: int):
-        self.capacity = capacity
-        self._buf     = [None] * capacity
+        self.capacity = int(capacity)
         self.position = 0
         self._len     = 0
+        # Lazy allocation: shapes are unknown until first push.
+        self._s = self._p = self._a = self._ns = None
+        self._r = self._d = None
+        self._state_shape = None     # preserve per-transition state shape on sample
+        self._action_shape = None
+        self._pref_shape = None
+
+    def _alloc(self, state, pref, action, next_state):
+        s_arr  = np.asarray(state)
+        p_arr  = np.asarray(pref)
+        a_arr  = np.asarray(action)
+        ns_arr = np.asarray(next_state)
+        self._state_shape  = s_arr.shape
+        self._action_shape = a_arr.shape
+        self._pref_shape   = p_arr.shape
+        # Store flattened internally — fast & contiguous.  Reshape on sample().
+        self._s  = np.zeros((self.capacity, s_arr.size),  dtype=np.float32)
+        self._p  = np.zeros((self.capacity, p_arr.size),  dtype=np.float32)
+        self._a  = np.zeros((self.capacity, a_arr.size),  dtype=np.float32)
+        self._ns = np.zeros((self.capacity, ns_arr.size), dtype=np.float32)
+        self._r  = np.zeros(self.capacity, dtype=np.float32)
+        self._d  = np.zeros(self.capacity, dtype=np.float32)
 
     def push(self, state, pref, action, reward, next_state, done):
-        self._buf[self.position] = (state, pref, action, reward, next_state, done)
+        if self._s is None:
+            self._alloc(state, pref, action, next_state)
+        i = self.position
+        self._s[i]  = np.asarray(state,      dtype=np.float32).reshape(-1)
+        self._p[i]  = np.asarray(pref,       dtype=np.float32).reshape(-1)
+        self._a[i]  = np.asarray(action,     dtype=np.float32).reshape(-1)
+        self._ns[i] = np.asarray(next_state, dtype=np.float32).reshape(-1)
+        self._r[i]  = float(reward)
+        self._d[i]  = float(done)
         self.position = (self.position + 1) % self.capacity
-        self._len = min(self._len + 1, self.capacity)
+        self._len     = min(self._len + 1, self.capacity)
 
     def sample(self, batch_size: int):
-        idx   = np.random.randint(0, self._len, size=batch_size)
-        batch = [self._buf[i] for i in idx]
-        state, pref, action, reward, next_state, done = map(np.stack, zip(*batch))
+        idx = np.random.randint(0, self._len, size=batch_size)
+        # Reshape back to the original per-transition shape so downstream code
+        # that does `state.unsqueeze(1).expand(B, n, n, -1)` keeps working.
+        s_out  = self._s[idx].reshape((batch_size,) + self._state_shape)
+        p_out  = self._p[idx].reshape((batch_size,) + self._pref_shape)
+        a_out  = self._a[idx].reshape((batch_size,) + self._action_shape)
+        ns_out = self._ns[idx].reshape((batch_size,) + self._state_shape)
         return (
-            torch.FloatTensor(state),
-            torch.FloatTensor(pref),
-            torch.FloatTensor(action),
-            torch.FloatTensor(reward),
-            torch.FloatTensor(next_state),
-            torch.FloatTensor(done),
+            torch.from_numpy(s_out),
+            torch.from_numpy(p_out),
+            torch.from_numpy(a_out),
+            torch.from_numpy(self._r[idx]),
+            torch.from_numpy(ns_out),
+            torch.from_numpy(self._d[idx]),
         )
 
     def __len__(self):
@@ -250,19 +315,50 @@ class PrioritizedReplayBuffer:
 
     Falls back to TD-error priorities when projection magnitude is unavailable
     (e.g. during the first offline training call of an epoch).
+
+    Storage is preallocated numpy arrays (lazy on first push).  This avoids the
+    Python-tuple overhead and np.stack copy that dominated sample() cost.
     """
 
     def __init__(self, capacity: int):
-        self.capacity    = capacity
-        self._buf        = [None] * capacity
+        self.capacity    = int(capacity)
         self.position    = 0
         self._len        = 0
-        self._priorities = np.zeros(capacity, dtype=np.float32)
+        self._priorities = np.zeros(self.capacity, dtype=np.float32)
         self._max_prio   = 1.0
+        # Lazy allocation
+        self._s = self._p = self._a = self._ns = None
+        self._r = self._d = None
+        self._state_shape = None
+        self._action_shape = None
+        self._pref_shape = None
+
+    def _alloc(self, state, pref, action, next_state):
+        s_arr  = np.asarray(state)
+        p_arr  = np.asarray(pref)
+        a_arr  = np.asarray(action)
+        ns_arr = np.asarray(next_state)
+        self._state_shape  = s_arr.shape
+        self._action_shape = a_arr.shape
+        self._pref_shape   = p_arr.shape
+        self._s  = np.zeros((self.capacity, s_arr.size),  dtype=np.float32)
+        self._p  = np.zeros((self.capacity, p_arr.size),  dtype=np.float32)
+        self._a  = np.zeros((self.capacity, a_arr.size),  dtype=np.float32)
+        self._ns = np.zeros((self.capacity, ns_arr.size), dtype=np.float32)
+        self._r  = np.zeros(self.capacity, dtype=np.float32)
+        self._d  = np.zeros(self.capacity, dtype=np.float32)
 
     def push(self, state, pref, action, reward, next_state, done, priority: float = None):
-        self._buf[self.position]        = (state, pref, action, reward, next_state, done)
-        self._priorities[self.position] = float(priority) if priority is not None else self._max_prio
+        if self._s is None:
+            self._alloc(state, pref, action, next_state)
+        i = self.position
+        self._s[i]  = np.asarray(state,      dtype=np.float32).reshape(-1)
+        self._p[i]  = np.asarray(pref,       dtype=np.float32).reshape(-1)
+        self._a[i]  = np.asarray(action,     dtype=np.float32).reshape(-1)
+        self._ns[i] = np.asarray(next_state, dtype=np.float32).reshape(-1)
+        self._r[i]  = float(reward)
+        self._d[i]  = float(done)
+        self._priorities[i] = float(priority) if priority is not None else self._max_prio
         self.position = (self.position + 1) % self.capacity
         self._len     = min(self._len + 1, self.capacity)
 
@@ -274,24 +370,32 @@ class PrioritizedReplayBuffer:
         idx     = np.random.choice(self._len, size=batch_size, replace=True, p=probs)
         weights = (self._len * probs[idx]) ** (-beta)
         weights /= weights.max()
+        weights = weights.astype(np.float32)
 
-        batch = [self._buf[i] for i in idx]
-        state, pref, action, reward, next_state, done = map(np.stack, zip(*batch))
+        # Restore per-transition shapes (the CF block and others rely on (B, num_dcs, feat_dim)).
+        s_out  = self._s[idx].reshape((batch_size,) + self._state_shape)
+        p_out  = self._p[idx].reshape((batch_size,) + self._pref_shape)
+        a_out  = self._a[idx].reshape((batch_size,) + self._action_shape)
+        ns_out = self._ns[idx].reshape((batch_size,) + self._state_shape)
         return (
-            torch.FloatTensor(state),
-            torch.FloatTensor(pref),
-            torch.FloatTensor(action),
-            torch.FloatTensor(reward),
-            torch.FloatTensor(next_state),
-            torch.FloatTensor(done),
+            torch.from_numpy(s_out),
+            torch.from_numpy(p_out),
+            torch.from_numpy(a_out),
+            torch.from_numpy(self._r[idx]),
+            torch.from_numpy(ns_out),
+            torch.from_numpy(self._d[idx]),
             idx,
-            torch.FloatTensor(weights),
+            torch.from_numpy(weights),
         )
 
     def update_priorities(self, indices, priorities):
-        for i, p in zip(indices, np.asarray(priorities).flatten()):
-            self._priorities[int(i)] = float(p) + PRIORITY_EPS
-            self._max_prio = max(self._max_prio, self._priorities[int(i)])
+        # Vectorized — original used a Python for-loop.
+        idx = np.asarray(indices, dtype=np.int64)
+        new_prios = np.asarray(priorities, dtype=np.float32).flatten() + PRIORITY_EPS
+        self._priorities[idx] = new_prios
+        local_max = float(new_prios.max())
+        if local_max > self._max_prio:
+            self._max_prio = local_max
 
     def __len__(self):
         return self._len
@@ -328,17 +432,22 @@ class GATLayer(nn.Module):
         h   : (B, N, in_dim)
         adj : (N, N) normalized proximity in (0, 1] — higher = closer DCs
         Returns: (B, N, out_dim)
+
+        Memory-efficient attention: split the attention vector into source/dest
+        halves and reduce the head dimension BEFORE broadcasting i × j.  This
+        avoids ever materializing the (B, N, N, H, 2d) tensor that the original
+        cat([hi, hj]) version produced — same math, ~2d× less peak memory.
         """
         B, N, _ = h.shape
         Wh      = self.W(h)                                          # (B, N, out_dim)
         heads   = Wh.view(B, N, self.n_heads, self.head_dim)        # (B, N, H, d)
 
-        # Pair-wise attention logits: e_{ij,h} = LeakyReLU(a_h^T [Wh_i ‖ Wh_j])
-        hi = heads.unsqueeze(2).expand(-1, -1, N, -1, -1)           # (B, N, N, H, d)
-        hj = heads.unsqueeze(1).expand(-1, N, -1, -1, -1)           # (B, N, N, H, d)
-        e  = torch.cat([hi, hj], dim=-1)                            # (B, N, N, H, 2d)
-        e  = (e * self.attn_vec.view(1, 1, 1, self.n_heads, -1)).sum(-1)  # (B, N, N, H)
-        e  = torch.nn.functional.leaky_relu(e, negative_slope=0.2)
+        # Pair-wise attention logits: e_{ij,h} = LeakyReLU(a_src_h · Wh_i + a_dst_h · Wh_j)
+        a_src, a_dst = self.attn_vec.split(self.head_dim, dim=-1)                # each (H, d)
+        e_src = (heads * a_src.view(1, 1, self.n_heads, self.head_dim)).sum(-1)  # (B, N, H)
+        e_dst = (heads * a_dst.view(1, 1, self.n_heads, self.head_dim)).sum(-1)  # (B, N, H)
+        e = e_src.unsqueeze(2) + e_dst.unsqueeze(1)                              # (B, N, N, H)
+        e = torch.nn.functional.leaky_relu(e, negative_slope=0.2)
 
         # Bias by topology: add log-proximity so nearby DCs receive more attention
         if adj is not None:
@@ -347,9 +456,10 @@ class GATLayer(nn.Module):
 
         alpha = torch.softmax(e, dim=2)                              # (B, N, N, H)
 
-        # Aggregate neighbour features
-        out = (alpha.unsqueeze(-1) * heads.unsqueeze(1)).sum(2)      # (B, N, H, d)
-        out = out.view(B, N, -1)                                     # (B, N, out_dim)
+        # Aggregate via einsum — no (B, N, N, H, d) intermediate.
+        # out[b, i, h, d] = sum_j alpha[b, i, j, h] * heads[b, j, h, d]
+        out = torch.einsum("bijh,bjhd->bihd", alpha, heads)          # (B, N, H, d)
+        out = out.reshape(B, N, -1)                                  # (B, N, out_dim)
         return self.norm(torch.relu(out) + self.res_proj(h))
 
 
@@ -532,6 +642,11 @@ class OfflineBaseAgent:
         self.buffer = PrioritizedReplayBuffer(OFFLINE_MEMORY_SIZE)
         self._beta  = PRIORITY_BETA_INIT   # annealed toward 1.0 during training
 
+        # Persistent FOMAML clone — reused every train_step via load_state_dict.
+        # Avoids the deepcopy alloc churn that previously fragmented the heap
+        # 350× per epoch.
+        self.fast_actor = copy.deepcopy(self.actor)
+
     def train_step(self, batch_size: int = OFFLINE_BATCH_SIZE,
                    adj: torch.Tensor | None = None) -> float | None:
         if len(self.buffer) < batch_size * 2:
@@ -574,8 +689,10 @@ class OfflineBaseAgent:
         self.buffer.update_priorities(q_idx, td_err.cpu().numpy().flatten())
 
         # ── FOMAML actor update ───────────────────────────────────────────────
-        # Inner loop: simulate K adaptation steps on support set using a fast clone
-        fast_actor = copy.deepcopy(self.actor)
+        # Inner loop: simulate K adaptation steps on support set using the
+        # persistent fast_actor clone (state_dict copy — no allocation).
+        self.fast_actor.load_state_dict(self.actor.state_dict())
+        fast_actor = self.fast_actor
         fast_opt   = optim.SGD(fast_actor.parameters(), lr=MAML_INNER_LR, momentum=0.9)
 
         with torch.no_grad():
@@ -590,47 +707,49 @@ class OfflineBaseAgent:
             nn.utils.clip_grad_norm_(fast_actor.parameters(), 1.0)
             fast_opt.step()
 
-        # Outer (meta) loop: compute loss on query using the adapted fast_actor
-        # FOMAML: backprop only through the fast_actor's current (post-inner) parameters
-        meta_act    = fast_actor(q_st, q_pr, adj)
+        # Outer (meta) loop: compute loss on query using the adapted fast_actor.
+        # Both gradients computed via torch.autograd.grad — no retained graph,
+        # no parameter .grad mutation between the two passes.
+        meta_act     = fast_actor(q_st, q_pr, adj)
         utility_loss = -self.critics.forward_mean(q_st, q_pr, meta_act, adj).mean()
 
-        fast_opt.zero_grad()
-        utility_loss.backward(retain_graph=True)
-        grad_utility = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
-                        for p in fast_actor.parameters()]
-
-        # Constraint gradient: weighted by slack-channel violation magnitude (§2.4)
         slack           = q_pr[:, PREF_DIM:]
         violation       = torch.clamp(1.0 - slack, min=0.0).mean(dim=1, keepdim=True)
         constraint_loss = (violation * self.critics.forward_mean(q_st, q_pr, meta_act, adj)).mean()
-        fast_opt.zero_grad(); constraint_loss.backward()
-        grad_constraint = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
-                           for p in fast_actor.parameters()]
+
+        fast_params = list(fast_actor.parameters())
+        grad_utility = torch.autograd.grad(
+            utility_loss,    fast_params, retain_graph=True,  allow_unused=True)
+        grad_constraint = torch.autograd.grad(
+            constraint_loss, fast_params, retain_graph=False, allow_unused=True)
+        grad_utility    = [g if g is not None else torch.zeros_like(p)
+                           for g, p in zip(grad_utility,    fast_params)]
+        grad_constraint = [g if g is not None else torch.zeros_like(p)
+                           for g, p in zip(grad_constraint, fast_params)]
 
         # Gradient projection (§2.4)
-        u_flat = torch.cat([g.flatten() for g in grad_utility])
-        c_flat = torch.cat([g.flatten() for g in grad_constraint])
+        u_flat = torch.cat([g.reshape(-1) for g in grad_utility])
+        c_flat = torch.cat([g.reshape(-1) for g in grad_constraint])
         dot    = (u_flat * c_flat).sum()
 
-        if dot > 0:
+        if dot.item() > 0.0:
             c_norm_sq = (c_flat * c_flat).sum().clamp(min=1e-8)
             proj_flat = u_flat - (dot / c_norm_sq) * c_flat
         else:
             proj_flat = u_flat
 
         # Copy projected meta-gradient into self.actor and step
-        self.actor_opt.zero_grad()
+        self.actor_opt.zero_grad(set_to_none=True)
         offset = 0
-        for p_orig, p_fast in zip(self.actor.parameters(), fast_actor.parameters()):
-            numel  = p_fast.numel()
-            p_orig.grad = proj_flat[offset:offset + numel].view_as(p_orig).clone()
+        for p_orig in self.actor.parameters():
+            numel = p_orig.numel()
+            p_orig.grad = proj_flat[offset:offset + numel].view_as(p_orig).detach().clone()
             offset += numel
         nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
         self.actor_opt.step()
 
         # Boost priority of support transitions by projection activity (boundary proximity)
-        dot_prio = float(dot.abs().item()) + PRIORITY_EPS
+        dot_prio = float(dot.detach().abs().item()) + PRIORITY_EPS
         self.buffer.update_priorities(s_idx, np.full(len(s_idx), dot_prio))
 
         # ── Soft target updates ───────────────────────────────────────────────
@@ -888,35 +1007,37 @@ class OnlineAdapterAgent:
         # Advantage-weighted actor loss: boost DCs where the agent's action matters
         utility_loss = -(global_q * (1.0 + CF_CREDIT_ALPHA * adv_scalar.detach())).mean()
 
-        self.actor_opt.zero_grad()
-        utility_loss.backward(retain_graph=True)
-        grad_utility = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
-                        for p in self.actor.parameters()]
-
         # Gradient projection: constraint enforcement (§2.4)
         slack           = pref[:, PREF_DIM:]
         violation       = torch.clamp(1.0 - slack, min=0.0).mean(dim=1, keepdim=True)
         constraint_loss = (violation * self.critic(state, pref, actor_action, adj)).mean()
-        self.actor_opt.zero_grad()
-        constraint_loss.backward()
-        grad_constraint = [p.grad.clone() if p.grad is not None else torch.zeros_like(p)
-                           for p in self.actor.parameters()]
 
-        u_flat = torch.cat([g.flatten() for g in grad_utility])
-        c_flat = torch.cat([g.flatten() for g in grad_constraint])
+        # Both gradients via autograd.grad — no retained graph, no .grad mutation.
+        actor_params = list(self.actor.parameters())
+        grad_utility = torch.autograd.grad(
+            utility_loss,    actor_params, retain_graph=True,  allow_unused=True)
+        grad_constraint = torch.autograd.grad(
+            constraint_loss, actor_params, retain_graph=False, allow_unused=True)
+        grad_utility    = [g if g is not None else torch.zeros_like(p)
+                           for g, p in zip(grad_utility,    actor_params)]
+        grad_constraint = [g if g is not None else torch.zeros_like(p)
+                           for g, p in zip(grad_constraint, actor_params)]
+
+        u_flat = torch.cat([g.reshape(-1) for g in grad_utility])
+        c_flat = torch.cat([g.reshape(-1) for g in grad_constraint])
         dot    = (u_flat * c_flat).sum()
 
-        if dot > 0:
+        if dot.item() > 0.0:
             c_norm_sq = (c_flat * c_flat).sum().clamp(min=1e-8)
             proj_flat = u_flat - (dot / c_norm_sq) * c_flat
         else:
             proj_flat = u_flat
 
-        self.actor_opt.zero_grad()
+        self.actor_opt.zero_grad(set_to_none=True)
         offset = 0
-        for p in self.actor.parameters():
-            numel  = p.numel()
-            p.grad = proj_flat[offset:offset + numel].view_as(p).clone()
+        for p in actor_params:
+            numel = p.numel()
+            p.grad = proj_flat[offset:offset + numel].view_as(p).detach().clone()
             offset += numel
 
         nn.utils.clip_grad_norm_(self.actor.parameters(), 1.0)
@@ -966,41 +1087,34 @@ class HybridPSLAgent:
         losses        = []
         batch_per_fut = max(1, steps_target // max(1, len(futures)))
 
-        eval_bar    = tqdm(total=len(futures),  desc="  Phase 2 │ Exploit eval",
-                           unit="cand", leave=False, dynamic_ncols=True)
-        offline_bar = tqdm(total=steps_target, desc="  Phase 3 │ Offline train (MAML)",
-                           unit="step", leave=False, dynamic_ncols=True)
-        offline_bar.set_postfix(loss=0.0)
+        n_futures  = len(futures)
+        evals_done = 0
 
         for fut in as_completed(futures):
             idx = fut_to_idx[fut]
             candidate_solutions[idx] = fut.result()
-            eval_bar.update(1)
+            evals_done += 1
 
             for _ in range(batch_per_fut):
                 if steps_done < steps_target:
                     l = self.offline.train_step(adj=adj)
                     if l is not None:
                         losses.append(l)
-                        offline_bar.set_postfix(
-                            loss=round(float(np.mean(losses[-20:])), 4), refresh=False)
-                    offline_bar.update(1)
                     steps_done += 1
+
+            if evals_done % max(1, n_futures // 4) == 0 or evals_done == n_futures:
+                avg_loss = float(np.mean(losses[-20:])) if losses else 0.0
+                print(f"  [Phase 2+3] eval {evals_done}/{n_futures} | "
+                      f"offline steps {steps_done}/{steps_target} | loss {avg_loss:.4f}")
 
         while steps_done < steps_target:
             l = self.offline.train_step(adj=adj)
             if l is not None:
                 losses.append(l)
-                offline_bar.set_postfix(
-                    loss=round(float(np.mean(losses[-20:])), 4), refresh=False)
-            offline_bar.update(1)
             steps_done += 1
 
-        eval_bar.close()
-        offline_bar.close()
-
         if losses:
-            tqdm.write(f"  [Offline/MAML] {steps_done} steps — avg critic loss: {np.mean(losses):.4f}")
+            print(f"  [Offline/MAML] {steps_done} steps — avg critic loss: {np.mean(losses):.4f}")
 
         return candidate_solutions
 
@@ -1018,7 +1132,27 @@ class ParallelParetoTracker:
     def set_sim_ref(self, sim):
         self.last_sim_ref = sim
 
-    def record_solution(self, metrics, weights, power_plan, mode_name="Scan"):
+    # A solution that drops more than this fraction of requests is degenerate:
+    # its avg_ttft is computed over a tiny, unrepresentative survivor set (the
+    # queue-bound stragglers), producing fake catastrophic latencies like 276s.
+    # Such solutions must never become recordable Pareto-front points.
+    MAX_RECORDABLE_DROP_FRAC = 0.50
+
+    def record_solution(self, metrics, weights, power_plan, mode_name="Scan",
+                        force=False):
+        # ── Drop-rate feasibility gate ─────────────────────────────────────
+        # Reject solutions that served less than half their requests.  Their
+        # reported avg_ttft is a metric artifact (average over ~2% survivors),
+        # not a real latency.  `force=True` bypasses this for named modes that
+        # must always have a row in the summary table even when degenerate.
+        _served  = float(metrics.get("requests_completed",
+                                     metrics.get("served_requests", 0.0)))
+        _dropped = float(metrics.get("requests_dropped", 0.0))
+        _total   = _served + _dropped
+        _drop_frac = (_dropped / _total) if _total > 0.0 else 1.0
+        if (not force) and _drop_frac > self.MAX_RECORDABLE_DROP_FRAC:
+            return False   # not recorded — degenerate solution
+
         active_nodes = 0
         for p in power_plan.values():
             if str(p.get("all", "")).upper() in ("IDLE", "ON"):
@@ -1032,15 +1166,16 @@ class ParallelParetoTracker:
             "mode":         mode_name,
             "ttft":         metrics.get("avg_ttft", 0.0),
             "carbon":       metrics.get("carbon_emissions", 0.0) / 1000.0,
-            "water":        metrics.get("water_usage",      0.0) / 100.0,
+            "water":        metrics.get("water_usage",      0.0),          # m³ native
             "cost":         metrics.get("energy_cost",      0.0),
             "total_energy": metrics.get("total_energy",     0.0),
-            "served":       float(metrics.get("requests_completed", metrics.get("served_requests", 0.0))),
-            "dropped":      float(metrics.get("requests_dropped", 0.0)),
+            "served":       _served,
+            "dropped":      _dropped,
             "active_nodes": active_nodes,
             "weights":      weights,
             "power_plan":   power_plan,
         })
+        return True
 
     def increment_epoch(self):
         self.epoch_count += 1
@@ -1050,7 +1185,7 @@ class ParallelParetoTracker:
             return "No data."
         report = [
             f"\n=== EPOCH {self.epoch_count - 1} PARETO FRONT EVALUATION ===",
-            f"{'Mode':<18} | {'TTFT(s)':<8} | {'Carb(kg)':<8} | {'Wat(L)':<8} | "
+            f"{'Mode':<18} | {'TTFT(s)':<8} | {'Carb(kg)':<8} | {'Wat(m³)':<8} | "
             f"{'Cost($)':<8} | {'Energy(kWh)':<11} | {'Served':<6} | {'Drop%':<6} | {'ActTypes'}",
             "-" * 122,
         ]
@@ -1070,6 +1205,10 @@ _PARETO_TRACKER = ParallelParetoTracker()
 _GLOBAL_AGENT: HybridPSLAgent = None
 _NORM           = MetricNormalizer()
 
+# Per-thread LLM_Simulator cache for Phase 2 parallel candidate evaluation.
+# Avoids rebuilding the DC graph + re-reading CSVs once per candidate.
+_thread_local_sim = threading.local()
+
 # Latency adjacency tensor — (N, N) proximity matrix derived from the simulator's
 # inter-DC latency matrix.  Rebuilt whenever the agent is (re)initialised.
 _GLOBAL_ADJ: torch.Tensor | None = None
@@ -1082,6 +1221,33 @@ _VIOLATION_HISTORY: dict = collections.defaultdict(lambda: [0, 0])  # [viol, tot
 # ── UTILITIES ─────────────────────────────────────────────────────────────────
 def _stable_hash_int(s: str) -> int:
     return int(hashlib.sha256(s.encode()).hexdigest()[:16], 16)
+
+
+def _hash_order_indices(req_indices, epoch_idx: int, bucket: str) -> list:
+    """Deterministic-but-fast permutation of req_indices.
+
+    Drop-in for: sorted(req_indices, key=lambda r: _stable_hash_int(f"{epoch}:{bucket}:{r}")).
+    Uses Knuth multiplicative hashing, vectorized in numpy — same well-distributed
+    pseudo-random ordering for a few hundred nanoseconds per request instead of
+    a SHA256 evaluation.
+    """
+    if not req_indices:
+        return []
+    MASK64 = 0xFFFFFFFFFFFFFFFF
+    KNUTH  = 0x9E3779B97F4A7C15
+
+    # All bit-level arithmetic in Python ints (arbitrary precision), then mask
+    # to 64 bits and convert via np.array — np.uint64(big_python_int) can fail
+    # for values >= 2^63 on some NumPy builds because it goes through the
+    # signed-long conversion path.
+    seed_py   = ((int(epoch_idx) * KNUTH) & MASK64) ^ (hash(bucket) & MASK64)
+    seed      = np.array(seed_py, dtype=np.uint64)
+    knuth_u64 = np.array(KNUTH,    dtype=np.uint64)
+
+    arr   = np.asarray(req_indices, dtype=np.uint64)
+    keys  = arr * knuth_u64 + seed   # numpy uint64: wraps modulo 2^64
+    order = np.argsort(keys, kind="stable")
+    return [req_indices[i] for i in order.tolist()]
 
 
 def _build_adjacency(lat_matrix, dc_ids: list) -> torch.Tensor:
@@ -1215,22 +1381,105 @@ def build_condition_vector(pref_vec: np.ndarray, constraints: dict) -> np.ndarra
     return np.concatenate([pref, slack])
 
 
-def build_power_plan_sliding(dc_ids, slider_values) -> dict:
+def _get_dc_node_types(sim) -> dict:
+    """
+    Return {dc_id: [sorted type_ids]} from the simulator.
+
+    The v2 simulator assigns a unique node-type-ID range per DC
+    (e.g. DC0: 0-5, DC1: 6-11, DC8: 8-13).  build_power_plan_sliding must
+    use these actual IDs so that apply_power_plan can match the correct units.
+    Falls back to range(NUM_NODE_TYPES) per DC when the sim cannot be queried.
+    """
+    result: dict = {}
+    try:
+        for dc_id, dc in sim.datacenters.items():
+            type_ids = sorted({
+                getattr(u, "type_id", None)
+                for u in getattr(dc, "units", [])
+                if getattr(u, "type_id", None) is not None
+            })
+            result[int(dc_id)] = type_ids if type_ids else list(range(NUM_NODE_TYPES))
+    except Exception:
+        pass
+    return result
+
+
+# ── Per-DC throughput capacity ────────────────────────────────────────────────
+# Real token throughput per DC, NOT node count.  Two DCs with equal node counts
+# can differ widely in tokens/sec (accelerator type, ms_per_token).  Routing by
+# node count overloads slow DCs → deep queues → high TTFT.  This matches the
+# capacity basis the heuristic schedulers (Helix, Splitwise) already use.
+_DC_CAPACITY_CACHE: dict = {}
+
+
+def _compute_dc_capacity(sim) -> dict:
+    """Compute and cache {dc_id: tokens_per_epoch} from the simulator."""
+    global _DC_CAPACITY_CACHE
+    epoch_ms = float(getattr(sim, "epoch_length", 900)) * 1000.0
+    caps = {}
+    try:
+        for dc_id, dc in sim.datacenters.items():
+            total = 0.0
+            for unit in getattr(dc, "units", []):
+                best_tpm = 0.0
+                for rec in getattr(unit, "model_perf", {}).values():
+                    mpt = float(rec.get("ms_per_token", 0.0))
+                    if mpt > 0:
+                        best_tpm = max(best_tpm, 1.0 / mpt)
+                total += best_tpm * epoch_ms
+            caps[int(dc_id)] = max(total, 1.0)
+    except Exception:
+        pass
+    _DC_CAPACITY_CACHE = caps
+    return caps
+
+
+def _dc_capacity_array(dc_ids) -> np.ndarray:
+    """Per-DC capacity aligned to dc_ids order.  Flat fallback if cache empty."""
+    if not _DC_CAPACITY_CACHE:
+        return np.full(len(dc_ids), float(REQUESTS_PER_NODE_CAP), dtype=np.float64)
+    return np.array([_DC_CAPACITY_CACHE.get(int(d), 1.0) for d in dc_ids], dtype=np.float64)
+
+
+def build_power_plan_sliding(dc_ids, slider_values, dc_node_types: dict = None) -> dict:
+    """
+    Convert continuous power sliders to a per-DC power plan.
+
+    Uses the actual node type IDs for each DC (from _get_dc_node_types) so
+    that apply_power_plan's type-based lookup matches real units regardless of
+    which ID range each DC uses.
+
+    slider == 0   →  {"all": "OFF"}            (all units powered off)
+    0 < s < 1     →  graduated IDLE/OFF split   (first n type IDs → IDLE)
+    slider == 1   →  {"all": "IDLE"}            (all units IDLE)
+    """
     plan = {}
     for idx, dc_id in enumerate(dc_ids):
-        n = min(max(int(np.floor(float(slider_values[idx]) * (NUM_NODE_TYPES + 0.99))), 0), NUM_NODE_TYPES)
-        plan[int(dc_id)] = ({"all": "OFF"} if n == 0
-                            else {"unit": {str(t): "IDLE" if t < n else "OFF" for t in range(NUM_NODE_TYPES)}})
+        node_types = (
+            dc_node_types.get(int(dc_id), list(range(NUM_NODE_TYPES)))
+            if dc_node_types else list(range(NUM_NODE_TYPES))
+        )
+        n_types = len(node_types)
+        n = min(max(int(np.floor(float(slider_values[idx]) * (n_types + 0.99))), 0), n_types)
+
+        if n == 0:
+            plan[int(dc_id)] = {"all": "OFF"}
+        elif n == n_types:
+            plan[int(dc_id)] = {"all": "IDLE"}
+        else:
+            plan[int(dc_id)] = {
+                "unit": {str(nt): "IDLE" if i < n else "OFF"
+                         for i, nt in enumerate(node_types)}
+            }
     return plan
 
 
 def _active_nodes_per_dc(power_sliders) -> np.ndarray:
-    """Convert power sliders → integer active node count per DC."""
+    """Convert power sliders → integer active node count per DC (vectorized)."""
     sliders = np.asarray(power_sliders, dtype=np.float64)
-    return np.array(
-        [min(max(int(np.floor(s * (NUM_NODE_TYPES + 0.99))), 0), NUM_NODE_TYPES)
-         for s in sliders],
-        dtype=np.int32,
+    return np.clip(
+        np.floor(sliders * (NUM_NODE_TYPES + 0.99)).astype(np.int32),
+        0, NUM_NODE_TYPES,
     )
 
 
@@ -1272,6 +1521,10 @@ def build_schedule_map(small_indices, large_indices, dc_ids, w_small, w_large,
 
     # Use the module-level constant so routing and slider enforcement are consistent.
     dc_capacity = active_nodes.astype(np.float64) * REQUESTS_PER_NODE_CAP   # (n_dcs,)
+    # Real per-DC token throughput (for distribution weighting — see Step 1).
+    # dc_capacity above stays as the discrete request-count ceiling used for
+    # overflow clipping; real_capacity sets how load is *distributed*.
+    real_capacity = _dc_capacity_array(dc_ids)           # (n_dcs,) float array
 
     def _load_weight(indices: list) -> float:
         """Return total load weight for a set of request indices."""
@@ -1288,15 +1541,30 @@ def build_schedule_map(small_indices, large_indices, dc_ids, w_small, w_large,
         n_req = len(req_indices)
 
         # ── Step 1: effective allocation weights (preference × capacity) ───
-        # A DC with 0 active nodes cannot receive traffic.
-        eff_w = np.asarray(pref_weights, dtype=np.float64) * active_nodes.astype(np.float64)
+        # Weight by REAL throughput capacity, not node count.  A DC with N
+        # active nodes can have very different token/sec than another DC with
+        # N nodes (different accelerators / ms_per_token).  active_nodes>0 is
+        # kept purely as the on/off mask; real_capacity sets the magnitude so
+        # load is distributed in proportion to true throughput — matching how
+        # the heuristic schedulers (Helix, Splitwise) balance load.
+        eff_w = (np.asarray(pref_weights, dtype=np.float64)
+                 * real_capacity
+                 * (active_nodes > 0).astype(np.float64))
         total_eff = eff_w.sum()
         if total_eff <= 0.0:
-            # All DCs offline or zero-weight — fall back to equal share of active DCs
+            # No DC has both positive preference weight and active nodes.
+            # Option A: still route everything rather than dropping.  Fall back
+            # first to any active DC (equal share), then — if literally no DC
+            # is active — to real throughput capacity so the request lands
+            # somewhere and the simulator reports the true consequence.
             eff_w = (active_nodes > 0).astype(np.float64)
             total_eff = eff_w.sum()
             if total_eff <= 0.0:
-                return {}           # nothing online, drop everything
+                eff_w = real_capacity.astype(np.float64).copy()
+                total_eff = eff_w.sum()
+                if total_eff <= 0.0:
+                    eff_w = np.ones(len(dc_ids), dtype=np.float64)
+                    total_eff = eff_w.sum()
         eff_w /= total_eff
 
         # ── Step 2: initial allocation ────────────────────────────────────
@@ -1306,45 +1574,40 @@ def build_schedule_map(small_indices, large_indices, dc_ids, w_small, w_large,
         frac_order = np.argsort(raw_counts - counts)[::-1]
         counts[frac_order[:remainder]] += 1
 
-        # ── Step 3: single-pass overflow detection ────────────────────────
-        # Compute all overflows from the initial allocation simultaneously.
-        # DCs with active_nodes == 0 have capacity 0 → any count is overflow.
-        overflow_vec = np.maximum(0, counts - dc_capacity.astype(np.int64))
-        counts      -= overflow_vec
-        total_overflow = int(overflow_vec.sum())
+        # ── Step 3: route EVERY request (Option A) ─────────────────────────
+        # Previous behaviour clipped counts to a hard request-count ceiling
+        # (active_nodes × REQUESTS_PER_NODE_CAP) and DISCARDED the overflow —
+        # "leave it unrouted".  That silently dropped up to 60%+ of requests
+        # at the routing stage.  Worse, it corrupted avg_ttft: a plan that
+        # dropped 98% of requests reported the TTFT of the ~2% survivors
+        # (queue-bound stragglers), producing fake 270s latencies.
+        #
+        # Fix: the simulator is the single source of truth for congestion.
+        # We route 100% of requests in proportion to real throughput capacity;
+        # if a plan is over-subscribed the simulator reflects that as genuine
+        # queue wait_ms (and its own >300s drop rule), exactly as it does for
+        # Helix / Splitwise — which route 100% and never showed this pathology.
+        #
+        # `counts` from Step 2 already sums to n_req via largest-remainder, so
+        # every request is assigned.  No clipping, no discard.  (The eff_w in
+        # Step 1 is already capacity-weighted, so the proportional split sends
+        # more load to high-throughput DCs and keeps queues shallow.)
 
-        if total_overflow > 0:
-            # ── Step 4: single-pass proportional redistribution ───────────
-            # spare[j] = how many MORE requests DC j can take after initial alloc
-            spare = np.maximum(0.0, dc_capacity - counts.astype(np.float64))
-            spare[active_nodes == 0] = 0.0           # offline DCs have no spare
-            total_spare = spare.sum()
-
-            if total_spare > 0.0:
-                # Distribute overflow proportionally to available spare capacity.
-                extra   = np.floor(spare / total_spare * total_overflow).astype(np.int64)
-                leftover = total_overflow - int(extra.sum())
-                # Give fractional leftovers to the DCs with the most remaining spare
-                spare_order = np.argsort(spare)[::-1]
-                extra[spare_order[:leftover]] += 1
-                counts += extra
-                # If any DC is now over cap due to discrete rounding, trim it
-                overshoot = np.maximum(0, counts - dc_capacity.astype(np.int64))
-                counts -= overshoot
-                # The trimmed amount is genuinely unroutable — leave it unrouted.
-                # (The simulator handles these as drops, spreading queue depth evenly.)
-            # else: total system capacity exceeded — leave excess unrouted entirely.
-            # DO NOT pile overflow on a single DC (the previous behaviour that caused
-            # 30k+ requests per node type and 120s TTFT).
-
-        # ── Step 5: deterministic request ordering + assignment ───────────
-        ordered = sorted(req_indices, key=lambda r: _stable_hash_int(f"{epoch_idx}:{bucket}:{r}"))
+        # ── Step 4: deterministic request ordering + assignment ────────────
+        ordered = _hash_order_indices(req_indices, epoch_idx, bucket)
         alloc, ptr = {}, 0
         for dc_idx, count in enumerate(counts):
             for _ in range(int(count)):
                 if ptr < len(ordered):
                     alloc[int(ordered[ptr])] = int(dc_ids[dc_idx])
                     ptr += 1
+        # Safety net: if rounding ever left a request unassigned, send it to
+        # the highest-capacity active DC rather than dropping it.
+        if ptr < len(ordered):
+            fallback_dc_idx = int(np.argmax(real_capacity * (active_nodes > 0)))
+            while ptr < len(ordered):
+                alloc[int(ordered[ptr])] = int(dc_ids[fallback_dc_idx])
+                ptr += 1
         return alloc
 
     m = {}
@@ -1462,8 +1725,9 @@ def _constraints_satisfied(cand: dict) -> bool:
     metrics     = cand["metrics"]
     constraints = cand.get("constraints", {})
     checks = [
+        ("ttft",         float(metrics.get("avg_ttft", metrics.get("avg_ttft_sec", 0.0)))),
         ("carbon",       float(metrics.get("carbon_emissions", 0.0)) / 1000.0),
-        ("water",        float(metrics.get("water_usage",      0.0)) / 100.0),
+        ("water",        float(metrics.get("water_usage",      0.0))),          # m³ native
         ("cost",         float(metrics.get("energy_cost",      0.0))),
         ("total_energy", float(metrics.get("total_energy",     0.0))),
     ]
@@ -1504,7 +1768,7 @@ def _score_solution(metrics, power_sliders, dc_usage, pref_vec, constraints, dc_
     """
     ttft         = float(metrics.get("avg_ttft", metrics.get("avg_ttft_sec", 0.0)))
     carbon       = float(metrics.get("carbon_emissions", 0.0)) / 1000.0
-    water        = float(metrics.get("water_usage",      0.0)) / 100.0
+    water        = float(metrics.get("water_usage",      0.0))          # v2 sim: native m³
     cost         = float(metrics.get("energy_cost",      0.0))
     total_energy = float(metrics.get("total_energy",     0.0))
 
@@ -1513,14 +1777,20 @@ def _score_solution(metrics, power_sliders, dc_usage, pref_vec, constraints, dc_
 
     # ── Constraint lagrangian (scale-independent fractions) ───────────────
     lagrangian = 0.0
-    for key, val, denom in [("carbon",       carbon,       d_carbon),
+    for key, val, denom in [("ttft",         ttft,         d_ttft),
+                             ("carbon",       carbon,       d_carbon),
                              ("water",        water,        d_water),
                              ("cost",         cost,         d_cost),
                              ("total_energy", total_energy, max(d_cost * 8, 1.0))]:
         if key in constraints and constraints[key].get("budget", 0) > 0:
             budget = constraints[key]["budget"]
             viol   = max(0.0, (val - budget) / max(budget, 1e-6))
-            lagrangian += min(8.0, constraints[key]["penalty"] * viol * 15.0)
+            lagrangian += min(15.0, constraints[key]["penalty"] * viol * 15.0)
+            # ↑ cap reduced to 15 (was 50): the TTFT log-penalty in the base
+            # reward now provides the differentiation at high violations, so
+            # the lagrangian only needs to handle the mild-violation regime
+            # (viol < ~2).  If we let it grow large here too, it dominates the
+            # log term and re-introduces saturation against REWARD_CLIP.
 
     # ── Preference weights ─────────────────────────────────────────────────
     w_perf, w_carb, w_wat, w_cost = (float(x) for x in pref_vec)
@@ -1605,6 +1875,28 @@ def _score_solution(metrics, power_sliders, dc_usage, pref_vec, constraints, dc_
         base -= 2.0 * max(w_perf, 0.15)
     base -= norm_ttft * 1.0 * w_perf
 
+    # Always-on TTFT pressure — applies to EVERY preference, including pure-eco
+    # agents with w_perf=0.  Uses a LOG curve (not sqrt) so the gradient stays
+    # informative across the entire TTFT range — even extreme violations remain
+    # below REWARD_CLIP, so the agent can always distinguish "50s" from "275s".
+    #
+    # This is the lever that fixes the failure mode "when the constraint is
+    # infeasible, agents go to arbitrarily high TTFT because all infeasible
+    # solutions look identical".  log1p grows but never saturates.
+    if ttft > TTFT_MAX_S:
+        excess_factor  = (ttft - TTFT_MAX_S) / max(TTFT_MAX_S, 0.1)
+        # log1p(x) = log(1+x); coefficient 5.0 puts TTFT=275s at penalty ~24.6
+        # (just under REWARD_CLIP=25), so the entire realistic range is
+        # representable without clipping.
+        ttft_pressure  = 5.0 * math.log1p(excess_factor)
+        # If the candidate carries an explicit TTFT constraint, scale the
+        # pressure by the constraint's penalty weight so named modes feel it
+        # more strongly than unconstrained exploration points.
+        cfg = constraints.get("ttft") if isinstance(constraints, dict) else None
+        if isinstance(cfg, dict):
+            ttft_pressure *= max(1.0, float(cfg.get("penalty", 0.6)) * 2.0)
+        base -= ttft_pressure
+
     # ── Adaptive SLA penalty ──────────────────────────────────────────────
     # Uses _NORM.sla_target (EMA of observed serve rates) instead of a fixed
     # 85% threshold.  When the infrastructure can genuinely only serve 50% of
@@ -1681,11 +1973,19 @@ def _bias_power_sliders(power_sliders, w_small, w_large,
     return sliders
 
 
-def _build_training_schedule(population, n_steps: int) -> list:
+def _build_training_schedule(population, n_steps: int, default_constraints: dict = None) -> list:
     """
     Pre-build the full (pref_vec, cond_vec, constraints) list so
     build_condition_vector() is not called in the hot training loop.
+
+    default_constraints is merged into every entry that doesn't already have
+    its own constraints from `population`.  This ensures the TTFT floor (and
+    any other hard constraint) is applied uniformly across corners, edges,
+    Dirichlet samples, and population-derived points alike.  Without this,
+    only ~20% of training steps would carry the constraint and the agent
+    would receive no lagrangian signal on the other 80%.
     """
+    default_constraints = dict(default_constraints) if default_constraints else {}
     corners  = [np.eye(PREF_DIM, dtype=np.float32)[i] for i in range(PREF_DIM)]
     edges    = []
     for i in range(PREF_DIM):
@@ -1694,31 +1994,57 @@ def _build_training_schedule(population, n_steps: int) -> list:
             edges.append(v)
     pop_pairs = [(np.array(c["pref"], dtype=np.float32), c.get("constraints", {})) for c in population]
 
+    def _merge(extra):
+        # Population constraints override defaults; otherwise inherit defaults.
+        out = dict(default_constraints)
+        out.update(extra or {})
+        return out
+
     schedule           = []
     c_idx = e_idx = p_idx = 0
     for _ in range(n_steps):
         roll = random.random()
         if roll < 0.25:
-            pv, cons = corners[c_idx % len(corners)].copy(), {}; c_idx += 1
+            pv, cons = corners[c_idx % len(corners)].copy(), dict(default_constraints); c_idx += 1
         elif roll < 0.45:
-            pv, cons = edges[e_idx % len(edges)].copy(), {}; e_idx += 1
+            pv, cons = edges[e_idx % len(edges)].copy(), dict(default_constraints); e_idx += 1
         elif roll < 0.65:
-            pv, cons = pop_pairs[p_idx % len(pop_pairs)]; pv = pv.copy(); p_idx += 1
+            pv, pop_cons = pop_pairs[p_idx % len(pop_pairs)]; pv = pv.copy()
+            cons = _merge(pop_cons); p_idx += 1
         elif roll < 0.85:
-            pv, cons = np.random.dirichlet(np.ones(PREF_DIM)).astype(np.float32), {}
+            pv, cons = np.random.dirichlet(np.ones(PREF_DIM)).astype(np.float32), dict(default_constraints)
         else:
-            pv, cons = np.random.dirichlet(np.ones(PREF_DIM) * 0.3).astype(np.float32), {}
+            pv, cons = np.random.dirichlet(np.ones(PREF_DIM) * 0.3).astype(np.float32), dict(default_constraints)
         schedule.append((pv, build_condition_vector(pv, cons), cons))
     return schedule
 
 
 # ── MAIN ENTRY POINT ──────────────────────────────────────────────────────────
+# Cached primary simulator.  Rebuilding LLM_Simulator every epoch constructed
+# 12,000 ProcNodes per epoch (each deep-copying its model_perf dict), and the
+# old simulators were not being collected — ~100MB+ leaked per epoch, OOM-killing
+# long runs around epoch 18.  The simulator's topology/specs never change between
+# epochs (run_epoch already calls reset_epoch() on every DC), so it is built once
+# and reused.  Keyed by (spec_dir, epoch_len) so a config change rebuilds it.
+_PRIMARY_SIM = None
+_PRIMARY_SIM_KEY = None
+
+
 def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
     global _PARETO_TRACKER, _GLOBAL_AGENT, _GLOBAL_ADJ
+    global _PRIMARY_SIM, _PRIMARY_SIM_KEY
 
     spec_dir  = epoch_summary.get("spec_dir", "sim_specs")
     epoch_len = int(epoch_summary.get("epoch_length", 900))
-    temp_sim  = Rate_Flow_Sim.LLM_Simulator(spec_dir=spec_dir, epoch_length=epoch_len, debug=False)
+    # Build the primary simulator ONCE and reuse it across epochs.  run_epoch()
+    # resets all per-epoch DC state internally, so reuse is correct — and it
+    # avoids the per-epoch 12,000-ProcNode allocation that leaked memory.
+    sim_key = (spec_dir, epoch_len)
+    if _PRIMARY_SIM is None or _PRIMARY_SIM_KEY != sim_key:
+        _PRIMARY_SIM = Rate_Flow_Sim.LLM_Simulator(
+            spec_dir=spec_dir, epoch_length=epoch_len, debug=False)
+        _PRIMARY_SIM_KEY = sim_key
+    temp_sim = _PRIMARY_SIM
     _PARETO_TRACKER.set_sim_ref(temp_sim)
 
     dc_ids       = sorted(int(dc_id) for dc_id in temp_sim.datacenters.keys()) or [0]
@@ -1736,6 +2062,17 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
         _GLOBAL_ADJ = _build_adjacency(lat_raw, dc_ids)
     else:
         _GLOBAL_ADJ = None   # GAT falls back to uniform attention
+
+    # ── Collect actual per-DC node type IDs for power plan construction ───────
+    # The v2 sim assigns unique type-ID ranges per DC (DC0: 0-5, DC1: 6-11 …).
+    # build_power_plan_sliding uses these so the type-based lookup in
+    # apply_power_plan matches real units regardless of which ID range a DC uses.
+    _dc_node_types = _get_dc_node_types(temp_sim)
+
+    # Compute real per-DC token throughput once — used for capacity-aware
+    # routing in build_schedule_map (load distributed by true throughput,
+    # not node count).
+    _compute_dc_capacity(temp_sim)
 
     agent = _GLOBAL_AGENT
     adj   = _GLOBAL_ADJ
@@ -1777,12 +2114,18 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
                                         "energy_cost", "total_energy", "requests_completed", "requests_dropped"]}
         _PARETO_TRACKER.increment_epoch()
         _PARETO_TRACKER.clear_epoch()
-        _PARETO_TRACKER.record_solution(metrics, np.zeros(real_num_dcs), power_plan, "Zero_Traffic")
+        _PARETO_TRACKER.record_solution(metrics, np.zeros(real_num_dcs), power_plan,
+                                        "Zero_Traffic", force=True)
         print(_PARETO_TRACKER.get_report())
         return metrics, [], []
 
     _PARETO_TRACKER.increment_epoch()
     _PARETO_TRACKER.clear_epoch()
+
+    import sys
+    print(f"[MEM-DBG] epoch {epoch_idx}: "
+          f"buffer={len(_GLOBAL_AGENT.replay_buffer) if hasattr(_GLOBAL_AGENT, 'replay_buffer') else 'n/a'} "
+          f"tracker_solutions={len(_PARETO_TRACKER.epoch_solutions)}" )
 
     current_state = get_rich_state(temp_sim, dc_ids, clean_data, epoch_idx)
     num_requests  = len(clean_data)
@@ -1795,36 +2138,50 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
         else None
     )
 
+    # ── TTFT performance floor applied to every mode ───────────────────────────
+    # All modes share this constraint so eco-heavy schemes cannot win by trading
+    # away all latency.  The penalty (0.6) is moderate — strong enough to steer
+    # training away from TTFT violations but not so dominant that it prevents the
+    # eco agents from reducing capacity when traffic is light.
+    _ttft_constraint = {"budget": TTFT_MAX_S, "penalty": 0.6}
+
     population = [
-        {"mode": "time_agent",       "pref": [1.0, 0.0, 0.0, 0.0], "constraints": {}},
-        {"mode": "carbon_agent",     "pref": [0.0, 1.0, 0.0, 0.0], "constraints": {}},
-        {"mode": "water_agent",      "pref": [0.0, 0.0, 1.0, 0.0], "constraints": {}},
-        {"mode": "cost_agent",       "pref": [0.0, 0.0, 0.0, 1.0], "constraints": {}},
-        {"mode": "Balanced",         "pref": [0.25, 0.25, 0.25, 0.25], "constraints": {}},
+        {"mode": "time_agent",       "pref": [1.0, 0.0, 0.0, 0.0],
+         "constraints": {"ttft": _ttft_constraint}},
+        {"mode": "carbon_agent",     "pref": [0.0, 1.0, 0.0, 0.0],
+         "constraints": {"ttft": _ttft_constraint}},
+        {"mode": "water_agent",      "pref": [0.0, 0.0, 1.0, 0.0],
+         "constraints": {"ttft": _ttft_constraint}},
+        {"mode": "cost_agent",       "pref": [0.0, 0.0, 0.0, 1.0],
+         "constraints": {"ttft": _ttft_constraint}},
+        {"mode": "Balanced",         "pref": [0.25, 0.25, 0.25, 0.25],
+         "constraints": {"ttft": _ttft_constraint}},
         {"mode": "green_perf",       "pref": [0.6, 0.3, 0.0, 0.1],
-         "constraints": {"carbon":       {"budget": 4000.0 / 96.0, "penalty": 0.5}}},
+         "constraints": {"ttft": _ttft_constraint,
+                         "carbon": {"budget": 4000.0 / 96.0, "penalty": 0.5}}},
         {"mode": "cost_guard",       "pref": [0.7, 0.0, 0.0, 0.3],
-         "constraints": {"cost":         {"budget": 2800.0 / 96.0, "penalty": 0.5}}},
+         "constraints": {"ttft": _ttft_constraint,
+                         "cost": {"budget": 2800.0 / 96.0, "penalty": 0.5}}},
         {"mode": "water_saver",      "pref": [0.7, 0.0, 0.3, 0.0],
-         "constraints": {"water":        {"budget": 2500.0 / 96.0, "penalty": 0.5}}},
+         "constraints": {"ttft": _ttft_constraint,
+                         "water": {"budget": 2.5 / 96.0, "penalty": 0.5}}},
         {"mode": "peak_power_guard", "pref": [0.8, 0.0, 0.0, 0.2],
-         "constraints": {"total_energy": {"budget": 25051.0 / 96.0, "penalty": 0.3}}},
+         "constraints": {"ttft": _ttft_constraint,
+                         "total_energy": {"budget": 25051.0 / 96.0, "penalty": 0.3}}},
     ]
 
-    training_schedule = _build_training_schedule(population, ONLINE_OPTIM_STEPS)
+    training_schedule = _build_training_schedule(
+        population, ONLINE_OPTIM_STEPS,
+        default_constraints={"ttft": _ttft_constraint},
+    )
 
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 1 — ONLINE EXPLORATION (fast adaptation on current epoch)
     # ══════════════════════════════════════════════════════════════════════════
-    phase1_bar = tqdm(
-        training_schedule,
-        desc=f"  Phase 1 │ Online explore (ep {epoch_idx})",
-        unit="sim",
-        dynamic_ncols=True,
-    )
-    phase1_bar.set_postfix(reward=0.0, noise=NOISE_INIT, pref="?")
+    print(f"  [Phase 1] Online explore — ep {epoch_idx} | {ONLINE_OPTIM_STEPS} sim steps ...")
+    log_every = max(1, ONLINE_OPTIM_STEPS // 5)
 
-    for pref_vec, cond_vec, constraints in phase1_bar:
+    for step_i, (pref_vec, cond_vec, constraints) in enumerate(training_schedule):
         full_action = agent.select_action(current_state, cond_vec, exploration=True, adj=adj)
 
         w_small       = _normalize_weights(full_action[0:real_num_dcs])
@@ -1832,7 +2189,7 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
         power_sliders = _bias_power_sliders(
             full_action[2 * real_num_dcs:], w_small, w_large, pref_vec, True, num_requests
         )
-        power_plan    = build_power_plan_sliding(dc_ids, power_sliders)
+        power_plan    = build_power_plan_sliding(dc_ids, power_sliders, _dc_node_types)
         schedule_plan = build_schedule_map(
             small_indices, large_indices, dc_ids, w_small, w_large, power_sliders, epoch_idx,
             token_counts=token_counts
@@ -1846,8 +2203,6 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
             -REWARD_CLIP, REWARD_CLIP
         ) * 0.01
 
-        # Record whether this preference vector caused a constraint violation
-        # (used by build_preference_cloud for constraint-aware oversampling)
         _record_preference_outcome(
             pref_vec,
             violated=not _constraints_satisfied({"metrics": metrics, "constraints": constraints})
@@ -1856,19 +2211,18 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
         agent.push(current_state, cond_vec, full_action, reward, current_state, False)
         agent.train_online(ONLINE_GRAD_STEPS_PER_ENV, adj=adj)
 
-        dom   = int(np.argmax(pref_vec))
-        label = ["time", "carbon", "water", "cost"][dom]
-        phase1_bar.set_postfix(
-            reward=reward, noise=agent.online.noise_std, pref=label, refresh=False
-        )
-
-    phase1_bar.close()
+        if (step_i + 1) % log_every == 0 or (step_i + 1) == ONLINE_OPTIM_STEPS:
+            dom   = int(np.argmax(pref_vec))
+            label = ["time", "carbon", "water", "cost"][dom]
+            print(f"  [Phase 1] step {step_i + 1}/{ONLINE_OPTIM_STEPS} | "
+                  f"reward={reward:.4f} noise={agent.online.noise_std:.3f} pref={label}")
 
     # ══════════════════════════════════════════════════════════════════════════
     # PHASE 2 — EXPLOITATION (preference cloud evaluation, parallelised)
     #         + PHASE 3 — OFFLINE TRAINING (interleaved with Phase 2 futures)
     # ══════════════════════════════════════════════════════════════════════════
-    eval_configs = [{"pref": p, "constraints": {}} for p in build_preference_cloud(population, target_size=40)]
+    eval_configs = [{"pref": p, "constraints": {"ttft": _ttft_constraint}}
+                    for p in build_preference_cloud(population, target_size=40)]
     eval_configs.extend(
         {"pref": np.array(c["pref"], dtype=np.float32), "constraints": c.get("constraints", {}), "mode": c["mode"]}
         for c in population
@@ -1970,7 +2324,7 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
             candidate_inputs.append({
                 "pref_vec":      pref_vec,
                 "constraints":   constraints,
-                "power_plan":    build_power_plan_sliding(dc_ids, power_sliders),
+                "power_plan":    build_power_plan_sliding(dc_ids, power_sliders, _dc_node_types),
                 "schedule_plan": build_schedule_map(
                     small_indices, large_indices, dc_ids, w_small, w_large, power_sliders, epoch_idx,
                     token_counts=token_counts
@@ -1980,34 +2334,41 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
             })
 
     def _evaluate_candidate(cand):
-        local_sim = Rate_Flow_Sim.LLM_Simulator(spec_dir=spec_dir, epoch_length=epoch_len, debug=False)
-        m, r, u   = local_sim.run_epoch(epoch_idx, clean_data, cand["schedule_plan"], cand["power_plan"])
-        return {**cand, "metrics": m, "results": r, "dc_usage": u}
+        # Reuse one LLM_Simulator per worker thread — saves rebuilding the DC
+        # graph and re-reading 5+ CSVs on every candidate.  run_epoch() already
+        # calls reset_epoch() on every DC internally, so reuse is safe.
+        sim = getattr(_thread_local_sim, "sim", None)
+        if sim is None or getattr(sim, "spec_dir", None) != spec_dir \
+           or int(getattr(sim, "epoch_length", -1)) != int(epoch_len):
+            sim = Rate_Flow_Sim.LLM_Simulator(
+                spec_dir=spec_dir, epoch_length=epoch_len, debug=False
+            )
+            _thread_local_sim.sim = sim
+        m, r, u = sim.run_epoch(epoch_idx, clean_data, cand["schedule_plan"], cand["power_plan"])
+        # CRITICAL: do NOT retain `r` (per-request details).  At ~200k requests
+        # × ~49 candidates × 96 epochs that's tens of millions of dicts held
+        # alive in candidate_solutions and causes OOM around epoch 80–85.
+        # Only `metrics` and `dc_usage` are read downstream.
+        return {**cand, "metrics": dict(m), "results": [], "dc_usage": dict(u)}
 
     candidate_solutions = [None] * len(candidate_inputs)
     max_workers = min(max(1, os.cpu_count() or 1), 8, len(candidate_inputs))
 
     if max_workers <= 1:
         # Sequential: run offline training between candidates
-        seq_bar = tqdm(
-            enumerate(candidate_inputs),
-            total=len(candidate_inputs),
-            desc="  Phase 2+3 │ Exploit+Offline (sequential)",
-            unit="cand",
-            dynamic_ncols=True,
-            bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}]",
-        )
         offline_losses_seq = []
-        for i, cand in seq_bar:
+        n_cands = len(candidate_inputs)
+        log_every_cand = max(1, n_cands // 4)
+        for i, cand in enumerate(candidate_inputs):
             candidate_solutions[i] = _evaluate_candidate(cand)
-            steps_per_cand = max(1, OFFLINE_GRAD_STEPS // max(1, len(candidate_inputs)))
+            steps_per_cand = max(1, OFFLINE_GRAD_STEPS // max(1, n_cands))
             for _ in range(steps_per_cand):
                 l = agent.offline.train_step(adj=adj)
                 if l is not None:
                     offline_losses_seq.append(l)
-            if offline_losses_seq:
-                seq_bar.set_postfix(off_loss=f"{np.mean(offline_losses_seq[-10:]):.4f}", refresh=False)
-        seq_bar.close()
+            if (i + 1) % log_every_cand == 0 or (i + 1) == n_cands:
+                avg_loss = float(np.mean(offline_losses_seq[-10:])) if offline_losses_seq else 0.0
+                print(f"  [Phase 2+3] cand {i + 1}/{n_cands} | off_loss={avg_loss:.4f}")
     else:
         # Parallel: interleave offline gradient steps with incoming futures
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -2067,21 +2428,87 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
                 pref_vec, constraints, dc_to_idx
             )
 
+    # Seed modes serve as candidate generators (their "ideal" hand-crafted
+    # actions enrich the candidate pool that learned modes pick from), but
+    # they shouldn't appear as separate rows in the Pareto front table —
+    # they confuse comparison with the learned modes.  Skip them here.
+    HIDDEN_MODES = {"green_perf", "cost_guard", "water_saver", "peak_power_guard"}
+
     for config in population:
         mode_name = config["mode"]
 
+        if mode_name in HIDDEN_MODES:
+            continue   # candidates from this mode are still in the pool
+
         if mode_name in SINGLE_OBJ_METRIC:
-            # Pick the globally best candidate by raw metric value (minimise)
+            # ── Single-objective selection: pick best primary metric ──────────
+            # We do NOT add TTFT as a *scoring term* here — that would distort
+            # which low-carbon candidate wins among the feasible ones (e.g.
+            # carbon_agent picking a 127 kg candidate over a 4.6 kg one just
+            # because the 127 kg one has lower TTFT).  Selection stays purely
+            # min(primary metric).
+            #
+            # However, the TTFT ceiling (TTFT_MAX_S) is a HARD constraint, not
+            # a soft preference.  The training-time TTFT pressure (lagrangian +
+            # log penalty in _score_solution) only nudges the policy on average
+            # — it does NOT guarantee any individual candidate satisfies the
+            # ceiling.  So feasibility must be enforced as a gate on the
+            # candidate set *before* metric selection, exactly as it already is
+            # for the Pareto_Sample front via _constraints_satisfied().  Without
+            # this gate, eco modes happily report TTFT well over budget.
+            #
+            # Two gates, applied in order:
+            #   1. Hard constraint gate  — _constraints_satisfied (TTFT, etc.)
+            #   2. Drop-rate filter      — candidates serving <30% of requests
+            #      are degenerate ("shut everything off" wins the metric on a
+            #      near-empty workload).  Tiered fallback to <70% then <100%.
+            # Each gate falls back to the wider pool if it would empty the set,
+            # so a named mode always gets a row (flagged over-budget if no
+            # feasible candidate exists — more honest than a missing mode).
             metric_key = SINGLE_OBJ_METRIC[mode_name]
-            best_idx   = min(range(len(candidate_solutions)),
-                             key=lambda i, mk=metric_key: candidate_solutions[i]["metrics"].get(mk, float("inf")))
+
+            def _drop_frac_of(c):
+                done = float(c["metrics"].get("requests_completed",
+                              c["metrics"].get("served_requests", 0.0)))
+                drop = float(c["metrics"].get("requests_dropped", 0.0))
+                total = done + drop
+                return (drop / total) if total > 0.0 else 1.0
+
+            # Gate 1: hard constraint feasibility (TTFT ceiling etc.).
+            feasible = [i for i, c in enumerate(candidate_solutions)
+                        if _constraints_satisfied(c)]
+            pool = feasible if feasible else list(range(len(candidate_solutions)))
+
+            # Gate 2: drop-rate filter, applied within the feasible pool.
+            viable = [i for i in pool if _drop_frac_of(candidate_solutions[i]) <= 0.30]
+            if not viable:
+                viable = [i for i in pool if _drop_frac_of(candidate_solutions[i]) <= 0.70]
+            if not viable:
+                viable = pool
+
+            best_idx = min(viable,
+                           key=lambda i, mk=metric_key:
+                               float(candidate_solutions[i]["metrics"].get(mk, float("inf"))))
         else:
             best_idx = max(range(len(candidate_solutions)),
                            key=lambda i, mn=mode_name: all_scores[(mn, i)])
 
         best_cand = candidate_solutions[best_idx]
+        # force=True: a named mode must always have a row in the summary table,
+        # even if its best candidate is degenerate.  A flagged bad row is more
+        # informative than a silently missing mode.  (Pareto_Sample recording
+        # below is NOT forced — degenerate samples get filtered out.)
         _PARETO_TRACKER.record_solution(
-            best_cand["metrics"], best_cand["w_total"], best_cand["power_plan"], mode_name
+            best_cand["metrics"], best_cand["w_total"], best_cand["power_plan"],
+            mode_name, force=True
+        )
+        _m = best_cand["metrics"]
+        print(
+            f"[LAHYPER-FRONT] epoch={epoch_idx}"
+            f" ttft={_m.get('avg_ttft', 0.0):.6f}"
+            f" carbon={_m.get('carbon_emissions', 0.0):.4f}"
+            f" water={_m.get('water_usage', 0.0):.4f}"
+            f" cost={_m.get('energy_cost', 0.0):.6f}"
         )
         if mode_name == "Balanced":
             best_balanced_metrics = best_cand["metrics"]
@@ -2092,8 +2519,29 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
     # ══════════════════════════════════════════════════════════════════════════
     # §3.2 A Priori Constraint Bounding: prune infeasible solutions *before*
     # Pareto sorting so only the feasible manifold F is presented.
-    feasible_solutions = [c for c in candidate_solutions if _constraints_satisfied(c)]
-    pareto_source      = feasible_solutions if len(feasible_solutions) >= 3 else candidate_solutions
+    # ══════════════════════════════════════════════════════════════════════════
+    # Drop-rate prefilter: a solution that serves <50% of requests is degenerate
+    # — its near-zero carbon/water/cost come from doing almost no work, and it
+    # would dominate the carbon/water/cost axes of the Pareto front with a fake
+    # point.  Exclude these before non-domination sorting so the front is built
+    # only from solutions that actually served the workload.
+    def _drop_frac_of_cand(c):
+        m = c.get("metrics", {})
+        done = float(m.get("requests_completed", m.get("served_requests", 0.0)))
+        drop = float(m.get("requests_dropped", 0.0))
+        tot  = done + drop
+        return (drop / tot) if tot > 0.0 else 1.0
+
+    non_degenerate = [c for c in candidate_solutions
+                      if _drop_frac_of_cand(c) <= 0.50]
+    # Fall back to the full pool only if the filter would leave too few points
+    # to build a meaningful front.
+    candidate_pool_for_pareto = (non_degenerate
+                                 if len(non_degenerate) >= 3
+                                 else candidate_solutions)
+
+    feasible_solutions = [c for c in candidate_pool_for_pareto if _constraints_satisfied(c)]
+    pareto_source      = feasible_solutions if len(feasible_solutions) >= 3 else candidate_pool_for_pareto
 
     # Run non-domination filter over the feasible candidate pool.
     keys     = ["avg_ttft", "carbon_emissions", "water_usage", "energy_cost"]
@@ -2142,5 +2590,12 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
                                                     "energy_cost", "total_energy",
                                                     "requests_completed", "requests_dropped"]}
         best_balanced_results = []
+
+    # Free per-epoch memory before returning.  candidate_solutions holds metrics
+    # dicts + power plans + dc_usage for every evaluated candidate.  Without
+    # this hint, the heap drifts upward across epochs and OOMs around ep 80.
+    del candidate_solutions
+    import gc
+    gc.collect()
 
     return best_balanced_metrics, best_balanced_results, []

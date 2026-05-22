@@ -265,49 +265,22 @@ def _capacity_per_dc_from_sim(sim: LLM_Simulator) -> Dict[int, float]:
 # -----------------------------
 def _build_power_plan(
     routed_token_share_by_dc: Dict[int, float],
-    epoch_summary: Any,
-) -> Dict[int, Dict[str, Dict[int, str]]]:
+    epoch_summary: Any,        # kept in signature for backward compat; unused
+) -> Dict[int, Dict[str, str]]:
     """
-    Heuristic Idle/Off power plan scaled by per-DC share.
-    epoch_summary may contain:
-      - node_types (default DEFAULT_NODE_TYPES)
-      - min_idle_types (default 1)
-      - max_idle_types (default len(node_types))
+    Build a power plan using the {"all": ...} shorthand so every unit in each
+    DC is addressed regardless of its node type ID.
+
+    The v2 simulator assigns a unique node-type-ID range to each DC
+    (e.g. DC0: 0-5, DC1: 6-11, DC8: 8-13).  A plan keyed on a hardcoded
+    [0-5] list silently has no effect on the majority of DCs.
+
+    DCs with routed traffic  →  IDLE  (ready to accept requests; ~13% idle power)
+    DCs with no traffic      →  OFF   (zero power draw)
     """
-    if isinstance(epoch_summary, dict):
-        node_types = list(epoch_summary.get("node_types", DEFAULT_NODE_TYPES))
-        min_idle = int(epoch_summary.get("min_idle_types", 1))
-        max_idle = int(epoch_summary.get("max_idle_types", len(node_types)))
-    else:
-        node_types = list(DEFAULT_NODE_TYPES)
-        min_idle = 1
-        max_idle = len(node_types)
-
-    max_idle = max(1, min(max_idle, len(node_types)))
-
-    total = sum(max(0.0, v) for v in routed_token_share_by_dc.values()) or 1.0
-    shares = {
-        dc: max(0.0, routed_token_share_by_dc.get(dc, 0.0)) / total
-        for dc in routed_token_share_by_dc
-    }
-
-    power_plan: Dict[int, Dict[str, Dict[int, str]]] = {}
-    for dc, share in shares.items():
-        # More share = fewer Idle node types (high share -> more "On")
-        idle_types = max(
-            min_idle,
-            min(max_idle, int(round((1.0 - share) * len(node_types)))),
-        )
-        idle_types = max(0, min(idle_types, len(node_types)))
-
-        dc_power: Dict[int, str] = {}
-        for idx, nt in enumerate(node_types):
-            if idx < idle_types:
-                dc_power[nt] = "IDLE"
-            else:
-                dc_power[nt] = "OFF"
-        power_plan[int(dc)] = {"unit": dc_power}
-
+    power_plan: Dict[int, Dict[str, str]] = {}
+    for dc, share in routed_token_share_by_dc.items():
+        power_plan[int(dc)] = {"all": "IDLE" if max(0.0, share) > 0.0 else "OFF"}
     return power_plan
 
 

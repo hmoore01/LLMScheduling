@@ -1,73 +1,56 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import numpy as np
+import torch.nn.functional as F
 import pandas as pd
-import random
-import collections
+import numpy as np
 import Rate_Flow_Sim_v2 as Rate_Flow_Sim
 
-REPLAY_BUFFER_MAXLEN = 10_000
 FIXED_VARIANT = "_FP16 (Base)_B16"
 DEFAULT_NODE_TYPES = [0, 1, 2, 3, 4, 5]
 
 
-class QNetwork(nn.Module):
+class ActorCriticNetwork(nn.Module):
     def __init__(self, state_dim, action_dim):
-        super(QNetwork, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(state_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU(),
-            nn.Linear(128, action_dim)
-        )
+        super(ActorCriticNetwork, self).__init__()
+        self.affine = nn.Linear(state_dim, 128)
+        self.action_head = nn.Linear(128, action_dim)
+        self.value_head = nn.Linear(128, 1)
 
     def forward(self, x):
-        return self.fc(x)
+        x = F.relu(self.affine(x))
+        action_prob = F.softmax(self.action_head(x), dim=-1)
+        state_values = self.value_head(x)
+        return action_prob, state_values
 
 
-class DDQNAgent:
+class A2CAgent:
     def __init__(self, state_dim, action_dim, lr=1e-3, gamma=0.99):
         self.state_dim = state_dim
         self.action_dim = action_dim
+        self.model = ActorCriticNetwork(state_dim, action_dim)
+        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         self.gamma = gamma
+        self.log_probs = None
+        self.state_value = None
 
-        self.policy_net = QNetwork(state_dim, action_dim)
-        self.target_net = QNetwork(state_dim, action_dim)
-        self.target_net.load_state_dict(self.policy_net.state_dict())
+    def select_action(self, state):
+        state = torch.from_numpy(state).float()
+        probs, state_value = self.model(state)
+        m = torch.distributions.Categorical(probs)
+        action = m.sample()
+        self.log_probs = m.log_prob(action)
+        self.state_value = state_value
+        return action.item()
 
-        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=lr)
-        self.memory = collections.deque(maxlen=REPLAY_BUFFER_MAXLEN)
-        self.batch_size = 32
+    def update_policy(self, reward, next_state, done):
+        _, next_value = self.model(torch.from_numpy(next_state).float())
+        returns = reward + (self.gamma * next_value.item() * (1 - done))
+        advantage = returns - self.state_value.item()
+        action_loss = -self.log_probs * advantage
+        value_loss = F.mse_loss(self.state_value, torch.tensor([[returns]]))
 
-    def select_action(self, state, epsilon):
-        if random.random() < epsilon:
-            return random.randint(0, self.action_dim - 1)
-        with torch.no_grad():
-            state_t = torch.FloatTensor(state)
-            return self.policy_net(state_t).argmax().item()
-
-    def train_step(self):
-        if len(self.memory) < self.batch_size:
-            return
-
-        batch = random.sample(self.memory, self.batch_size)
-        states, actions, rewards, next_states, dones = zip(*batch)
-
-        states_t = torch.FloatTensor(np.array(states))
-        actions_t = torch.LongTensor(actions).unsqueeze(1)
-        rewards_t = torch.FloatTensor(rewards)
-        next_states_t = torch.FloatTensor(np.array(next_states))
-        dones_t = torch.FloatTensor(dones)
-
-        current_q = self.policy_net(states_t).gather(1, actions_t)
-        next_actions = self.policy_net(next_states_t).argmax(1).unsqueeze(1)
-        next_q = self.target_net(next_states_t).gather(1, next_actions).squeeze(1)
-
-        target_q = rewards_t + (1 - dones_t) * self.gamma * next_q
-
-        loss = nn.MSELoss()(current_q.squeeze(), target_q.detach())
+        loss = action_loss + value_loss
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
@@ -135,17 +118,25 @@ def milp_optimizer(epoch_data: pd.DataFrame, epoch_idx: int, **kwargs):
     action_dim = num_dcs
 
     if _AGENT is None or _AGENT.state_dim != state_dim:
-        _AGENT = DDQNAgent(state_dim, action_dim)
+        _AGENT = A2CAgent(state_dim, action_dim)
 
-    epsilon = max(0.01, 1.0 - (epoch_idx / 100))
     current_state = _last_state if _last_state is not None and len(_last_state) == state_dim else np.zeros(state_dim,
                                                                                                            dtype=float)
 
-    action_idx = int(_AGENT.select_action(current_state, epsilon))
+    action_idx = int(_AGENT.select_action(current_state))
     target_dc = int(dc_ids[action_idx])
 
     dc_capacity = _dc_token_capacity(sim, epoch_length)
-    target_cap = dc_capacity.get(target_dc, 1.0)
+
+    # ── Target SET: agent's chosen DC plus next-highest-capacity DCs, totalling
+    # half of all DCs (rounded up).  Routing across a set instead of a single
+    # DC keeps queues shallow — a single target forces every request onto one
+    # DC until it saturates, producing deep queues and high TTFT.
+    n_targets = max(1, (len(dc_ids) + 1) // 2)
+    others = sorted((d for d in dc_ids if d != target_dc),
+                    key=lambda d: dc_capacity.get(d, 0.0), reverse=True)
+    target_set = [target_dc] + others[:n_targets - 1]
+    set_cap = {d: dc_capacity.get(d, 1.0) for d in target_set}
 
     plan_map = {}
     req_rows = []
@@ -153,12 +144,13 @@ def milp_optimizer(epoch_data: pd.DataFrame, epoch_idx: int, **kwargs):
 
     for idx, row in enumerate(sim_data.itertuples(index=False)):
         tokens = max(1, int(row.tokens))
-        if routed_tokens[target_dc] + tokens <= target_cap:
-            tgt = target_dc
-        else:
-            available_caps = {d: dc_capacity.get(d, 0.0) - routed_tokens[d] for d in dc_ids if d != target_dc}
-            tgt = max(available_caps, key=available_caps.get) if available_caps and max(
-                available_caps.values()) > 0 else target_dc
+        # Least-loaded-relative-to-capacity placement within the target set
+        # (the same rule Helix uses).  Falls back to any DC with spare capacity.
+        best = min(target_set, key=lambda d: routed_tokens[d] / set_cap[d])
+        if routed_tokens[best] + tokens > set_cap[best]:
+            spare = {d: dc_capacity.get(d, 0.0) - routed_tokens[d] for d in dc_ids}
+            best = max(spare, key=spare.get) if max(spare.values()) > 0 else best
+        tgt = best
 
         routed_tokens[tgt] += tokens
         plan_map[idx] = tgt
@@ -172,30 +164,24 @@ def milp_optimizer(epoch_data: pd.DataFrame, epoch_idx: int, **kwargs):
     requests_df = pd.DataFrame(req_rows)
     schedule_plan = {"map": plan_map}
 
-    # FIX: Valid Power Plan schema addressing hardware node units
     active_dcs = {dc for dc, load in routed_tokens.items() if load > 0}
     power_plan = {}
     for dc in dc_ids:
-        dc_power = {}
-        for nt in node_types:
-            dc_power[nt] = "ON" if dc in active_dcs else "OFF"
-        power_plan[dc] = {"unit": dc_power}
+        # {"all": "ON/OFF"} sets every unit in this DC regardless of its node
+        # type ID, bypassing the type-match logic that breaks for DCs whose
+        # type IDs differ from the hardcoded [0-5] range.
+        power_plan[dc] = {"all": "ON" if dc in active_dcs else "OFF"}
 
-    # FIX: Valid simulator tuple unpacking and normalization
     sim_out = sim.run_epoch(epoch_idx, requests_df, schedule_plan, power_plan)
     stats, results, leftovers = _normalize_sim_output(sim_out)
 
-    reward = -stats.get('energy_cost', 0) - (stats.get('avg_ttft_sec', 0) * 100)
+    n_migrated = len(sim_data[sim_data['source_dc'] != target_dc])
+    reward = -(stats.get('energy_cost', 0) + (n_migrated * 0.1))
 
-    # FIX: Real representation of environment state (Actual DC Utilization)
     next_state = np.array([min(1.0, routed_tokens.get(dc, 0.0) / dc_capacity.get(dc, 1.0)) for dc in dc_ids],
                           dtype=float)
     _last_state = next_state
 
-    _AGENT.memory.append((current_state, action_idx, reward, next_state, False))
-    _AGENT.train_step()
-
-    if epoch_idx % 5 == 0:
-        _AGENT.target_net.load_state_dict(_AGENT.policy_net.state_dict())
+    _AGENT.update_policy(reward, next_state, False)
 
     return stats, results, leftovers

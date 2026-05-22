@@ -119,42 +119,24 @@ def _normalize_sim_output(
 # -----------------------------
 def _build_power_plan(
     routed_tokens_by_dc: Dict[int, float],
-    node_types: List[int],
+    node_types: List[int],     # kept in signature for backward compat; unused
     all_dcs: List[int],
-) -> Dict[int, Dict[str, Dict[int, str]]]:
+) -> Dict[int, Dict[str, str]]:
     """
-    Simple Idle/Off power plan scaled by per-DC share of total tokens.
+    Build a power plan using the {"all": ...} shorthand so every unit in each
+    DC is addressed regardless of its node type ID.
 
-    More work → more node types kept out of 'Off'.
+    The v2 simulator assigns a unique node-type-ID range to each DC
+    (e.g. DC0: 0-5, DC1: 6-11, DC8: 8-13).  A plan keyed on a hardcoded
+    [0-5] list silently has no effect on the majority of DCs.
+
+    DCs with routed traffic  →  IDLE  (ready to accept requests; ~13% idle power)
+    DCs with no traffic      →  OFF   (zero power draw)
     """
-    if not node_types:
-        node_types = list(DEFAULT_NODE_TYPES)
-
-    min_idle = 1
-    max_idle = len(node_types)
-    max_idle = max(1, min(max_idle, len(node_types)))
-
-    total_tokens = sum(max(0.0, v) for v in routed_tokens_by_dc.values()) or 1.0
-
-    power_plan: Dict[int, Dict[str, Dict[int, str]]] = {}
+    power_plan: Dict[int, Dict[str, str]] = {}
     for dc in all_dcs:
-        share = max(0.0, routed_tokens_by_dc.get(dc, 0.0)) / total_tokens
-
-        # More share → fewer Idle types (more kept "On")
-        idle_types = max(
-            min_idle,
-            min(max_idle, int(round((1.0 - share) * len(node_types)))),
-        )
-        idle_types = max(0, min(idle_types, len(node_types)))
-
-        dc_power: Dict[int, str] = {}
-        for idx, nt in enumerate(node_types):
-            if idx < idle_types:
-                dc_power[nt] = "IDLE"
-            else:
-                dc_power[nt] = "ON"
-        power_plan[int(dc)] = {"unit": dc_power}
-
+        tokens = max(0.0, routed_tokens_by_dc.get(dc, 0.0))
+        power_plan[int(dc)] = {"all": "IDLE" if tokens > 0.0 else "OFF"}
     return power_plan
 
 

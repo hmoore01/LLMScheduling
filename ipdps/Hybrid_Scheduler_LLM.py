@@ -195,29 +195,25 @@ def _rank_dcs_balanced(sim, all_dcs: List[int]) -> List[int]:
 
 def _build_power_plan(
         routed_tokens_by_dc: Dict[int, float],
-        node_types: List[int],
+        node_types: List[int],     # kept in signature for backward compat; unused
         all_dcs: List[int],
 ) -> Dict[int, Dict[str, Any]]:
     """
-    Build a simple two-state power plan driven by actual routed traffic.
+    Build a power plan using the {"all": ...} shorthand so every unit in each
+    DC is addressed regardless of its node type ID.
 
-    DCs that receive traffic:   all node types → ON  (fully active, accept requests)
-    DCs that receive no traffic: all node types → OFF (zero idle energy)
+    The v2 simulator assigns a unique node-type-ID range to each DC
+    (e.g. DC0: 0-5, DC1: 6-11, DC8: 8-13).  A plan keyed on a hardcoded
+    [0-5] list silently has no effect on the majority of DCs because the
+    type-ID lookup finds no matching units.
 
-    Keeping active DCs fully ON maximises their queue depth — when
-    CONSOLIDATION_FACTOR routes traffic to fewer DCs those DCs must handle
-    more load, creating intentional queuing that trades TTFT for the energy
-    savings from the powered-off DCs.
+    DCs that receive traffic  →  ON   (fully active, accept requests)
+    DCs with no traffic       →  OFF  (zero idle energy, carbon, water)
     """
-    if not node_types:
-        node_types = list(DEFAULT_NODE_TYPES)
-
     power_plan: Dict[int, Dict[str, Any]] = {}
     for dc in all_dcs:
         tokens = max(0.0, routed_tokens_by_dc.get(dc, 0.0))
-        state  = "ON" if tokens > 0.0 else "OFF"
-        power_plan[int(dc)] = {"unit": {nt: state for nt in node_types}}
-
+        power_plan[int(dc)] = {"all": "ON" if tokens > 0.0 else "OFF"}
     return power_plan
 
 
