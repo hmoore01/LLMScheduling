@@ -58,6 +58,7 @@ from __future__ import annotations
 # OS threads contending for cores — slows everything and bloats memory.
 # Cap intraop to 1 and let the executor provide the parallelism.
 import os
+import json
 os.environ.setdefault("OMP_NUM_THREADS",      "1")
 os.environ.setdefault("MKL_NUM_THREADS",      "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
@@ -147,10 +148,37 @@ REWARD_CLIP = 25.0   # raised from 5.0: with the old clip, all TTFT violations
 # pruned from the Pareto front before sorting.  The lagrangian also fires in
 # _score_solution so the gradient pushes away from this region during training.
 #
-# 2.0 s is intentionally lenient — it rules out degenerate "turn everything off"
-# solutions (which produce TTFT > 5 s) while leaving eco agents free to
-# concentrate load onto fewer DCs.  Tighten to 1.0–1.5 s for stricter SLAs.
-TTFT_MAX_S = 2.0    # seconds — per-epoch average TTFT hard ceiling
+# ⚠ COUPLED TO AUTOSCALE TOKEN SCALING.  The simulator models TTFT as
+# `ms_per_token × tokens`, so when the autoscaler inflates per-request token
+# counts (AUTOSCALE_TARGET_TOKEN_SCALE in simulator_LLM.py, currently 5x) every
+# request's TTFT is inflated by the same factor.  This ceiling MUST be scaled to
+# match, otherwise nearly every candidate reads as constraint-infeasible, the
+# feasible set collapses, and all single-objective modes pick the one surviving
+# (max-throughput) candidate — i.e. the whole front degenerates to one point.
+#
+# Base SLA is 2.0 s (un-scaled workload).  The effective ceiling is
+# (base SLA) x (token scale): a request whose tokens were inflated Nx has the
+# same per-token latency at N x 2.0 s as a base request at 2.0 s, so this is a
+# unit rescale, not a loosening.  Degenerate "turn everything off" plans still
+# scale well past it and remain correctly pruned.
+#
+# The token scale is read DIRECTLY from simulator_LLM at import time so it can
+# never silently desync from the simulator again (the previous hardcoded 5.0
+# drifted out of sync with the simulator's 25.0, collapsing the feasible set
+# and sending eco modes' TTFT into the hundreds of seconds).  If the import
+# fails for any reason, fall back to the simulator's current default of 25.0.
+_TTFT_BASE_SLA_S = 1.5    # SLA for the un-token-scaled workload (tightened
+                          # from 2.0s: at 25x token scale the ceiling moves
+                          # 50.0s -> 37.5s, discouraging the 16-19s eco-agent
+                          # selections seen when the feasible band was too wide)
+try:
+    import simulator_LLM as _sim_cfg
+    _TTFT_TOKEN_SCALE_FACTOR = float(_sim_cfg.AUTOSCALE_TARGET_TOKEN_SCALE)
+except (ImportError, AttributeError):
+    _TTFT_TOKEN_SCALE_FACTOR = 25.0   # simulator_LLM default — keep in sync
+TTFT_MAX_S = _TTFT_BASE_SLA_S * _TTFT_TOKEN_SCALE_FACTOR
+print(f"[LAHYPER] TTFT ceiling: {TTFT_MAX_S:.1f}s "
+      f"(base {_TTFT_BASE_SLA_S:.1f}s x token-scale {_TTFT_TOKEN_SCALE_FACTOR:.1f})")
 REQUESTS_PER_NODE_CAP = 5_000
 
 
@@ -179,6 +207,7 @@ class MetricNormalizer:
     EMA_ALPHA_METRIC = 0.05   # slow metric EMA — tracks epoch-level trends
     EMA_ALPHA_SLA    = 0.15   # faster SLA EMA — adapts to capacity changes quickly
     FLOOR            = 1e-6
+    WARMUP_OBS       = 8      # observations averaged before the EMA goes live
 
     def __init__(self):
         self.ttft       = None
@@ -187,6 +216,16 @@ class MetricNormalizer:
         self.cost       = None
         self.sla_target = 0.80   # adaptive: EMA of observed serve rates (soft floor 0.70)
         self.n_obs      = 0
+        # Warm-up accumulators: the denominators are the MEAN of the first
+        # WARMUP_OBS observations, not the single first one.  The previous
+        # code seeded the EMA from observation #0 — so the whole run's
+        # normalization pivoted on whichever candidate happened to be scored
+        # first.  With unseeded exploration that was random per run, and
+        # because alpha=0.05 the EMA needed ~20+ steps to drift off a bad
+        # seed, skewing every water/carbon-sensitive selection in between.
+        # Averaging a small window makes the denominator robust to any single
+        # outlier and is the main structural fix for the wide cross-run bars.
+        self._warm_sum  = [0.0, 0.0, 0.0, 0.0]
 
     def update(self, metrics: dict):
         """Call with the raw metrics dict from run_epoch before scoring."""
@@ -209,8 +248,16 @@ class MetricNormalizer:
                 max(abs(water),  self.FLOOR),
                 max(abs(cost),   self.FLOOR))
 
-        if self.n_obs == 0:
-            self.ttft, self.carbon, self.water, self.cost = vals
+        if self.n_obs < self.WARMUP_OBS:
+            # Warm-up window: accumulate, and set the denominators to the
+            # running MEAN so far (so they are usable from observation #1 but
+            # not anchored to a single outlier).
+            for i in range(4):
+                self._warm_sum[i] += vals[i]
+            k = self.n_obs + 1
+            self.ttft, self.carbon, self.water, self.cost = (
+                self._warm_sum[0] / k, self._warm_sum[1] / k,
+                self._warm_sum[2] / k, self._warm_sum[3] / k)
         else:
             a = self.EMA_ALPHA_METRIC
             self.ttft   = (1 - a) * self.ttft   + a * vals[0]
@@ -1207,11 +1254,34 @@ _NORM           = MetricNormalizer()
 
 # Per-thread LLM_Simulator cache for Phase 2 parallel candidate evaluation.
 # Avoids rebuilding the DC graph + re-reading CSVs once per candidate.
-_thread_local_sim = threading.local()
+#
+# NOTE: this cache is now created *fresh inside milp_optimizer() every epoch*
+# (see _epoch_sim_pool below), NOT module-global.  A module-global
+# threading.local() retains every worker thread's LLM_Simulator (DC graph +
+# ~12k ProcNodes + CSV tables) for the lifetime of the process; since a new
+# ThreadPoolExecutor — and therefore new worker threads — is spawned every
+# epoch, those simulator instances pile up epoch after epoch and the heap
+# drifts upward until an OOM mid-run.  Epoch-scoping guarantees the whole
+# pool (and every simulator on it) becomes collectable when the epoch ends.
+
+# Phase 2 parallel-evaluation worker cap.  Each worker holds its OWN full
+# LLM_Simulator instance, so peak memory scales with the worker count, not
+# just with CPU count.  8 simultaneous simulators is the single largest
+# transient allocation in an epoch; 4 halves that peak.  Raise this only if
+# the host has memory headroom to spare.
+PHASE2_MAX_WORKERS = 4
 
 # Latency adjacency tensor — (N, N) proximity matrix derived from the simulator's
 # inter-DC latency matrix.  Rebuilt whenever the agent is (re)initialised.
 _GLOBAL_ADJ: torch.Tensor | None = None
+
+# Raw inter-DC latency matrix — (N, N) ndarray, latency_ms[i][j] = network
+# latency from DC i to DC j, indexed by DC position.  Used by build_schedule_map
+# for origin-aware request routing (route each request to a DC near its origin
+# so network latency, and therefore TTFT, is minimised).  None when the
+# simulator exposes no latency data, in which case routing degrades gracefully
+# to the origin-blind hash assignment.
+_GLOBAL_LAT_MATRIX: np.ndarray | None = None
 
 # Constraint-aware preference sampling: tracks per-bucket violation rates across
 # epochs so build_preference_cloud can oversample constraint-active regions.
@@ -1274,6 +1344,34 @@ def _build_adjacency(lat_matrix, dc_ids: list) -> torch.Tensor:
     except Exception:
         prox = np.eye(N, dtype=np.float32)   # fallback: uniform self-attention
     return torch.FloatTensor(prox)
+
+
+def _build_latency_matrix(lat_raw, dc_ids: list) -> "np.ndarray | None":
+    """Raw inter-DC latency matrix as an (N, N) float ndarray indexed by DC
+    position — latency_ms[i][j] is the network latency from dc_ids[i] to
+    dc_ids[j].
+
+    This mirrors _build_adjacency's indexing assumption (lat_raw[i][j]
+    corresponds to dc_ids[i] -> dc_ids[j]) so the GAT proximity bias and the
+    origin-aware router agree on the same topology.  The diagonal is forced to
+    0.0 — a request served by its own origin DC pays no network hop.
+
+    Returns None when the latency data is missing, the wrong shape, or contains
+    non-finite values; build_schedule_map then falls back to origin-blind
+    hash assignment so routing still works, just without proximity awareness.
+    """
+    N = len(dc_ids)
+    try:
+        lat = np.array(
+            [[float(lat_raw[i][j]) for j in range(N)] for i in range(N)],
+            dtype=np.float64,
+        )
+        if lat.shape != (N, N) or not np.isfinite(lat).all():
+            return None
+        np.fill_diagonal(lat, 0.0)
+        return lat
+    except Exception:
+        return None
 
 
 def _record_preference_outcome(pref_vec: np.ndarray, violated: bool):
@@ -1484,9 +1582,23 @@ def _active_nodes_per_dc(power_sliders) -> np.ndarray:
 
 
 def build_schedule_map(small_indices, large_indices, dc_ids, w_small, w_large,
-                       power_sliders, epoch_idx, token_counts: np.ndarray = None) -> dict:
+                       power_sliders, epoch_idx, token_counts: np.ndarray = None,
+                       source_dc: np.ndarray = None,
+                       lat_matrix: np.ndarray = None,
+                       dc_to_idx: dict = None) -> dict:
     """
     Capacity-aware request routing with single-pass overflow redistribution.
+
+    Origin-aware request matching
+    ─────────────────────────────
+    The per-DC request *counts* are set by (action routing weights × real
+    throughput capacity) — that fixes the load distribution and therefore queue
+    balance and the carbon/water/cost behaviour.  What remains free is *which*
+    individual requests land on each DC.  When `source_dc`, `lat_matrix` and
+    `dc_to_idx` are supplied, requests are matched to DCs so each one is served
+    close to its origin (low network latency → low TTFT), instead of an
+    origin-blind hash shuffle — while still hitting the per-DC counts exactly.
+    Without those inputs the original origin-blind hash assignment is used.
 
     Previous sequential overflow loop bug
     ──────────────────────────────────────
@@ -1533,6 +1645,93 @@ def build_schedule_map(small_indices, large_indices, dc_ids, w_small, w_large,
         tc = token_counts[np.asarray(indices, dtype=np.int64)]
         median_tc = float(np.median(tc)) if len(tc) > 0 else 1.0
         return float(np.sum(np.clip(tc / max(median_tc, 1.0), 0.2, 5.0)))
+
+    def _assign_origin_aware(req_indices, counts, bucket):
+        """Match requests to DCs minimising origin→DC network latency while
+        hitting the per-DC quota `counts` exactly.
+
+        Modelled as a balanced transportation problem: one supply node per
+        origin DC (how many requests originate there) and one demand node per
+        serving DC (counts[d]).  Both have ≤ N nodes, so the grid is tiny.
+        Solved with the greedy least-cost-cell method — globally cheapest
+        (origin, DC) cells are filled first; for an N ≤ 12 grid this is
+        near-optimal and fully deterministic.  Since supply and demand are
+        balanced (both sum to n_req) a single pass over the sorted cells
+        completes a feasible assignment.
+
+        Returns {request_index: dc_id}, or None on any inconsistency — the
+        caller then falls back to the origin-blind hash assignment, so the
+        worst case is simply the original behaviour.
+        """
+        try:
+            n_dc    = len(dc_ids)
+            req_arr = np.asarray(req_indices, dtype=np.int64)
+            n_req   = int(req_arr.size)
+            if n_req == 0:
+                return {}
+
+            cost = np.asarray(lat_matrix, dtype=np.float64)
+            if cost.shape != (n_dc, n_dc) or not np.isfinite(cost).all():
+                return None
+
+            demand = np.asarray(counts, dtype=np.int64)
+            if int(demand.sum()) != n_req:
+                return None   # counts must partition the requests
+
+            # Origin (source-DC) position for each request.  Origins whose DC
+            # id is not among the active set map to -1 and are pooled into a
+            # synthetic group that uses a mean-latency cost row, so they
+            # distribute by available capacity rather than by proximity.
+            src_ids = source_dc[req_arr]
+            origin_groups: dict = {}
+            for pos, sid in enumerate(src_ids):
+                oi = dc_to_idx.get(int(sid), -1)
+                origin_groups.setdefault(int(oi), []).append(pos)
+
+            group_keys = sorted(origin_groups.keys())        # deterministic
+            supply     = np.array([len(origin_groups[k]) for k in group_keys],
+                                  dtype=np.int64)
+            mean_row   = cost.mean(axis=0)
+            cost_rows  = np.array(
+                [mean_row if k < 0 else cost[k] for k in group_keys],
+                dtype=np.float64,
+            )
+
+            # Greedy least-cost-cell transportation fill.
+            n_grp = len(group_keys)
+            pairs = sorted(
+                ((float(cost_rows[g, d]), g, d)
+                 for g in range(n_grp) for d in range(n_dc)),
+                key=lambda t: (t[0], t[1], t[2]),
+            )
+            s      = supply.copy()
+            dem    = demand.copy()
+            assign = np.zeros((n_grp, n_dc), dtype=np.int64)
+            for _c, g, d in pairs:
+                if s[g] <= 0 or dem[d] <= 0:
+                    continue
+                k = int(min(s[g], dem[d]))
+                assign[g, d] += k
+                s[g]   -= k
+                dem[d] -= k
+            if int(s.sum()) != 0 or int(dem.sum()) != 0:
+                return None   # incomplete fill (should not happen) → fallback
+
+            # Expand the (group → DC) assignment into per-request DC ids.
+            # Requests within one origin group are interchangeable for latency
+            # (identical origin); `origin_groups[k]` is in ascending positional
+            # order, so the expansion is deterministic.
+            out = {}
+            for g, key in enumerate(group_keys):
+                members = origin_groups[key]
+                ptr = 0
+                for d in range(n_dc):
+                    for _ in range(int(assign[g, d])):
+                        out[int(req_arr[members[ptr]])] = int(dc_ids[d])
+                        ptr += 1
+            return out
+        except Exception:
+            return None
 
     def allocate(req_indices: list, pref_weights: np.ndarray, bucket: str) -> dict:
         if not req_indices:
@@ -1593,7 +1792,25 @@ def build_schedule_map(small_indices, large_indices, dc_ids, w_small, w_large,
         # Step 1 is already capacity-weighted, so the proportional split sends
         # more load to high-throughput DCs and keeps queues shallow.)
 
-        # ── Step 4: deterministic request ordering + assignment ────────────
+        # ── Step 4: assign individual requests to DCs ──────────────────────
+        # `counts` is now fixed — it is the per-DC load distribution and is NOT
+        # changed below, so queue balance and carbon/water/cost are unaffected.
+        # The only choice here is WHICH requests land on each DC.
+        #
+        # Origin-aware path: when latency/origin data is available, match
+        # requests to DCs so each is served close to its origin (minimising
+        # network latency → TTFT), while still hitting counts[dc] exactly.
+        # Falls back to the origin-blind hash assignment when that data is
+        # absent or the transportation solve reports any inconsistency.
+        origin_aware = (source_dc is not None and lat_matrix is not None
+                        and dc_to_idx is not None)
+        if origin_aware:
+            alloc = _assign_origin_aware(req_indices, counts, bucket)
+            if alloc is not None:
+                return alloc
+            # else: fall through to the origin-blind assignment below
+
+        # ── Step 4 (fallback): deterministic origin-blind assignment ───────
         ordered = _hash_order_indices(req_indices, epoch_idx, bucket)
         alloc, ptr = {}, 0
         for dc_idx, count in enumerate(counts):
@@ -2031,8 +2248,25 @@ _PRIMARY_SIM_KEY = None
 
 
 def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
-    global _PARETO_TRACKER, _GLOBAL_AGENT, _GLOBAL_ADJ
+    global _PARETO_TRACKER, _GLOBAL_AGENT, _GLOBAL_ADJ, _GLOBAL_LAT_MATRIX
     global _PRIMARY_SIM, _PRIMARY_SIM_KEY
+
+    # ── Deterministic RNG seeding ─────────────────────────────────────────
+    # LAHyper draws exploration noise (candidate Dirichlet/normal perturbation,
+    # Pareto sampling, per-mode seed jitter) from the GLOBAL numpy RNG.  The
+    # simulator's routing helpers also call np.random.seed() internally, so
+    # without this LAHyper's exploration ran off whatever leftover global RNG
+    # state happened to remain after the sim's calls — which differs run to
+    # run.  That made the deployed schedule (and thus water/carbon/TTFT)
+    # irreproducible and was a major source of the wide cross-run error bars.
+    #
+    # Seeding from epoch_idx here makes every epoch's exploration start from a
+    # known state, so repeated runs of the same config produce the same
+    # schedule.  Genuine algorithmic variation across epochs is preserved
+    # (the seed still varies per epoch); only the spurious run-to-run drift
+    # is removed.
+    _LAHYPER_SEED_BASE = 0x1A2B3C
+    np.random.seed((_LAHYPER_SEED_BASE + int(epoch_idx) * 2654435761) & 0x7FFFFFFF)
 
     spec_dir  = epoch_summary.get("spec_dir", "sim_specs")
     epoch_len = int(epoch_summary.get("epoch_length", 900))
@@ -2059,9 +2293,12 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
     # ── Build latency adjacency for GAT topology-aware attention ─────────────
     lat_raw = getattr(getattr(temp_sim, "network", None), "lat", None)
     if lat_raw is not None and len(lat_raw) >= real_num_dcs:
-        _GLOBAL_ADJ = _build_adjacency(lat_raw, dc_ids)
+        _GLOBAL_ADJ        = _build_adjacency(lat_raw, dc_ids)
+        # Raw latency matrix (DC-position indexed) for origin-aware routing.
+        _GLOBAL_LAT_MATRIX = _build_latency_matrix(lat_raw, dc_ids)
     else:
-        _GLOBAL_ADJ = None   # GAT falls back to uniform attention
+        _GLOBAL_ADJ        = None   # GAT falls back to uniform attention
+        _GLOBAL_LAT_MATRIX = None   # routing falls back to origin-blind
 
     # ── Collect actual per-DC node type IDs for power plan construction ───────
     # The v2 sim assigns unique type-ID ranges per DC (DC0: 0-5, DC1: 6-11 …).
@@ -2122,10 +2359,19 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
     _PARETO_TRACKER.increment_epoch()
     _PARETO_TRACKER.clear_epoch()
 
-    import sys
+    # Epoch-start collection: reclaim anything left dangling by the previous
+    # epoch (stray cycles, detached tensors) before this epoch allocates.
+    import gc
+    gc.collect()
+
+    # Memory probe.  NOTE: the agent has no `.replay_buffer` attribute — the real
+    # buffers are agent.offline.buffer and agent.online.buffer — so the old probe
+    # always printed "n/a".  Report the actual buffer fills instead.
+    _off_buf = len(agent.offline.buffer) if hasattr(agent, "offline") else 0
+    _on_buf  = len(agent.online.buffer)  if hasattr(agent, "online")  else 0
     print(f"[MEM-DBG] epoch {epoch_idx}: "
-          f"buffer={len(_GLOBAL_AGENT.replay_buffer) if hasattr(_GLOBAL_AGENT, 'replay_buffer') else 'n/a'} "
-          f"tracker_solutions={len(_PARETO_TRACKER.epoch_solutions)}" )
+          f"offline_buf={_off_buf} online_buf={_on_buf} "
+          f"tracker_solutions={len(_PARETO_TRACKER.epoch_solutions)}")
 
     current_state = get_rich_state(temp_sim, dc_ids, clean_data, epoch_idx)
     num_requests  = len(clean_data)
@@ -2137,13 +2383,20 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
         if "tokens" in clean_data.columns
         else None
     )
+    # Per-request origin DC (positional, aligned to clean_data rows) — passed to
+    # build_schedule_map so requests can be routed close to their origin.
+    source_dc_arr = clean_data["source_dc"].to_numpy(dtype=np.int64)
+    lat_matrix    = _GLOBAL_LAT_MATRIX
 
     # ── TTFT performance floor applied to every mode ───────────────────────────
     # All modes share this constraint so eco-heavy schemes cannot win by trading
     # away all latency.  The penalty (0.6) is moderate — strong enough to steer
     # training away from TTFT violations but not so dominant that it prevents the
     # eco agents from reducing capacity when traffic is light.
-    _ttft_constraint = {"budget": TTFT_MAX_S, "penalty": 0.6}
+    # penalty raised 0.6 -> 0.85: a stronger Lagrangian gradient away from the
+    # TTFT ceiling, so single-objective eco agents stop accepting near-ceiling
+    # (high-TTFT) plans just because they shave their own metric.
+    _ttft_constraint = {"budget": TTFT_MAX_S, "penalty": 0.85}
 
     population = [
         {"mode": "time_agent",       "pref": [1.0, 0.0, 0.0, 0.0],
@@ -2192,7 +2445,8 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
         power_plan    = build_power_plan_sliding(dc_ids, power_sliders, _dc_node_types)
         schedule_plan = build_schedule_map(
             small_indices, large_indices, dc_ids, w_small, w_large, power_sliders, epoch_idx,
-            token_counts=token_counts
+            token_counts=token_counts,
+            source_dc=source_dc_arr, lat_matrix=lat_matrix, dc_to_idx=dc_to_idx
         )
 
         metrics, _, dc_usage = temp_sim.run_epoch(epoch_idx, clean_data, schedule_plan, power_plan)
@@ -2239,6 +2493,32 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
     pue_inv       = 1.0 - np.clip(state_2d[:, 2], 0.0, 1.0)
     uniform_w     = np.ones(real_num_dcs, dtype=np.float32) / real_num_dcs
 
+    def _eco_dcs_needed() -> int:
+        """How many DCs an eco mode must power on to serve the epoch's load
+        without a queue blow-up.
+
+        The old formula was
+            ceil(num_requests / (REQUESTS_PER_NODE_CAP * NUM_NODE_TYPES))
+        which estimated ~30,000 req/DC at 1x token scale and therefore
+        returned 1 for a typical epoch.  But the simulator runs at
+        _TTFT_TOKEN_SCALE_FACTOR (25x) token scale — each request occupies a
+        node ~25x longer — so real per-DC capacity is ~25x smaller.  Powering
+        on 1 DC then serialised the whole epoch through one queue and floored
+        eco-agent TTFT at ~12 s (no sub-5s plan could exist).
+
+        This divides the per-DC capacity by the token scale and applies a
+        1.4x headroom factor so the powered DCs run at ~70% utilisation
+        (a knife-edge 100% target leaves no queue margin).  The agent still
+        ranks WHICH DCs to power by the eco weight, so it powers on the
+        cleanest / lowest-PUE / cheapest DCs — the metric stays strong, the
+        footprint is just wide enough to meet a latency SLA.
+        """
+        per_dc_1x   = max(REQUESTS_PER_NODE_CAP * NUM_NODE_TYPES, 1)
+        tok_scale   = max(1.0, float(_TTFT_TOKEN_SCALE_FACTOR))
+        per_dc_real = max(1.0, per_dc_1x / tok_scale)
+        need = math.ceil(1.4 * num_requests / per_dc_real)
+        return max(1, min(real_num_dcs, need))
+
     def _ideal_action(mode_name: str, pref_vec: np.ndarray) -> np.ndarray:
         """Hand-crafted action representing the ideal for this named mode."""
         n  = real_num_dcs
@@ -2255,7 +2535,7 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
             # Route to lowest-carbon DCs; shut down high-carbon ones
             w = np.maximum(ci_inv, 1e-8); w /= w.sum()
             a[0:n]  = w; a[n:pw] = w
-            needed  = max(1, min(n, math.ceil(num_requests / max(REQUESTS_PER_NODE_CAP * NUM_NODE_TYPES, 1))))
+            needed  = _eco_dcs_needed()
             ranked  = np.argsort(w)[::-1]
             a[pw:]  = 0.0
             for i in ranked[:needed]: a[pw + i] = 1.0
@@ -2263,7 +2543,7 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
         elif mode_name == "water_agent":
             w = np.maximum(pue_inv, 1e-8); w /= w.sum()
             a[0:n]  = w; a[n:pw] = w
-            needed  = max(1, min(n, math.ceil(num_requests / max(REQUESTS_PER_NODE_CAP * NUM_NODE_TYPES, 1))))
+            needed  = _eco_dcs_needed()
             ranked  = np.argsort(w)[::-1]
             a[pw:]  = 0.0
             for i in ranked[:needed]: a[pw + i] = 1.0
@@ -2271,7 +2551,7 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
         elif mode_name == "cost_agent":
             w = np.maximum(tou_inv, 1e-8); w /= w.sum()
             a[0:n]  = w; a[n:pw] = w
-            needed  = max(1, min(n, math.ceil(num_requests / max(REQUESTS_PER_NODE_CAP * NUM_NODE_TYPES, 1))))
+            needed  = _eco_dcs_needed()
             ranked  = np.argsort(w)[::-1]
             a[pw:]  = 0.0
             for i in ranked[:needed]: a[pw + i] = 1.0
@@ -2324,26 +2604,35 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
             candidate_inputs.append({
                 "pref_vec":      pref_vec,
                 "constraints":   constraints,
+                "origin_mode":   mode_name,     # which mode generated this candidate
+                "origin_variant": variant_tag,  # "network" | "ideal" | "perturb"
                 "power_plan":    build_power_plan_sliding(dc_ids, power_sliders, _dc_node_types),
                 "schedule_plan": build_schedule_map(
                     small_indices, large_indices, dc_ids, w_small, w_large, power_sliders, epoch_idx,
-                    token_counts=token_counts
+                    token_counts=token_counts,
+                    source_dc=source_dc_arr, lat_matrix=lat_matrix, dc_to_idx=dc_to_idx
                 ),
                 "w_total":       (w_small + w_large) / 2.0,
                 "power_sliders": power_sliders,
             })
 
+    # Epoch-scoped per-thread simulator cache.  Created fresh here so that when
+    # milp_optimizer() returns, this object — and every LLM_Simulator the Phase 2
+    # worker threads cached on it — loses all references and becomes collectable.
+    # This is what stops simulator instances from accumulating across epochs.
+    _epoch_sim_pool = threading.local()
+
     def _evaluate_candidate(cand):
         # Reuse one LLM_Simulator per worker thread — saves rebuilding the DC
         # graph and re-reading 5+ CSVs on every candidate.  run_epoch() already
         # calls reset_epoch() on every DC internally, so reuse is safe.
-        sim = getattr(_thread_local_sim, "sim", None)
+        sim = getattr(_epoch_sim_pool, "sim", None)
         if sim is None or getattr(sim, "spec_dir", None) != spec_dir \
            or int(getattr(sim, "epoch_length", -1)) != int(epoch_len):
             sim = Rate_Flow_Sim.LLM_Simulator(
                 spec_dir=spec_dir, epoch_length=epoch_len, debug=False
             )
-            _thread_local_sim.sim = sim
+            _epoch_sim_pool.sim = sim
         m, r, u = sim.run_epoch(epoch_idx, clean_data, cand["schedule_plan"], cand["power_plan"])
         # CRITICAL: do NOT retain `r` (per-request details).  At ~200k requests
         # × ~49 candidates × 96 epochs that's tens of millions of dicts held
@@ -2352,7 +2641,7 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
         return {**cand, "metrics": dict(m), "results": [], "dc_usage": dict(u)}
 
     candidate_solutions = [None] * len(candidate_inputs)
-    max_workers = min(max(1, os.cpu_count() or 1), 8, len(candidate_inputs))
+    max_workers = min(max(1, os.cpu_count() or 1), PHASE2_MAX_WORKERS, len(candidate_inputs))
 
     if max_workers <= 1:
         # Sequential: run offline training between candidates
@@ -2376,6 +2665,22 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
             candidate_solutions = agent.train_offline_concurrent(
                 list(fut_to_idx.keys()), fut_to_idx, candidate_solutions, adj=adj
             )
+
+    # ── Tear down the Phase 2 worker simulators ────────────────────────────────
+    # The ThreadPoolExecutor's worker threads are gone now, but each one cached a
+    # full LLM_Simulator (DC graph + ~12k ProcNodes + CSV tables) on
+    # _epoch_sim_pool.  Drop every cached reference and force a collection so that
+    # memory is reclaimed *before* the Pareto-front sorting below — instead of
+    # lingering until the function returns.  Without this the per-epoch peak is
+    # carried forward and the heap drifts upward across epochs.
+    import gc
+    for _attr in list(vars(_epoch_sim_pool).keys()):
+        try:
+            delattr(_epoch_sim_pool, _attr)
+        except AttributeError:
+            pass
+    _epoch_sim_pool = None
+    gc.collect()
 
     # Push exploitation solutions into both buffers
     for cand in candidate_solutions:
@@ -2474,17 +2779,97 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
                 total = done + drop
                 return (drop / total) if total > 0.0 else 1.0
 
-            # Gate 1: hard constraint feasibility (TTFT ceiling etc.).
-            feasible = [i for i, c in enumerate(candidate_solutions)
-                        if _constraints_satisfied(c)]
-            pool = feasible if feasible else list(range(len(candidate_solutions)))
+            # ── Single-objective selection (carbon/water/cost agents) ─────────
+            # A specialist agent must DEPLOY its own specialization.  Previously
+            # selection was min(metric) over the GLOBAL candidate pool, with a
+            # TTFT-ceiling + 30%-drop gate applied first.  A genuinely
+            # metric-optimal plan (hard consolidation onto low-carbon / low-PUE
+            # / cheap DCs) tends to have higher TTFT and higher drops, so the
+            # mode's OWN ideal candidate was frequently gated out and selection
+            # fell back to a Balanced-like compromise — which is exactly why
+            # the eco agents only matched Balanced ~5-6/10 runs instead of
+            # beating it 10/10, and why the eco rows jumped run to run (the
+            # gate outcome was effectively a coin flip).
+            #
+            # Two corrections:
+            #  (1) The mode's own "ideal" candidate is ALWAYS admitted to the
+            #      selection set — it is the agent's defining solution and must
+            #      never be silently replaced by another mode's plan.
+            #  (2) For a single-objective mode the TTFT ceiling is the EXPECTED
+            #      tradeoff, not a violation, so the hard-constraint gate is
+            #      dropped here; only the degenerate-plan drop filter (>70%
+            #      dropped = "shut everything off" winning a near-empty
+            #      workload) is retained.
+            own_ideal = [i for i, c in enumerate(candidate_solutions)
+                         if c.get("origin_mode") == mode_name
+                         and c.get("origin_variant") == "ideal"]
 
-            # Gate 2: drop-rate filter, applied within the feasible pool.
-            viable = [i for i in pool if _drop_frac_of(candidate_solutions[i]) <= 0.30]
+            # Opt-in candidate-pool dump for the offline (drop_gate, SLA) sweep.
+            # Disabled unless LAHYPER_DUMP_CANDIDATES is set, so normal runs pay
+            # nothing.  One JSON record per (epoch, mode); sweep_thresholds.py
+            # replays different gates against this fixed pool.  Guarded so a
+            # dump failure can never break a real run.
+            if os.environ.get("LAHYPER_DUMP_CANDIDATES"):
+                try:
+                    _dump_path = os.environ["LAHYPER_DUMP_CANDIDATES"]
+                    _rec = {
+                        "epoch": int(epoch_idx),
+                        "mode": mode_name,
+                        "metric_key": metric_key,
+                        "candidates": [
+                            {
+                                "origin_mode":    c.get("origin_mode"),
+                                "origin_variant": c.get("origin_variant"),
+                                "drop_frac":      _drop_frac_of(c),
+                                "ttft":           float(c["metrics"].get("avg_ttft", 0.0)),
+                                "carbon":         float(c["metrics"].get("carbon_emissions", 0.0)),
+                                "water":          float(c["metrics"].get("water_usage", 0.0)),
+                                "cost":           float(c["metrics"].get("energy_cost", 0.0)),
+                                "metric_value":   float(c["metrics"].get(metric_key, float("inf"))),
+                            }
+                            for c in candidate_solutions
+                        ],
+                    }
+                    with open(_dump_path, "a") as _df:
+                        _df.write(json.dumps(_rec) + "\n")
+                except Exception as _e:
+                    print(f"[LAHYPER] candidate dump skipped: {_e}")
+
+            # Drop-rate gate for single-objective (eco) modes.
+            #
+            # An eco agent must minimise its metric among schedules that still
+            # SERVE the workload — not "win" by shedding most of the traffic.
+            # With the simulator now honestly reporting epoch-boundary drops, a
+            # loose 70% gate let carbon/water/cost agents deploy plans that
+            # dropped 60-70% of all requests (e.g. carbon 5.4 kg achieved only
+            # by serving 2,550 of 8,372 requests).  That is not a credible
+            # "carbon-optimal scheduler".
+            #
+            # The gate is therefore 10%: an eco agent reports the lowest metric
+            # among schedules that drop <=10%.  Tiered fallback to 30% then
+            # unrestricted, so a mode always gets a row even on a hard epoch
+            # (flagged by its drop% in the summary rather than missing).
+            _DROP_GATE_TIERS = (0.10, 0.30, 1.01)
+            viable = []
+            for _tier in _DROP_GATE_TIERS:
+                viable = [i for i, c in enumerate(candidate_solutions)
+                          if _drop_frac_of(c) <= _tier]
+                if viable:
+                    break
             if not viable:
-                viable = [i for i in pool if _drop_frac_of(candidate_solutions[i]) <= 0.70]
-            if not viable:
-                viable = pool
+                viable = list(range(len(candidate_solutions)))
+
+            # The mode's own "ideal" candidate is still guaranteed a place in
+            # the running — but ONLY if it also satisfies the active drop tier.
+            # A high-drop ideal must not slip past the gate it exists to honour;
+            # if the ideal itself drops too much, the gated pool stands.
+            _active_tier = next((t for t in _DROP_GATE_TIERS
+                                 if any(_drop_frac_of(candidate_solutions[i]) <= t
+                                        for i in range(len(candidate_solutions)))),
+                                1.01)
+            for i in own_ideal:
+                if i not in viable and _drop_frac_of(candidate_solutions[i]) <= _active_tier:
+                    viable.append(i)
 
             best_idx = min(viable,
                            key=lambda i, mk=metric_key:
@@ -2509,6 +2894,7 @@ def milp_optimizer(epoch_data, epoch_idx, node_properties, epoch_summary):
             f" carbon={_m.get('carbon_emissions', 0.0):.4f}"
             f" water={_m.get('water_usage', 0.0):.4f}"
             f" cost={_m.get('energy_cost', 0.0):.6f}"
+            f" served={_m.get('requests_completed', _m.get('served_requests', 0.0)):.0f}"
         )
         if mode_name == "Balanced":
             best_balanced_metrics = best_cand["metrics"]

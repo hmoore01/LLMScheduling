@@ -46,6 +46,20 @@ def _dc_token_capacity(sim: Rate_Flow_Sim.LLM_Simulator, epoch_length: int) -> d
                 if mpt > 0: best_tpm = max(best_tpm, 1.0 / mpt)
             total += best_tpm * epoch_ms
         caps[int(dc_id)] = max(total, 1.0)
+    # Token-scale correction: the simulator inflates every request's token
+    # count by AUTOSCALE_TARGET_TOKEN_SCALE.  `total` above is a 1x-scale
+    # estimate, so without this the target set looks ~Nx larger than it
+    # really is, the spill-to-any-DC fallback fires constantly, load smears
+    # across every DC (no consolidation) and TTFT balloons.  Express capacity
+    # in the SAME scaled token units the requests carry.
+    try:
+        import simulator_LLM as _sim_cfg
+        _tok_scale = float(getattr(_sim_cfg, "AUTOSCALE_TARGET_TOKEN_SCALE", 25.0))
+    except Exception:
+        _tok_scale = 25.0
+    if _tok_scale > 1.0:
+        for _dc in caps:
+            caps[_dc] = max(caps[_dc] / _tok_scale, 1.0)
     return caps
 
 def _normalize_sim_output(sim_out):
@@ -55,6 +69,7 @@ def _normalize_sim_output(sim_out):
     stats = {
         "avg_ttft_sec": avg_ttft,
         "energy_kwh": energy_kwh,
+        "total_energy": energy_kwh,   # key simulator_LLM's Final Report reads
         "carbon_emissions": float(metrics.get("carbon_emissions", 0.0)),
         "water_usage": float(metrics.get("water_usage", 0.0)),
         "energy_cost": float(metrics.get("energy_cost", 0.0)),

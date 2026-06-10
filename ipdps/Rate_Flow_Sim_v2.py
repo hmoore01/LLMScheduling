@@ -5,11 +5,13 @@ from typing import Callable, Union
 import math
 import collections
 import heapq
+import array            # compact typed arrays for tasks_by_dc
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 
 # ---- Debug helpers (near imports) ----
 import os
+import numpy as np          # required by _clean_tokens() in apply_schedule_plan
 import pandas as pd
 
 # ===========================================================
@@ -488,7 +490,8 @@ class Datacenter:
                 if uid in id_map and state and str(state).upper() in ("ON", "IDLE", "OFF"):
                     id_map[uid].state = str(state).upper()
 
-    def schedule_request(self, model, arrival, net_latency_ms=0.0, tokens=None, **kwargs):
+    def schedule_request(self, model, arrival, net_latency_ms=0.0, tokens=None, base_tokens=None,
+                         epoch_start_ms=None, **kwargs):
         if not hasattr(self, "_node_heap"):
             self._node_heap = []
             self._heap_valid = False
@@ -523,12 +526,25 @@ class Datacenter:
         start_ms = max(float(arrival), unit.next_available_ms)
         wait_ms = start_ms - float(arrival)
 
-        if wait_ms > 300000.0:
-            heapq.heappush(self._node_heap, (unit.next_available_ms, unit.node_id, unit))
-            return {
-                "dc_id": self.id, "dropped": True, "ttft_s": 0.0,
-                "energy_kwh": 0.0, "carbon_g": 0.0, "cost_usd": 0.0, "water_m3": 0.0
-            }
+        # Epoch-boundary drop (no-drop policy, refined).  A request is NEVER
+        # dropped for *moderate* queueing — it is served and records an honest
+        # ttft_s, which avoids the survivor bias that drop-based TTFT had.  But
+        # a request whose start_ms falls past the END of the epoch window did
+        # not actually begin within the simulated epoch: the node is grossly
+        # overloaded and physically cannot serve it this epoch.  Counting it as
+        # "served" with a multi-epoch wait_ms is not an honest statistic — it is
+        # an artifact (a 38,000 s wait inside a 900 s epoch).  Such a request is
+        # the genuine, physical outcome of an infeasible schedule, so it is
+        # dropped here — restoring a real drop signal for gross overload while
+        # keeping the no-drop behaviour for every request that DOES fit.
+        if epoch_start_ms is not None:
+            epoch_end_ms = float(epoch_start_ms) + float(self._epoch_len_s) * 1000.0
+            if start_ms > epoch_end_ms:
+                heapq.heappush(self._node_heap, (unit.next_available_ms, unit.node_id, unit))
+                return {
+                    "dc_id": int(self.id), "dropped": True, "ttft_s": 0.0,
+                    "energy_kwh": 0.0, "carbon_g": 0.0, "cost_usd": 0.0, "water_m3": 0.0,
+                }
 
         unit.next_available_ms = start_ms + exec_ms
         end_ms = start_ms + exec_ms
@@ -536,12 +552,21 @@ class Datacenter:
 
         score = self.settle_and_score(unit, exec_ms, start_ms)
 
+        # First-token latency (prefill) is a per-request cost and must reflect a
+        # REALISTIC request size.  `tokens` may be inflated by the autoscaler's
+        # token-scale load knob; `base_tokens` is the un-inflated size written
+        # by the autoscaler.  Use the base size here so reported TTFT is not
+        # multiplied by the token-scale factor.  NOTE: `exec_ms` above keeps the
+        # inflated `tokens` on purpose — node occupancy, utilisation and energy
+        # must reflect the true compute load.  When base_tokens is absent
+        # (non-autoscaled run) this falls back to `tokens`: identical old behaviour.
+        _prefill_tokens = base_tokens if base_tokens is not None else tokens
         prefill_ms = 0.0
         if rec:
             if "ms_per_request" in rec:
                 prefill_ms = float(rec["ms_per_request"]) * unit._exec_ms_temp_mult()
             elif "ms_per_token" in rec:
-                prefill_ms = float(rec["ms_per_token"]) * float(tokens or 1) * unit._exec_ms_temp_mult()
+                prefill_ms = float(rec["ms_per_token"]) * float(_prefill_tokens or 1) * unit._exec_ms_temp_mult()
 
         ttft_s = (float(net_latency_ms) + wait_ms + prefill_ms) / 1000.0
 
@@ -549,6 +574,12 @@ class Datacenter:
             "dc_id": int(self.id),
             "start_ms": start_ms, "end_ms": end_ms, "exec_ms": exec_ms,
             "ttft_s": ttft_s, "dropped": False,
+            # TTFT component breakdown (ms) — ttft_s == (sum of these)/1000.
+            # Surfaced for diagnostics: lets the caller see whether latency
+            # is network-proximity, queueing, or prefill bound.
+            "net_latency_ms": float(net_latency_ms),
+            "wait_ms": float(wait_ms),
+            "prefill_ms": float(prefill_ms),
             "energy_kwh": float(score.get("energy_kwh", 0.0)),
             "carbon_g": float(score.get("carbon_g", 0.0)),
             "cost_usd": float(score.get("cost_usd", 0.0)),
@@ -927,17 +958,35 @@ class Geo_Network:
                 except Exception:
                     pass
 
-    def _process_requests_for_dc(self, dc: "Datacenter", tasks: List[Tuple[Any, ...]], epoch_idx: int,
-                                 epoch_start_ms: float) -> List[Tuple[int, Dict[str, Any]]]:
+    def _process_requests_for_dc(self, dc: "Datacenter", dc_id: int, row_indices,
+                                 epoch_idx: int, epoch_start_ms: float,
+                                 cols: Tuple[Any, ...]) -> List[Tuple[int, Dict[str, Any]]]:
+        # row_indices: an array('i') of workload row indices routed to this DC.
+        # cols: the workload's columnar arrays.  The 9 per-request fields used
+        # to be carried as a tuple per request; they are now read back here by
+        # index, so the grouping costs 4 bytes/request instead of ~1.3 KB.
+        # Every value below is reconstructed identically to the old tuple, and
+        # row_indices is in ascending row order (same as the old append order),
+        # so processing order — and therefore results — are unchanged.
+        src_dcs, models, arrivals, net_arr, tokens_arr, base_tokens_arr = cols
+        tgt_dc = int(dc_id)
         out: List[Tuple[int, Dict[str, Any]]] = []
-        for row_idx, src_dc, tgt_dc, model, arrival_rel_ms, arrival_abs_ms, net_ms, tokens in tasks:
+        for _ri in row_indices:
+            row_idx        = int(_ri)
+            src_dc         = int(src_dcs[row_idx])
+            model          = str(models[row_idx])
+            arrival_rel_ms = float(arrivals[row_idx])
+            arrival_abs_ms = epoch_start_ms + arrival_rel_ms
+            net_ms         = float(net_arr[row_idx])
+            tokens         = int(tokens_arr[row_idx])
+            base_tokens    = int(base_tokens_arr[row_idx])
             result = {
-                "epoch": int(epoch_idx), "request_idx": int(row_idx),
-                "source_dc": int(src_dc), "target_dc": int(tgt_dc), "model": str(model),
-                "arrival_ms": float(arrival_rel_ms), "net_latency_ms": float(net_ms), "tokens": int(tokens),
+                "epoch": int(epoch_idx), "request_idx": row_idx,
+                "source_dc": src_dc, "target_dc": tgt_dc, "model": model,
+                "arrival_ms": arrival_rel_ms, "net_latency_ms": net_ms, "tokens": tokens,
             }
             try:
-                dc_ret = dc.schedule_request(model=model, arrival=arrival_abs_ms, net_latency_ms=net_ms, tokens=tokens)
+                dc_ret = dc.schedule_request(model=model, arrival=arrival_abs_ms, net_latency_ms=net_ms, tokens=tokens, base_tokens=base_tokens, epoch_start_ms=epoch_start_ms)
                 if isinstance(dc_ret, dict):
                     dc_ret = dict(dc_ret)
                     if "start_ms" in dc_ret:
@@ -950,12 +999,20 @@ class Geo_Network:
                     "ttft_s": float(net_ms) / 1000.0, "dropped": True,
                     "energy_cost": 0.0, "cost_usd": 0.0, "energy_kwh": 0.0, "carbon_g": 0.0, "water_m3": 0.0,
                 })
-            out.append((int(row_idx), result))
+            out.append((row_idx, result))
         return out
 
     def apply_schedule_plan(self, epoch_idx: int, workload_df, schedule_plan: Dict[str, Any],
-                            power_plan: Dict[str, Any] | None) -> List[Dict[str, Any]]:
+                            power_plan: Dict[str, Any] | None,
+                            collect_details: bool = True) -> List[Dict[str, Any]]:
+        # collect_details=False -> streaming aggregation: per-request results are
+        # folded into a metric accumulator and discarded instead of being held
+        # in a full per-request list.  That list (~1.3 KB/request) is LAHyper's
+        # dominant per-epoch memory transient, and LAHyper discards it anyway.
+        # collect_details=True keeps the full list for callers that consume it
+        # (e.g. the Hybrid scheduler).
         self._apply_power_plan(power_plan)
+        _acc = None if collect_details else self._new_metric_acc()
         details: List[Optional[Dict[str, Any]]] = []
         if workload_df is None or len(workload_df) == 0:
             details = []
@@ -963,6 +1020,11 @@ class Geo_Network:
         else:
             mp = schedule_plan.get("map", {}) if isinstance(schedule_plan, dict) else {}
             rt = schedule_plan.get("route", {}) if isinstance(schedule_plan, dict) else {}
+            # LAHyper passes the request->DC assignment as a compact int32 array
+            # ("map_array", -1 = unassigned) instead of a dict, to save memory.
+            # Dict-based plans (e.g. Hybrid's "map") still work unchanged.
+            map_arr = schedule_plan.get("map_array") if isinstance(schedule_plan, dict) else None
+            map_arr_len = len(map_arr) if map_arr is not None else 0
             if isinstance(schedule_plan, dict):
                 default_raw = schedule_plan.get("default_target_dc", -1)
                 try:
@@ -988,8 +1050,28 @@ class Geo_Network:
 
             arrivals_col = workload_df.get("arrival_ms", workload_df.get("arrival"))
             arrivals = arrivals_col.to_numpy(copy=False) if arrivals_col is not None else [0.0] * n_rows
+
+            # Token counts — sanitised.  Real traces can carry NaN or negative
+            # token values; a raw int(NaN) raises ValueError mid-epoch and
+            # aborts the run.  Coerce non-finite -> 0 and clip negatives -> 0 so
+            # a malformed request degrades to a trivial (0-token) request
+            # instead of crashing the whole simulation.
+            def _clean_tokens(col):
+                if col is None:
+                    return np.zeros(n_rows, dtype=np.int64)
+                a = pd.to_numeric(pd.Series(col), errors="coerce").to_numpy(dtype=np.float64)
+                a = np.nan_to_num(a, nan=0.0, posinf=0.0, neginf=0.0)
+                return np.clip(a, 0.0, None).astype(np.int64)
+
             tokens_col = workload_df.get("num_tokens", workload_df.get("tokens"))
-            tokens_arr = tokens_col.to_numpy(copy=False) if tokens_col is not None else [0] * n_rows
+            tokens_arr = _clean_tokens(tokens_col)
+            # Un-inflated per-request token count for first-token-latency (prefill).
+            # The autoscaler writes `base_num_tokens` whenever it applies token
+            # scaling.  Absent it (non-autoscaled run), prefill falls back to the
+            # main token count — no decoupling, identical to the old behaviour.
+            base_tokens_col = workload_df.get("base_num_tokens", workload_df.get("base_tokens"))
+            base_tokens_arr = (_clean_tokens(base_tokens_col)
+                               if base_tokens_col is not None else tokens_arr)
 
             epoch_len_s = 900.0
             if self.datacenters:
@@ -999,9 +1081,38 @@ class Geo_Network:
                     epoch_len_s = 900.0
             epoch_start_ms = float(epoch_idx) * epoch_len_s * 1000.0
 
-            details = [None] * n_rows
-            tasks_by_dc: Dict[int, List[Tuple[Any, ...]]] = collections.defaultdict(list)
+            details = ([None] * n_rows) if collect_details else []
+            # tasks_by_dc holds, per DC, an array('i') of *row indices* — not a
+            # list of 9-tuples.  The per-request fields are read back from the
+            # workload's columnar numpy arrays (+ net_arr) by index.  This turns
+            # ~1.3 KB/request of Python tuples (the dominant per-epoch memory
+            # transient) into 4 bytes/request.  array('i') is appendable and
+            # compact; workload row indices fit comfortably in int32.
+            tasks_by_dc: Dict[int, "array.array"] = collections.defaultdict(
+                lambda: array.array("i"))
+            net_arr = np.zeros(n_rows, dtype=np.float64)   # per-row net latency
             total_tokens_for_agg = 0
+
+            # ── No-drop routing support ───────────────────────────────────
+            # A DC can serve a request only if it has >= 1 non-OFF node.
+            # Power state is fixed for the epoch, so compute the serviceable
+            # DC set once.  Requests routed to an off/invalid DC are
+            # rerouted to the nearest serviceable DC (deterministic, cached
+            # per source DC) rather than dropped.
+            serviceable_dcs = sorted(
+                dc_id for dc_id, _dc in self.datacenters.items()
+                if any(getattr(u, "state", "OFF") != "OFF"
+                       for u in getattr(_dc, "units", []))
+            )
+            serviceable_set = set(serviceable_dcs)
+
+            def _safe_net_ms(s_dc, t_dc):
+                try:
+                    return float(self._ring_path_latency_ms(s_dc, t_dc))
+                except Exception:
+                    return 0.0
+
+            _reroute_cache: Dict[int, int] = {}
 
             for row_idx in range(n_rows):
                 src_dc = int(src_dcs[row_idx])
@@ -1009,66 +1120,110 @@ class Geo_Network:
                 arrival_rel_ms = float(arrivals[row_idx])
                 arrival_abs_ms = epoch_start_ms + arrival_rel_ms
                 tokens = int(tokens_arr[row_idx])
+                base_tokens = int(base_tokens_arr[row_idx])
                 total_tokens_for_agg += tokens
 
-                tgt_dc = mp.get(row_idx)
-                if tgt_dc is None:
-                    tgt_dc = mp.get(str(row_idx))
+                tgt_dc = None
+                if map_arr is not None:
+                    if 0 <= row_idx < map_arr_len:
+                        _v = int(map_arr[row_idx])
+                        if _v >= 0:                # -1 sentinel = unassigned
+                            tgt_dc = _v
+                else:
+                    tgt_dc = mp.get(row_idx)
+                    if tgt_dc is None:
+                        tgt_dc = mp.get(str(row_idx))
                 if tgt_dc is None:
                     tgt_dc = rt.get(model, default_dc if default_dc != -1 else src_dc)
                 tgt_dc = int(tgt_dc)
 
-                try:
-                    net_ms = float(self._ring_path_latency_ms(src_dc, tgt_dc))
-                except Exception:
-                    net_ms = 0.0
+                # No-drop routing: if the routed DC is invalid or has no
+                # active nodes, reroute to the nearest serviceable DC rather
+                # than dropping.  Only when NO DC can serve (entire grid
+                # powered off) is the request marked dropped.
                 dc = self.datacenters.get(tgt_dc)
+                if (dc is None or tgt_dc not in serviceable_set) and serviceable_dcs:
+                    reroute_to = _reroute_cache.get(src_dc)
+                    if reroute_to is None:
+                        reroute_to = min(serviceable_dcs,
+                                         key=lambda c: (_safe_net_ms(src_dc, c), c))
+                        _reroute_cache[src_dc] = reroute_to
+                    tgt_dc = reroute_to
+                    dc = self.datacenters.get(tgt_dc)
+
+                net_ms = _safe_net_ms(src_dc, tgt_dc)
+
                 if dc is None:
-                    details[row_idx] = {
+                    # No serviceable DC anywhere — entire grid powered off.
+                    _drop_rec = {
                         "epoch": int(epoch_idx), "request_idx": row_idx,
                         "source_dc": src_dc, "target_dc": tgt_dc, "model": model,
                         "arrival_ms": arrival_rel_ms, "net_latency_ms": net_ms, "tokens": tokens,
                         "ttft_s": net_ms / 1000.0, "dropped": True,
                         "energy_cost": 0.0, "cost_usd": 0.0, "energy_kwh": 0.0, "carbon_g": 0.0, "water_m3": 0.0,
                     }
+                    if collect_details:
+                        details[row_idx] = _drop_rec
+                    else:
+                        self._fold_metric_record(_acc, _drop_rec)
                 else:
-                    tasks_by_dc[tgt_dc].append(
-                        (row_idx, src_dc, tgt_dc, model, arrival_rel_ms, arrival_abs_ms, net_ms, tokens))
+                    # Store only the row index; _process_requests_for_dc reads
+                    # the per-request fields back from the columnar arrays.
+                    net_arr[row_idx] = net_ms
+                    tasks_by_dc[tgt_dc].append(row_idx)
 
+            def _store_updates(updates):
+                # Buffered: place each result in the per-request list.
+                # Streaming: fold each result into the accumulator and discard.
+                if collect_details:
+                    for row_idx, result in updates:
+                        details[row_idx] = result
+                else:
+                    for _row_idx, result in updates:
+                        self._fold_metric_record(_acc, result)
+
+            # Columnar bundle handed to every _process_requests_for_dc call.
+            cols = (src_dcs, models, arrivals, net_arr, tokens_arr, base_tokens_arr)
             if tasks_by_dc:
                 if self.parallel_dc_workers > 1 and len(tasks_by_dc) > 1:
                     max_workers = min(self.parallel_dc_workers, len(tasks_by_dc))
                     with ThreadPoolExecutor(max_workers=max_workers) as ex:
                         future_map = {
-                            ex.submit(self._process_requests_for_dc, self.datacenters[dc_id], dc_tasks, epoch_idx,
-                                      epoch_start_ms): (dc_id, dc_tasks)
-                            for dc_id, dc_tasks in tasks_by_dc.items()
+                            ex.submit(self._process_requests_for_dc, self.datacenters[dc_id], dc_id, dc_rows,
+                                      epoch_idx, epoch_start_ms, cols): (dc_id, dc_rows)
+                            for dc_id, dc_rows in tasks_by_dc.items()
                         }
                         for fut in as_completed(future_map):
-                            dc_id, dc_tasks = future_map[fut]
+                            dc_id, dc_rows = future_map[fut]
                             try:
                                 updates = fut.result()
                             except Exception:
-                                updates = self._process_requests_for_dc(self.datacenters[dc_id], dc_tasks, epoch_idx,
-                                                                        epoch_start_ms)
-                            for row_idx, result in updates:
-                                details[row_idx] = result
+                                updates = self._process_requests_for_dc(self.datacenters[dc_id], dc_id, dc_rows,
+                                                                        epoch_idx, epoch_start_ms, cols)
+                            _store_updates(updates)
                 else:
-                    for dc_id, dc_tasks in tasks_by_dc.items():
-                        updates = self._process_requests_for_dc(self.datacenters[dc_id], dc_tasks, epoch_idx,
-                                                                epoch_start_ms)
-                        for row_idx, result in updates:
-                            details[row_idx] = result
+                    for dc_id, dc_rows in tasks_by_dc.items():
+                        updates = self._process_requests_for_dc(self.datacenters[dc_id], dc_id, dc_rows,
+                                                                epoch_idx, epoch_start_ms, cols)
+                        _store_updates(updates)
 
-            for idx, rec in enumerate(details):
-                if rec is None:
-                    details[idx] = {
-                        "epoch": int(epoch_idx), "request_idx": idx,
-                        "source_dc": int(src_dcs[idx]), "target_dc": int(src_dcs[idx]), "model": str(models[idx]),
-                        "arrival_ms": float(arrivals[idx]), "net_latency_ms": 0.0, "tokens": int(tokens_arr[idx]),
-                        "ttft_s": 0.0, "dropped": True,
-                        "energy_cost": 0.0, "cost_usd": 0.0, "energy_kwh": 0.0, "carbon_g": 0.0, "water_m3": 0.0,
-                    }
+            if collect_details:
+                for idx, rec in enumerate(details):
+                    if rec is None:
+                        details[idx] = {
+                            "epoch": int(epoch_idx), "request_idx": idx,
+                            "source_dc": int(src_dcs[idx]), "target_dc": int(src_dcs[idx]), "model": str(models[idx]),
+                            "arrival_ms": float(arrivals[idx]), "net_latency_ms": 0.0, "tokens": int(tokens_arr[idx]),
+                            "ttft_s": 0.0, "dropped": True,
+                            "energy_cost": 0.0, "cost_usd": 0.0, "energy_kwh": 0.0, "carbon_g": 0.0, "water_m3": 0.0,
+                        }
+            else:
+                # Streaming: any row neither processed nor dropped above is
+                # counted as a drop — mirrors the None-fill record (dropped=True),
+                # which contributes only to reqs_dropped.
+                _missing = n_rows - (_acc["reqs_completed"] + _acc["reqs_dropped"])
+                if _missing > 0:
+                    _acc["reqs_dropped"] += _missing
 
         epoch_len_s = 900.0
         if self.datacenters:
@@ -1078,7 +1233,8 @@ class Geo_Network:
                 epoch_len_s = 900.0
         epoch_start_ms = float(epoch_idx) * epoch_len_s * 1000.0
 
-        final_details: List[Dict[str, Any]] = [d for d in details if d is not None]
+        final_details: List[Dict[str, Any]] = (
+            [d for d in details if d is not None] if collect_details else [])
         for dc in self.datacenters.values():
             pre_grid_kwh = float(getattr(dc, "energy_grid_kwh", 0.0))
             pre_emb_kg = float(getattr(dc, "embodied_battery_co2_kg", 0.0))
@@ -1106,38 +1262,60 @@ class Geo_Network:
 
             if hasattr(dc, "cost_usd"): dc.cost_usd = float(getattr(dc, "cost_usd", 0.0)) + dCost_usd
 
-            final_details.append({
-                "dc_id": int(getattr(dc, "id", -1)),
-                "start_ms": 0.0, "end_ms": 0.0, "exec_ms": 0.0, "ttft_s": 0.0,
-                "energy_kwh": dE_kwh, "carbon_g": dCarbon_g, "cost_usd": dCost_usd, "water_m3": 0.0,
-                "tag": "epoch_finalize_idle",
-            })
+            if collect_details:
+                final_details.append({
+                    "dc_id": int(getattr(dc, "id", -1)),
+                    "start_ms": 0.0, "end_ms": 0.0, "exec_ms": 0.0, "ttft_s": 0.0,
+                    "energy_kwh": dE_kwh, "carbon_g": dCarbon_g, "cost_usd": dCost_usd, "water_m3": 0.0,
+                    "tag": "epoch_finalize_idle",
+                })
 
         self._last_epoch_results = final_details
-        self._last_epoch_metrics = self._aggregate_epoch_metrics(total_tokens_for_agg, final_details)
+        if collect_details:
+            self._last_epoch_metrics = self._aggregate_epoch_metrics(total_tokens_for_agg, final_details)
+        else:
+            self._last_epoch_metrics = self._finalize_epoch_metrics(_acc)
         return final_details
 
-    def _aggregate_epoch_metrics(self, tokens, details: List[Dict[str, Any]]) -> Dict[str, Any]:
-        ttft_sum, ttft_cnt, token_sum = 0.0, 0, 0
-        reqs_completed, reqs_dropped = 0, 0
+    def _new_metric_acc(self) -> Dict[str, Any]:
+        """Fresh per-request metric accumulator (streaming-aggregation state)."""
+        return {"ttft_sum": 0.0, "ttft_cnt": 0, "token_sum": 0,
+                "reqs_completed": 0, "reqs_dropped": 0,
+                "net_sum": 0.0, "wait_sum": 0.0, "prefill_sum": 0.0}
 
-        for r in details:
-            if r.get("tag") == "epoch_finalize_idle": continue
-            if r.get("dropped", False):
-                reqs_dropped += 1
-                continue
-            reqs_completed += 1
+    def _fold_metric_record(self, acc: Dict[str, Any], r: Dict[str, Any]) -> None:
+        """Fold one per-request result dict into a metric accumulator.  Mirrors
+        the per-request loop body of the buffered aggregator exactly, so the
+        streaming (collect_details=False) and buffered paths agree."""
+        if r.get("tag") == "epoch_finalize_idle":
+            return
+        if r.get("dropped", False):
+            acc["reqs_dropped"] += 1
+            return
+        acc["reqs_completed"] += 1
+        v = r.get("ttft_s", r.get("TTFT", r.get("time_to_first_token_s")))
+        if v is not None:
+            try:
+                acc["ttft_sum"]    += float(v); acc["ttft_cnt"] += 1
+                acc["net_sum"]     += float(r.get("net_latency_ms", 0.0))
+                acc["wait_sum"]    += float(r.get("wait_ms", 0.0))
+                acc["prefill_sum"] += float(r.get("prefill_ms", 0.0))
+            except Exception:
+                pass
+        t = r.get("tokens", r.get("total_tokens", None))
+        if t is not None:
+            acc["token_sum"] += max(0, int(t))
 
-            v = r.get("ttft_s", r.get("TTFT", r.get("time_to_first_token_s")))
-            if v is not None:
-                try:
-                    ttft_sum += float(v); ttft_cnt += 1
-                except Exception:
-                    pass
-            t = r.get("tokens", r.get("total_tokens", None))
-            if t is not None: token_sum += max(0, int(t))
-
-        avg_ttft = (ttft_sum / float(ttft_cnt)) if ttft_cnt > 0 else 0.0
+    def _finalize_epoch_metrics(self, acc: Dict[str, Any]) -> Dict[str, Any]:
+        """Turn a folded per-request accumulator + the datacenters' energy state
+        into the epoch metrics dict.  Shared by the buffered aggregator and the
+        streaming (collect_details=False) path."""
+        ttft_cnt = acc["ttft_cnt"]
+        avg_ttft = (acc["ttft_sum"] / float(ttft_cnt)) if ttft_cnt > 0 else 0.0
+        _n = float(ttft_cnt) if ttft_cnt > 0 else 1.0
+        avg_net_latency_ms = acc["net_sum"] / _n      # network-proximity component
+        avg_wait_ms        = acc["wait_sum"] / _n     # queueing component
+        avg_prefill_ms     = acc["prefill_sum"] / _n  # per-request prefill component
         total_energy_kwh, total_it_energy_kwh, total_cooling_energy_kwh = 0.0, 0.0, 0.0
         total_carbon_g, total_water_m3, total_cost_usd = 0.0, 0.0, 0.0
 
@@ -1156,12 +1334,24 @@ class Geo_Network:
             total_carbon_g += (grid_kwh * ci) + water_carbon + (batt_emb_kg * 1000.0) + fluid_emb_g
 
         return {
-            "avg_ttft": float(avg_ttft), "requests_completed": reqs_completed,
-            "requests_dropped": reqs_dropped, "energy_cost": float(total_cost_usd),
+            "avg_ttft": float(avg_ttft), "requests_completed": acc["reqs_completed"],
+            "requests_dropped": acc["reqs_dropped"], "energy_cost": float(total_cost_usd),
             "carbon_emissions": float(total_carbon_g), "water_usage": float(total_water_m3),
             "total_energy": float(total_energy_kwh), "total_it_energy_kwh": float(total_it_energy_kwh),
-            "total_cooling_energy_kwh": float(total_cooling_energy_kwh), "processed_tokens": float(token_sum)
+            "total_cooling_energy_kwh": float(total_cooling_energy_kwh),
+            "processed_tokens": float(acc["token_sum"]),
+            "avg_net_latency_ms": float(avg_net_latency_ms),
+            "avg_wait_ms": float(avg_wait_ms),
+            "avg_prefill_ms": float(avg_prefill_ms)
         }
+
+    def _aggregate_epoch_metrics(self, tokens, details: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Buffered aggregator — fold a full per-request list, then finalize.
+        Behaviour-identical to the previous inline implementation."""
+        acc = self._new_metric_acc()
+        for r in details:
+            self._fold_metric_record(acc, r)
+        return self._finalize_epoch_metrics(acc)
 
     def report_global_stats(self) -> Dict[str, Any]:
         if not isinstance(self._last_epoch_metrics, dict):
@@ -1176,6 +1366,13 @@ class Geo_Network:
             "processed_tokens": float(m.get("processed_tokens", 0.0)),
             "requests_completed": int(m.get("requests_completed", 0)),
             "requests_dropped": int(m.get("requests_dropped", 0)),
+            # TTFT component breakdown — propagated from _aggregate_epoch_metrics.
+            # run_epoch returns THIS dict (not _aggregate_epoch_metrics' dict),
+            # so without these three lines the breakdown never reaches callers
+            # (the diagnostic harness, the per-epoch FRONT print).
+            "avg_net_latency_ms": float(m.get("avg_net_latency_ms", 0.0)),
+            "avg_wait_ms": float(m.get("avg_wait_ms", 0.0)),
+            "avg_prefill_ms": float(m.get("avg_prefill_ms", 0.0)),
         }
 
     def report_dc_utilization(self) -> Dict[int, float]:
@@ -1273,7 +1470,7 @@ class LLM_Simulator:
         self.network = Geo_Network(self.datacenters, lat_mat, parallel_dc_workers=self.parallel_dc_workers)
 
     def run_epoch(self, epoch_idx: int, workload_df: pd.DataFrame, schedule_plan: Dict[str, Any],
-                  power_plan: Dict[str, Any]) -> Tuple[
+                  power_plan: Dict[str, Any], collect_details: bool = True) -> Tuple[
         Dict[str, Any], List[Dict[str, Any]], Dict[int, Dict[str, float]]]:
         global _MARLIN_LAST_P_DC_KW
         # MARLIN: auto-apply grid agent's LMP signal before resetting counters.
@@ -1286,7 +1483,8 @@ class LLM_Simulator:
         detailed_results: List[Dict[str, Any]] = self.network.apply_schedule_plan(epoch_idx=epoch_idx,
                                                                                   workload_df=workload_df,
                                                                                   schedule_plan=schedule_plan,
-                                                                                  power_plan=power_plan)
+                                                                                  power_plan=power_plan,
+                                                                                  collect_details=collect_details)
         metrics: Dict[str, Any] = self.network.report_global_stats()
         for k in ("avg_ttft", "energy_cost", "carbon_emissions", "water_usage", "total_energy", "total_it_energy_kwh",
                   "total_cooling_energy_kwh", "processed_tokens", "requests_completed", "requests_dropped"):
@@ -1770,12 +1968,30 @@ def build_world_from_csvs_exact(dc_specs_csv: str, node_specs_csv: str, latency_
                 model_perf = {}
                 if accel == "CPU":
                     row = rows_list[0]
+                    # SPEC CPU benchmark columns give a per-RUN (per-request)
+                    # process time.  ms_per_token must be a genuine per-token
+                    # rate — aliasing the two (ms_per_token = ms_per_request)
+                    # made a CPU node's per-token time hundreds of times too
+                    # large, so any request routed there got a prefill/exec of
+                    # tens of thousands of seconds (the GPU path one block
+                    # below already converts correctly via val/(batch*1000)).
+                    # Convert the per-request time to per-token by dividing by
+                    # a representative request size, mirroring the GPU path.
+                    _CPU_TOKENS_PER_REQUEST = 950.0   # canonical mean request size
                     for wl in SPEC_CPU_WORKLOADS:
                         val = _num(row.get(wl))
-                        if val is not None: model_perf[wl] = {"ms_per_request": val, "ms_per_token": val}
+                        if val is not None:
+                            model_perf[wl] = {
+                                "ms_per_request": val,
+                                "ms_per_token": val / _CPU_TOKENS_PER_REQUEST,
+                            }
                     if not model_perf:
                         ms7 = _num(row.get("Llama7b_Process"))
-                        if ms7: model_perf["povray_r"] = {"ms_per_request": ms7, "ms_per_token": ms7}
+                        if ms7:
+                            model_perf["povray_r"] = {
+                                "ms_per_request": ms7,
+                                "ms_per_token": ms7 / _CPU_TOKENS_PER_REQUEST,
+                            }
                 else:
                     ALL_MODEL_COLUMNS = ["Llama7b", "Llama70b", "Llama2_70B", "Llama31_405B", "Mixtral_8x7B", "DeepSeek_R1"]
                     for row in rows_list:

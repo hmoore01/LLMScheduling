@@ -121,6 +121,29 @@ METRIC_REWARD_SCALE   = 8.0             # Amplified metric penalty in reward (wa
 ECO_BONUS_SCALE       = 0.05            # Dampen shared eco bonus to avoid homogeneity
 HER_CROSS_PRIORITY    = 0.4             # Priority discount for cross-agent HER samples
 
+# ── Online-epoch memory controls ──────────────────────────────────────────────
+# A low-traffic trace epoch can be auto-scaled to a very large request count
+# (e.g. BurstGPT epoch 83 inflated ~124x to hit target util).  These bound the
+# peak memory of milp_optimizer on such epochs WITHOUT changing the numerical
+# result of normal epochs.
+PHASE1_MAX_WORKERS        = 4           # Concurrent exploration sims (1 per agent)
+# When an epoch has more than this many requests, Phase 1 explores agents
+# serially (workers -> 1) so at most ONE heavy simulator is live at a time
+# instead of PHASE1_MAX_WORKERS.  Set just above your typical epoch size: read
+# the per-epoch request count / the harness "Auto-Scale ... Requests xN" line
+# and pick a value normal epochs never reach, so only pathological spikes trip
+# it.  Lower-concurrency only changes wall-time, not the routing math.
+SERIALIZE_PHASE1_ABOVE    = 250_000
+# Phase 2 runs the simulator once per scheme (5x).  The per-request result list
+# it returns is never read inside this module (the offline path discards its
+# equivalent immediately) — it is only handed back as milp_optimizer's 2nd
+# return value.  Holding all five schemes' lists at once is ~5x the per-request
+# memory a single-policy framework ever holds, and is the parliament-specific
+# blow-up that OOMs on a large auto-scaled epoch (e.g. 461k requests) that the
+# other frameworks survive.  Keep False unless the *caller* needs per-request
+# detail (the per-scheme metrics dict is always returned regardless).
+RETAIN_PER_REQUEST_RESULTS = False
+
 # ─────────────────────────────────────────────────────────────────────────────
 # METRIC INDEX MAPPING  (weight vector position → simulation output key)
 # Weight vectors are always ordered: [Time, Carbon, Water, Cost]
@@ -425,8 +448,14 @@ def print_run_summary():
         if not vals[METRIC_KEYS[0]]:
             continue
         n = len(vals[METRIC_KEYS[0]])
+        # TTFT is request-weighted across epochs to match simulator_LLM's
+        # final_avg_ttft.  Plain mean only if this scheme served nothing.
+        _tt_vals = np.asarray(vals["avg_ttft"], dtype=float)
+        _tt_wts  = np.asarray(vals["requests_completed"], dtype=float)
+        _tt_avg  = (float(np.average(_tt_vals, weights=_tt_wts))
+                    if _tt_wts.sum() > 0 else float(np.mean(_tt_vals)))
         display[s] = [
-            float(np.mean(vals["avg_ttft"])),
+            _tt_avg,
             float(np.sum(vals["carbon_emissions"])) * METRIC_SCALE[1],
             float(np.sum(vals["water_usage"]))       * METRIC_SCALE[2],
             float(np.sum(vals["energy_cost"]))       * METRIC_SCALE[3],
@@ -1560,22 +1589,42 @@ def _enforce_route_power_coherence(action: np.ndarray, num_dcs: int,
 def _ensure_feasible_power_sliders(power_sliders, w_small, w_large,
                                    has_traffic: bool, num_requests: int) -> np.ndarray:
     """
-    Minimal feasibility: guarantee at least ONE DC can handle the traffic.
-    Intentionally light-touch — the agent's power preferences are respected
-    as much as possible to preserve scheme differentiation.
+    Load-aware feasibility: guarantee enough DCs are powered to plausibly
+    carry the epoch's traffic.
+
+    The previous version raised only the SINGLE most-preferred DC to a 0.70
+    floor.  When Phase-2 consensus converged on a near-all-off vector, that
+    funnelled an entire epoch of traffic into one DC, overwhelming it and
+    sending TTFT into the hundreds of seconds on the unlucky epochs.  This
+    keeps the light touch (the agent's preferences still rank which DCs come
+    on) but powers on as MANY top-preferred DCs as the load needs, so a
+    degenerate consensus can no longer create a one-DC bottleneck.
     """
     sl = np.clip(np.asarray(power_sliders, np.float64), 0.0, 1.0)
     if not has_traffic:
         return sl
-    # Only ensure the single most-preferred DC has minimum power
-    wt  = _normalize_weights(
+
+    wt = _normalize_weights(
         (np.asarray(w_small, np.float64) + np.asarray(w_large, np.float64)) / 2.0)
-    best_dc = int(np.argmax(wt))
-    # Raise floor to 0.70 so the top DC has enough active nodes to avoid queuing
-    sl[best_dc] = max(float(sl[best_dc]), 0.70)
-    # If nothing is powered on at all, turn on the preferred DC fully
+    n_dcs = len(sl)
+
+    # How many fully-powered DCs does this epoch's traffic need?  A DC at full
+    # power has ~NUM_NODE_TYPES nodes x REQUESTS_PER_NODE_CAP capacity.  Add a
+    # 1.5x headroom factor so the floor targets comfortable utilisation, not a
+    # knife-edge, then require at least 1 and never more than all DCs.
+    per_dc_cap = max(1.0, float(NUM_NODE_TYPES) * float(REQUESTS_PER_NODE_CAP))
+    needed = int(np.ceil(1.5 * float(num_requests) / per_dc_cap))
+    needed = max(1, min(n_dcs, needed))
+
+    # Raise the floor on the `needed` most-preferred DCs (by agent weight).
+    top_dcs = np.argsort(wt)[::-1][:needed]
+    for dc in top_dcs:
+        sl[int(dc)] = max(float(sl[int(dc)]), 0.70)
+
+    # If nothing is powered on at all, turn the single top DC fully on as a
+    # last-resort backstop (preserves the original guarantee).
     if float(sl.max()) < (1.0 / (NUM_NODE_TYPES + 0.99) + 1e-6):
-        sl[best_dc] = 1.0
+        sl[int(np.argmax(wt))] = 1.0
     return sl
 
 
@@ -2041,6 +2090,13 @@ def milp_optimizer(epoch_data, epoch_idx: int, node_properties: dict, epoch_summ
         proposal = _enforce_route_power_coherence(proposal, real_num_dcs)
         agent.epoch_count += 1
 
+        # Release this thread's simulator now rather than waiting for all four
+        # futures to join — run_epoch accumulates internal per-request arrays
+        # that survive del of its returned results (see offline path), so on a
+        # large auto-scaled epoch holding four of them live is what OOMs.
+        del temp_sim
+        gc.collect()
+
         return ag_name, curr_state, proposal, her_log
 
     # Run all 4 metric agents in parallel
@@ -2048,7 +2104,17 @@ def milp_optimizer(epoch_data, epoch_idx: int, node_properties: dict, epoch_summ
     agent_states:  dict = {}
     her_pool:      list = []
 
-    with ThreadPoolExecutor(max_workers=4) as ex:
+    # Cap concurrency on pathologically large (heavily auto-scaled) epochs:
+    # one live simulator instead of PHASE1_MAX_WORKERS.  Normal epochs are
+    # unaffected, so their results are identical to prior runs.
+    n_workers = PHASE1_MAX_WORKERS
+    if len(clean_data) > SERIALIZE_PHASE1_ABOVE:
+        n_workers = 1
+        print(f"  [MEM] Large epoch ({len(clean_data):,} requests > "
+              f"{SERIALIZE_PHASE1_ABOVE:,}) — Phase 1 serialised "
+              f"(workers {PHASE1_MAX_WORKERS}->1) to cap memory")
+
+    with ThreadPoolExecutor(max_workers=n_workers) as ex:
         futures = [ex.submit(explore_and_propose, ag) for ag in METRIC_AGENTS]
         for f in as_completed(futures):
             ag_name, curr, action, her_log = f.result()
@@ -2191,7 +2257,10 @@ def milp_optimizer(epoch_data, epoch_idx: int, node_properties: dict, epoch_summ
         # MARLIN: run_epoch() auto-applies LMP override and captures P_dc via Rate_Flow_Sim_v2
         mp, rp, dc_usage = scheme_sim.run_epoch(epoch_idx, clean_data, sp_p, pp_p)
         all_metrics[scheme] = mp
-        all_results[scheme] = rp
+        # Per-request results are never read here; retaining all 5 schemes' lists
+        # is the parliament-specific OOM on large epochs.  Drop them by default
+        # and free the list now so peak memory is ~1 sim, not 5.
+        all_results[scheme] = rp if RETAIN_PER_REQUEST_RESULTS else []
         # Collect execution data for offline training
         _execution_log.append((
             agent_states[METRIC_AGENTS[0]].copy(),  # state (same for all agents)
@@ -2200,6 +2269,13 @@ def milp_optimizer(epoch_data, epoch_idx: int, node_properties: dict, epoch_summ
             ps_p.copy(),                              # power sliders
             dc_usage                                  # DC usage
         ))
+        # Free the simulator and the (unused) per-request results before building
+        # the next scheme's — a fresh sim is already created per scheme, so this
+        # changes nothing but peak memory.
+        if not RETAIN_PER_REQUEST_RESULTS:
+            del rp
+        del scheme_sim, sp_p, pp_p
+        gc.collect()
 
     # ── Evolve agent capital (performance-based, personal to each agent) ──
     # Each agent's capital is updated based on how well its metric was served
@@ -2303,6 +2379,11 @@ def milp_optimizer(epoch_data, epoch_idx: int, node_properties: dict, epoch_summ
 
     # ── Record epoch for summary ──────────────────────────────────────────
     _EPOCH_HISTORY.append({"epoch": epoch_idx, "metrics": dict(all_metrics)})
+
+    # Drop per-epoch scratch before returning so a large epoch's transients are
+    # reclaimed immediately rather than lingering into the next epoch.
+    del her_pool, _execution_log, clean_data
+    gc.collect()
 
     return all_metrics, all_results, []
 

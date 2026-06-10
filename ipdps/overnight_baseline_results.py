@@ -1,32 +1,57 @@
 """
 overnight_sweep.py
 ==================
-Overnight experiment runner covering three trace sources and three sweeps.
+Overnight experiment runner covering three trace sources and five sweeps.
 
 Traces
 ──────
-  1. BurstGPT     — BurstGPT_1.csv
-  2. Azure-Code   — AzureLLMInferenceTrace_code_1week.csv
-  3. Azure-Conv   — AzureLLMInferenceTrace_conv_1week.csv
+  1. BurstGPT     — BurstGPT_without_fails_2.csv
+  2. Azure-Code   — AzureLLMInferenceTrace_code_1week.csv   (--day-offset 0)
+  3. Azure-Conv   — AzureLLMInferenceTrace_conv_1week.csv   (--day-offset 0)
 
-Sweeps (per trace)
-──────────────────
-  1. DC Sweep    — [4, 6, 8, 12] DCs @ baseline util & model mix
-  2. Util Sweep  — [65%, 75%, 85%, 95%, 105%] util @ 8 DCs & baseline mix
-  3. Mix Sweep   — large_frac [0.0, 0.25, 0.50, 0.75, 1.0] @ 8 DCs & 95% util
+Sweeps (per trace, each pivots around the shared baseline)
+──────────────────────────────────────────────────────────
+  1. DC Sweep     — num_dcs        [4, 6, 8, 12]
+  2. Util Sweep   — target_util    [65%, 75%, 85%, 95%, 105%]
+  3. Mix Sweep    — large_frac     [0.0, 0.25, 0.50, 0.75, 1.0]
+  4. Origin Sweep — distribution   [even, population, time]
+  5. Noise Sweep  — prediction_noise [0.0, 0.10, 0.20, 0.30]
 
-Baseline: 8 DCs / 95% util / 0.75 large_frac — shared across all sweeps and
-executed only once per (trace, framework) pair to avoid redundant runs.
+Baseline: 8 DCs / 95% util / 0.75 large_frac / even / 0 noise — shared across
+all sweeps and executed only once per (trace, framework) pair.  Each sweep
+varies ONE axis and holds the others at baseline, so the baseline point is the
+common anchor of every sweep table.
+
+Which sweeps run is controlled by ENABLED_SWEEPS, so the run can be phased:
+e.g. run {baseline, dc, util, mix} first, analyse, then a later invocation with
+{origin, noise} appends to the same CSV (the baseline anchor rows from phase 1
+are reused by the analysis automatically).
 
 Frameworks
 ──────────
-  All FRAMEWORKS are benchmarked.  parliament (Game_Theoretic_RL) runs in
-  online-only mode — no --offline-train flag is ever passed.
+  Every entry in FRAMEWORKS is benchmarked.  parliament (Game_Theoretic_RL)
+  runs online-only — no --offline-train flag is ever passed.  NOTE: the output
+  parsers also recognise helix / splitwise / perllm / hybrid / nsga2 FRONT
+  tags; if any of those are intended baselines, add them to FRAMEWORKS — they
+  are NOT swept unless listed there.
+
+Robustness
+──────────
+  • Resume-safe: rows already marked "ok*" in the CSV are skipped on restart,
+    so a crash mid-sweep costs only the unfinished runs (see RERUN_FAILED).
+  • Idle hang guard (PER_RUN_IDLE_TIMEOUT_MIN, OFF by default): only a run
+    that goes fully silent for that many minutes is killed; a slow run that is
+    still printing epoch lines is never interrupted, so runs always finish.
+  • Preflight: verifies the sweep-defining CLI flags actually exist in the
+    target scripts, so an origin/noise sweep can't silently be a no-op.
+  • Coverage audit: after the run, every intended (trace, framework, config,
+    run) cell is checked against the CSV and missing/failed cells are listed.
 
 Runtime estimate
 ────────────────
-  NUM_RUNS=1:  3 traces × 12 configs × 7 frameworks × 1 = 252 total runs
-  NUM_RUNS=3:  3 × 12 × 7 × 3 = 756 runs  (CI is meaningful; plan a weekend)
+  total runs = len(TRACES) × len(configs) × len(FRAMEWORKS) × NUM_RUNS.
+  With the defaults below that is 3 × 17 × 5 × 5 = 1275 runs — plan a weekend,
+  and rely on the resume logic if it does not finish in one sitting.
 """
 
 import csv
@@ -35,6 +60,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import numpy as np
 from datetime import datetime
@@ -62,14 +88,13 @@ TRACES = [
 ]
 
 # ── Frameworks ────────────────────────────────────────────────────────────────
+# Every entry here is swept on all traces and all configs.  The output parsers
+# additionally recognise these FRONT tags: helix, splitwise, perllm, hybrid,
+# nsga2.  If any of those are intended baselines, add their CLI name here — they
+# are NOT run unless listed.
 FRAMEWORKS = [   # online-only — no --offline-train
     "lahyper",
     "parliament",
-    "hybrid",
-    "helix",
-    "nsga2",
-    "perllm",
-    "splitwise",
     "qlearning",
     "ddqn",
     "actorcritic",
@@ -92,8 +117,37 @@ ORIGIN_SWEEP_VALUES     = ["even", "population", "time"]
 BASELINE_PRED_NOISE     = 0.0
 PRED_NOISE_SWEEP_VALUES = [0.0, 0.10, 0.20, 0.30]
 
-NUM_RUNS   = 3      # per (trace, config, framework) — CI needs n >= 2
+NUM_RUNS   = 5      # per (trace, config, framework) — CI needs n >= 2
 NUM_EPOCHS = 96     # 96 x 15 min = 24 hours
+
+# ── Robustness & phasing knobs ────────────────────────────────────────────────
+# Which sweeps to run this invocation.  Drop entries to phase the work (e.g.
+# run {baseline, dc_sweep, util_sweep, mix_sweep} first, then a later run with
+# {origin_sweep, noise_sweep}).  The CSV is shared, so analysis still sees the
+# baseline anchors written by an earlier phase.
+ENABLED_SWEEPS = {
+    "baseline", "dc_sweep", "util_sweep", "mix_sweep",
+    "origin_sweep", "noise_sweep",
+}
+
+# Resume: a run whose CSV row has status starting with "ok" is considered done
+# and skipped on restart.  With RERUN_FAILED=True, "crashed"/"no-data" rows are
+# retried (their stale rows are ignored by the analysis, which only averages
+# "ok*" rows).  Set False to also treat any prior attempt as final.
+RERUN_FAILED = True
+
+# Optional hang guard.  This is an IDLE timeout, not a total-runtime cap: it
+# only fires when a run produces NO output for this many minutes, which means a
+# genuine hang.  A slow-but-progressing run keeps printing epoch lines and is
+# never interrupted, so legitimate long runs always finish.  None = disabled
+# (the default — runs are never killed).  If you enable it, size it well above
+# the longest silent stretch a healthy run can have (e.g. one slow epoch).
+PER_RUN_IDLE_TIMEOUT_MIN = None
+
+# Preflight: if a sweep-defining CLI flag is missing from the target script,
+# warn (False) or abort (True).  Catches an origin/noise sweep silently being a
+# no-op because the simulator never learned the flag.
+STRICT_PREFLIGHT = False
 
 # ── Trace processor ───────────────────────────────────────────────────────────
 TRACE_SCRIPT   = "trace_process.py"
@@ -116,36 +170,45 @@ MAX_ROWS       = 16_000_000
 SEARCH_STEPS   = 9
 
 # ── CSV schema ────────────────────────────────────────────────────────────────
-# Top-level summary fields per run.
-BASE_FIELDNAMES = [
-    "trace", "framework", "sweep", "num_dcs", "target_util", "large_frac",
-    "distribution", "prediction_noise",
-    "run", "start_time", "end_time", "elapsed_min", "exit_code", "epochs",
+# Two CSVs are written, each at its natural granularity so each stays readable:
+#
+#   RUNS csv  — one row per run (~25 columns); every column is meaningful for
+#               every framework, so there are no blank cells.
+#   MODES csv — one row per (run, lahyper mode).  The 10x5 per-mode breakdown
+#               used to sit as 50 columns inside the runs csv — blank for every
+#               non-lahyper framework — which is what made the file unreadable.
+#               It now lives here, linked back to the run row by `run_id`.
+#
+# The runs csv carries a `status` column (see _extract_run_metrics) so a run
+# that crashed mid-way is an explicit row, not a row of silent blank metrics.
+
+# A SINGLE CSV in long ("tidy") form — one file, every metric in it.
+#
+#   * Most rows are run-level: scope="run", carrying that run's headline
+#     metrics in the metric columns.
+#   * A lahyper run additionally emits one row per multi-agent mode
+#     (scope="time_agent", "carbon_agent", ...) carrying that mode's metrics
+#     in the SAME metric columns.  Those rows sit directly beneath their run
+#     (same run_id).
+#
+# To read headline results: filter scope=="run".  For the lahyper per-agent
+# breakdown: the scope=<mode> rows.  No second file, no 50-column wide block.
+FIELDNAMES = [
+    "run_id", "trace", "framework", "sweep",
+    "num_dcs", "target_util", "large_frac", "distribution", "prediction_noise",
+    "run", "scope",
+    "status", "epochs_completed", "epochs_expected", "metric_source",
     "avg_ttft_s", "total_carbon_kg", "total_water_m3",
-    "total_energy_usd", "total_energy_kwh",
-    "avg_epoch_phv",
+    "total_energy_usd", "total_energy_kwh", "avg_epoch_phv",
+    "elapsed_min", "exit_code", "start_time", "end_time", "command",
 ]
 
-# Per-mode aggregate fields, sourced from the LA_HYPER MULTI-AGENT SUMMARY
-# table at the end of every lahyper run.  TTFT is averaged across epochs;
-# carbon/water/cost/total_energy are summed across epochs (matching the
-# simulator's own aggregation).
-#
-# Keep this list in sync with the modes defined in LA_Hyper_DDQN.py.
+# lahyper per-mode modes — must stay in sync with LA_Hyper_DDQN.py.
 PER_MODE_NAMES = [
     "time_agent", "carbon_agent", "water_agent", "cost_agent",
     "Balanced", "green_perf", "cost_guard", "water_saver", "peak_power_guard",
     "Pareto_Sample",
 ]
-PER_MODE_METRICS = ["ttft", "carbon", "water", "cost", "total_energy"]
-
-PER_MODE_FIELDS = [
-    f"{mode}_{metric}"
-    for mode in PER_MODE_NAMES
-    for metric in PER_MODE_METRICS
-]
-
-FIELDNAMES = BASE_FIELDNAMES + PER_MODE_FIELDS + ["command"]
 
 METRICS = ["avg_ttft_s", "total_carbon_kg", "total_water_m3", "total_energy_usd"]
 LABELS  = ["TTFT(s)",    "Carbon(kg)",       "Water(m3)",      "Cost($)"]
@@ -195,24 +258,117 @@ def compute_hypervolume(points, ref):
 
 # ── Output parsers ────────────────────────────────────────────────────────────
 
-def _parse_final_report(lines):
-    text    = "".join(lines)
-    metrics = {k: "" for k in [
-        "epochs", "avg_ttft_s", "total_carbon_kg",
-        "total_water_m3", "total_energy_usd", "total_energy_kwh",
-    ]}
+def _parse_epoch_fronts(lines):
+    """Return {epoch: [(ttft, carbon, water, cost, served), ...]} from per-epoch
+    [*-FRONT] lines.  `served` is None for lines that predate the served=
+    field.  Used by the partial-run fallback (PHV has its own parser)."""
+    pat = re.compile(
+        r"\[(?:HYBRID|NSGA2|LAHYPER|PARLIAMENT|PERLLM|HELIX|SPLITWISE)-FRONT\]"
+        r".*?epoch=(\d+).*?ttft=([0-9eE+\-\.]+).*?carbon=([0-9eE+\-\.]+)"
+        r".*?water=([0-9eE+\-\.]+).*?cost=([0-9eE+\-\.]+)"
+        r"(?:.*?served=([0-9eE+\-\.]+))?",
+        re.IGNORECASE,
+    )
+    epoch_pts = {}
+    for line in lines:
+        m = pat.search(line)
+        if not m:
+            continue
+        try:
+            epoch  = int(m.group(1))
+            vals   = [float(m.group(i)) for i in range(2, 6)]
+            served = float(m.group(6)) if m.group(6) is not None else None
+        except (ValueError, TypeError):
+            continue
+        epoch_pts.setdefault(epoch, []).append(tuple(vals) + (served,))
+    return epoch_pts
+
+
+def _extract_run_metrics(lines, epochs_expected):
+    """Pull the headline run metrics, robustly.
+
+    Primary source is the simulator's '=== Final Report ===' block — but that
+    only prints if the run completes.  If it is missing or incomplete (the run
+    crashed or was killed mid-way), this aggregates whatever per-epoch
+    [*-FRONT] lines DID print: average TTFT, summed carbon/water/cost.  So a
+    partial run yields real numbers instead of a row of blank cells.
+
+    Returns the six metric strings plus 'status', 'epochs_completed' and
+    'metric_source', so a partial run is always flagged explicitly.
+    """
+    text = "".join(lines)
+    out  = {k: "" for k in ("avg_ttft_s", "total_carbon_kg", "total_water_m3",
+                            "total_energy_usd", "total_energy_kwh")}
+
+    # Fast path: the Final Report block.
+    report = {}
     for key, pat in {
-        "epochs":           r"Epochs:\s*([0-9]+)",
-        "avg_ttft_s":       r"Average TTFT\s*\([^)]+\):\s*([0-9eE+\-\.]+)",
-        "total_carbon_kg":  r"Total Carbon\s*\([^)]+\):\s*([0-9eE+\-\.]+)",
-        "total_water_m3":   r"Total Water\s*\([^)]+\):\s*([0-9eE+\-\.]+)",
-        "total_energy_usd": r"Total Energy\s*\(\$\):\s*([0-9eE+\-\.]+)",
-        "total_energy_kwh": r"Total Energy\s*\(kWh\):\s*([0-9eE+\-\.]+)",
+        "report_epochs":    r"Epochs:\s*([0-9]+)",
+        "avg_ttft_s":       r"Average TTFT\s*\([^)]*\):\s*([0-9eE+\-\.]+)",
+        "total_carbon_kg":  r"Total Carbon\s*\([^)]*\):\s*([0-9eE+\-\.]+)",
+        "total_water_m3":   r"Total Water\s*\([^)]*\):\s*([0-9eE+\-\.]+)",
+        "total_energy_usd": r"Total Energy\s*\(\s*\$\s*\):\s*([0-9eE+\-\.]+)",
+        "total_energy_kwh": r"Total Energy\s*\(\s*kWh\s*\):\s*([0-9eE+\-\.]+)",
     }.items():
-        m = re.search(pat, text)
+        m = re.search(pat, text, re.IGNORECASE)
         if m:
-            metrics[key] = m.group(1)
-    return metrics
+            report[key] = m.group(1)
+
+    fronts           = _parse_epoch_fronts(lines)
+    epochs_seen      = sorted(fronts.keys())
+    epochs_completed = len(epochs_seen)
+
+    metric_keys = ("avg_ttft_s", "total_carbon_kg", "total_water_m3",
+                   "total_energy_usd", "total_energy_kwh")
+    have_report = all(k in report for k in metric_keys)
+
+    if have_report:
+        for k in metric_keys:
+            out[k] = report[k]
+        if report.get("report_epochs"):
+            epochs_completed = int(report["report_epochs"])
+        out["metric_source"] = "final-report"
+        if epochs_expected and epochs_completed < epochs_expected:
+            out["status"] = f"ok-short({epochs_completed}/{epochs_expected})"
+        else:
+            out["status"] = "ok"
+    elif epochs_completed > 0:
+        # Crashed / killed before the Final Report — aggregate the epochs that
+        # ran.  Per epoch: mean the front points.  Across epochs: TTFT is
+        # request-weighted (matching the Final Report's final_avg_ttft) when the
+        # FRONT lines carry served=; otherwise a plain mean.  carbon/water/cost
+        # are summed across epochs.  kWh is not on the FRONT line -> blank.
+        per_ep_ttft, per_ep_w = [], []
+        sum_carbon = sum_water = sum_cost = 0.0
+        for ep in epochs_seen:
+            pts = fronts[ep]
+            n   = len(pts)
+            per_ep_ttft.append(sum(p[0] for p in pts) / n)
+            sum_carbon += sum(p[1] for p in pts) / n
+            sum_water  += sum(p[2] for p in pts) / n
+            sum_cost   += sum(p[3] for p in pts) / n
+            served = [p[4] for p in pts if p[4] is not None]
+            per_ep_w.append(sum(served) / len(served) if served else 0.0)
+        if sum(per_ep_w) > 0.0:
+            ttft = (sum(t * w for t, w in zip(per_ep_ttft, per_ep_w))
+                    / sum(per_ep_w))
+            out["metric_source"] = "epoch-fallback-weighted"
+        else:
+            ttft = sum(per_ep_ttft) / len(per_ep_ttft)
+            out["metric_source"] = "epoch-fallback-unweighted"
+        out["avg_ttft_s"]       = f"{ttft:.6f}"
+        out["total_carbon_kg"]  = f"{sum_carbon:.3f}"
+        out["total_water_m3"]   = f"{sum_water:.4f}"
+        out["total_energy_usd"] = f"{sum_cost:.3f}"
+        out["total_energy_kwh"] = ""
+        out["status"]           = (f"crashed(ep{epochs_seen[-1]},"
+                                   f"{epochs_completed}/{epochs_expected})")
+    else:
+        out["metric_source"] = "none"
+        out["status"]        = "no-data"
+
+    out["epochs_completed"] = str(epochs_completed)
+    return out
 
 
 def _parse_epoch_phv(lines):
@@ -371,7 +527,7 @@ def _build_command(framework, num_dcs, target_util,
 
 def _run_one(trace_cfg, framework, sweep_name, num_dcs, target_util,
              large_frac, run_num, script_dir, log_file, writer, summary_file,
-             distribution="even", prediction_noise=0.0):
+             run_id, distribution="even", prediction_noise=0.0):
     cmd        = _build_command(framework, num_dcs, target_util,
                                 distribution=distribution,
                                 prediction_noise=prediction_noise)
@@ -386,19 +542,56 @@ def _run_one(trace_cfg, framework, sweep_name, num_dcs, target_util,
     log_file.flush()
 
     output_lines, exit_code, process = [], -1, None
+    timed_out   = {"flag": False}        # set by the monitor if the run goes idle
+    last_output = {"t": time.time()}     # updated on every line the run prints
+
     try:
         process = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, bufsize=1, cwd=script_dir)
+
+        # Idle/no-output hang guard.  The stdout read loop below blocks until the
+        # process closes its pipe, so a truly hung run (no output, never exits)
+        # would otherwise stall the whole batch.  This monitor kills the process
+        # ONLY after PER_RUN_IDLE_TIMEOUT_MIN of complete silence — a run that is
+        # still printing epoch lines resets the clock and is never interrupted,
+        # so slow-but-healthy runs always finish.  Disabled when the knob is None.
+        monitor      = None
+        stop_monitor = threading.Event()
+        if PER_RUN_IDLE_TIMEOUT_MIN:
+            idle_sec = PER_RUN_IDLE_TIMEOUT_MIN * 60.0
+
+            def _watch_idle(proc):
+                poll = max(1.0, min(idle_sec / 4.0, 30.0))
+                while not stop_monitor.wait(poll):
+                    if time.time() - last_output["t"] > idle_sec:
+                        timed_out["flag"] = True
+                        try: proc.kill()
+                        except Exception: pass
+                        return
+
+            monitor = threading.Thread(target=_watch_idle, args=(process,),
+                                       daemon=True)
+            monitor.start()
+
         try:
             for line in process.stdout:
+                last_output["t"] = time.time()
                 print(line, end=""); log_file.write(line)
                 output_lines.append(line); log_file.flush()
         except (BrokenPipeError, IOError, ValueError):
             pass
+        finally:
+            stop_monitor.set()
+            if monitor:
+                monitor.join(timeout=5)
+
         process.wait(timeout=30)
         exit_code = int(process.returncode)
-        if exit_code != 0:
+        if timed_out["flag"]:
+            log_file.write(f"\n[IDLE-TIMEOUT] {framework} killed after "
+                           f"{PER_RUN_IDLE_TIMEOUT_MIN} min with no output\n")
+        elif exit_code != 0:
             log_file.write(f"\n[WARN] {framework} exit code {exit_code}\n")
     except subprocess.TimeoutExpired:
         process.kill(); process.wait()
@@ -417,13 +610,25 @@ def _run_one(trace_cfg, framework, sweep_name, num_dcs, target_util,
               f"lf={large_frac:.2f} run={run_num}) in {elapsed_min:.2f}min\n")
     print(finish); log_file.write("-"*70 + "\n" + finish); log_file.flush()
 
-    parsed     = _parse_final_report(output_lines)
+    info       = _extract_run_metrics(output_lines, NUM_EPOCHS)
     avg_ep_phv = _parse_epoch_phv(output_lines)
     per_mode   = _parse_per_mode(output_lines)
+    # A killed run is recorded as a timeout regardless of how many epochs it
+    # logged, so the audit and analysis treat it as a failure, not "ok".  Status
+    # still starts with "timeout" so the coverage audit buckets it correctly.
+    if timed_out["flag"]:
+        info["status"] = (f"timeout-idle({info['epochs_completed']}/{NUM_EPOCHS},"
+                          f"{PER_RUN_IDLE_TIMEOUT_MIN}min-silent)")
     if avg_ep_phv:
         print(f"  [PHV] {framework}@{trace_cfg['label']} = {avg_ep_phv}")
+    # Surface the run's health on the console — a crash is no longer a silent
+    # row of blank metric cells.
+    if not info["status"].startswith("ok"):
+        print(f"  [STATUS] {framework}@{trace_cfg['label']} run{run_num}: "
+              f"{info['status']}  (metrics from {info['metric_source']})")
 
     row = {
+        "run_id":           run_id,
         "trace":            trace_cfg["name"],
         "framework":        framework,
         "sweep":            sweep_name,
@@ -433,23 +638,49 @@ def _run_one(trace_cfg, framework, sweep_name, num_dcs, target_util,
         "distribution":     distribution,
         "prediction_noise": f"{prediction_noise:.2f}",
         "run":              run_num,
-        "start_time":       start_dt.isoformat(timespec="seconds"),
-        "end_time":         datetime.now().isoformat(timespec="seconds"),
+        "scope":            "run",
+        "status":           info["status"],
+        "epochs_completed": info["epochs_completed"],
+        "epochs_expected":  str(NUM_EPOCHS),
+        "metric_source":    info["metric_source"],
+        "avg_ttft_s":       info["avg_ttft_s"],
+        "total_carbon_kg":  info["total_carbon_kg"],
+        "total_water_m3":   info["total_water_m3"],
+        "total_energy_usd": info["total_energy_usd"],
+        "total_energy_kwh": info["total_energy_kwh"],
+        "avg_epoch_phv":    avg_ep_phv,
         "elapsed_min":      f"{elapsed_min:.2f}",
         "exit_code":        str(exit_code),
-        "epochs":           parsed["epochs"],
-        "avg_ttft_s":       parsed["avg_ttft_s"],
-        "total_carbon_kg":  parsed["total_carbon_kg"],
-        "total_water_m3":   parsed["total_water_m3"],
-        "total_energy_usd": parsed["total_energy_usd"],
-        "total_energy_kwh": parsed["total_energy_kwh"],
-        "avg_epoch_phv":    avg_ep_phv,
+        "start_time":       start_dt.isoformat(timespec="seconds"),
+        "end_time":         datetime.now().isoformat(timespec="seconds"),
         "command":          " ".join(cmd),
     }
-    # Fill per-mode columns; missing modes get "".
-    for field in PER_MODE_FIELDS:
-        row[field] = per_mode.get(field, "")
     writer.writerow(row); summary_file.flush()
+
+    # lahyper per-mode breakdown -> additional rows in the SAME csv
+    # (scope=<mode>), reusing the shared metric columns.  Baseline frameworks
+    # emit no extra rows.  csv.DictWriter blanks any field not supplied here,
+    # so run-level-only columns (timing, command, phv) stay empty on these.
+    ident = {
+        "run_id": run_id, "trace": trace_cfg["name"], "framework": framework,
+        "sweep": sweep_name, "num_dcs": num_dcs,
+        "target_util": f"{target_util:.2f}", "large_frac": f"{large_frac:.2f}",
+        "distribution": distribution,
+        "prediction_noise": f"{prediction_noise:.2f}", "run": run_num,
+        "status": info["status"], "epochs_completed": info["epochs_completed"],
+        "epochs_expected": str(NUM_EPOCHS),
+    }
+    for mode in PER_MODE_NAMES:
+        if f"{mode}_ttft" in per_mode:
+            writer.writerow({
+                **ident, "scope": mode, "metric_source": "multi-agent-summary",
+                "avg_ttft_s":       per_mode.get(f"{mode}_ttft", ""),
+                "total_carbon_kg":  per_mode.get(f"{mode}_carbon", ""),
+                "total_water_m3":   per_mode.get(f"{mode}_water", ""),
+                "total_energy_usd": per_mode.get(f"{mode}_cost", ""),
+                "total_energy_kwh": per_mode.get(f"{mode}_total_energy", ""),
+            })
+    summary_file.flush()
     return row
 
 
@@ -493,7 +724,7 @@ def _print_sweep_table_str(df, sweep_col, sweep_values, metric, label, fw_list, 
     print(hdr)
     print(f"  {'':->14}", end="")
     for _ in sweep_values:
-        print(f"  {'':->width}", end="")
+        print(f"  {'':->{width}}", end="")
     print()
     for fw in fw_list:
         fw_df   = df[df["framework"] == fw]
@@ -514,7 +745,7 @@ def _print_sweep_table(df, sweep_col, sweep_values, metric, label, fw_list, widt
     print(hdr)
     print(f"  {'':->14}", end="")
     for _ in sweep_values:
-        print(f"  {'':->width}", end="")
+        print(f"  {'':->{width}}", end="")
     print()
     for fw in fw_list:
         fw_df   = df[df["framework"] == fw]
@@ -528,6 +759,168 @@ def _print_sweep_table(df, sweep_col, sweep_values, metric, label, fw_list, widt
         print(row_str)
 
 
+# ── Resume / preflight / coverage helpers ─────────────────────────────────────
+
+def _run_key(trace_name, framework, num_dcs, target_util,
+             large_frac, distribution, prediction_noise, run_num):
+    """Canonical identity of a single run, formatted exactly as the CSV stores
+    it so a row read back from disk matches a config built in memory."""
+    return (
+        str(trace_name), str(framework), int(num_dcs),
+        f"{float(target_util):.2f}", f"{float(large_frac):.2f}",
+        str(distribution), f"{float(prediction_noise):.2f}", int(run_num),
+    )
+
+
+def _load_run_status(csv_path):
+    """Read the existing results CSV and return {run_key: status} for every
+    scope=='run' row.  Empty dict if the file is absent or unreadable."""
+    status = {}
+    if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
+        return status
+    try:
+        with open(csv_path, newline="") as fh:
+            for r in csv.DictReader(fh):
+                if r.get("scope") != "run":
+                    continue
+                try:
+                    key = _run_key(
+                        r["trace"], r["framework"], r["num_dcs"],
+                        r["target_util"], r["large_frac"],
+                        r.get("distribution") or BASELINE_DISTRIBUTION,
+                        r.get("prediction_noise") or 0.0, r["run"],
+                    )
+                except (KeyError, ValueError):
+                    continue
+                prev = status.get(key, "")
+                # Keep the best status we've seen for this key (ok* wins).
+                if prev.startswith("ok"):
+                    continue
+                status[key] = r.get("status", "")
+    except Exception as exc:
+        print(f"[RESUME] Could not read existing CSV ({exc}); starting fresh.")
+    return status
+
+
+def _is_done(status):
+    """A run counts as done (skippable) iff it produced a final report."""
+    s = status or ""
+    if s.startswith("ok"):
+        return True
+    return (not RERUN_FAILED) and s != ""
+
+
+def _preflight_flags(script_dir):
+    """Verify the sweep-defining CLI flags actually appear in the target
+    scripts.  A flag passed but unknown to the script means that whole sweep is
+    silently a no-op, which a coverage count alone would never reveal."""
+    checks = [
+        ("simulator_LLM.py", "--distribution",
+         "origin/distribution sweep" if len(ORIGIN_SWEEP_VALUES) > 1 else None),
+        ("simulator_LLM.py", "--prediction-noise",
+         "prediction-noise sweep" if len(PRED_NOISE_SWEEP_VALUES) > 1 else None),
+        ("simulator_LLM.py", "--num-dcs",  "DC sweep"),
+        ("simulator_LLM.py", "--target-util", "utilisation sweep"),
+        (TRACE_SCRIPT,       "--large-frac",  "model-mix sweep"),
+    ]
+    # --day-offset only matters if some trace uses it.
+    if any("--day-offset" in t.get("extra_args", []) for t in TRACES):
+        checks.append((TRACE_SCRIPT, "--day-offset", "Azure day-offset"))
+
+    missing = []
+    cache = {}
+    for fname, flag, why in checks:
+        if why is None:
+            continue
+        path = os.path.join(script_dir, fname)
+        if fname not in cache:
+            try:
+                with open(path) as fh:
+                    cache[fname] = fh.read()
+            except OSError:
+                cache[fname] = None
+        src = cache[fname]
+        if src is None:
+            missing.append((fname, flag, why, "script not found"))
+        elif flag not in src:
+            missing.append((fname, flag, why, "flag not referenced"))
+
+    if missing:
+        print("\n[PREFLIGHT] WARNING — sweep flags not found in target scripts:")
+        for fname, flag, why, reason in missing:
+            print(f"    {flag:<20} ({why}) -> {fname}: {reason}")
+        print("    Affected sweep(s) may run but produce baseline-identical "
+              "results.")
+        if STRICT_PREFLIGHT:
+            print("[PREFLIGHT] STRICT_PREFLIGHT=True -> aborting.")
+            sys.exit(2)
+        print("[PREFLIGHT] Continuing (STRICT_PREFLIGHT=False).\n")
+    else:
+        print("[PREFLIGHT] OK — all sweep flags are recognised by their "
+              "target scripts.\n")
+    return missing
+
+
+def _audit_coverage(csv_path, traces, frameworks, configs, num_runs):
+    """Cross-check every intended (trace, framework, config, run) cell against
+    the CSV and print a clear completeness report.  This is the guarantee that
+    the matrix is actually covered — not just that the loop ran."""
+    status = _load_run_status(csv_path)
+    buckets = {"ok": [], "short": [], "timeout": [], "crashed": [],
+               "no-data": [], "missing": []}
+
+    for tr in traces:
+        for sweep, dcs, util, lf, dist, noise in configs:
+            for fw in frameworks:
+                for run_num in range(1, num_runs + 1):
+                    key = _run_key(tr["name"], fw, dcs, util, lf, dist,
+                                   noise, run_num)
+                    s = status.get(key)
+                    label = (f"{tr['name']}|{fw}|dcs{dcs}|util{util:.2f}|"
+                             f"lf{lf:.2f}|{dist}|noise{noise:.2f}|run{run_num}")
+                    if s is None:
+                        buckets["missing"].append(label)
+                    elif s.startswith("ok-short"):
+                        buckets["short"].append(label)
+                    elif s.startswith("ok"):
+                        buckets["ok"].append(label)
+                    elif s.startswith("timeout"):
+                        buckets["timeout"].append(label)
+                    elif s.startswith("crashed"):
+                        buckets["crashed"].append(label)
+                    else:
+                        buckets["no-data"].append(label)
+
+    total = sum(len(v) for v in buckets.values())
+    print(f"\n{'='*80}")
+    print(f"  COVERAGE AUDIT  —  {total} intended cells "
+          f"({len(traces)} traces x {len(configs)} configs x "
+          f"{len(frameworks)} frameworks x {num_runs} runs)")
+    print(f"{'='*80}")
+    print(f"  ok (usable)      : {len(buckets['ok'])}")
+    print(f"  ok-short         : {len(buckets['short'])}  (final report, fewer epochs)")
+    print(f"  timeout          : {len(buckets['timeout'])}")
+    print(f"  crashed          : {len(buckets['crashed'])}")
+    print(f"  no-data          : {len(buckets['no-data'])}")
+    print(f"  MISSING (unrun)  : {len(buckets['missing'])}")
+
+    incomplete = (buckets["timeout"] + buckets["crashed"]
+                  + buckets["no-data"] + buckets["missing"])
+    if not incomplete:
+        print("\n  ✓ Full coverage — every intended cell has a usable result.")
+    else:
+        print(f"\n  {len(incomplete)} cell(s) need attention "
+              f"(re-run the script to retry them):")
+        CAP = 40
+        for lbl in incomplete[:CAP]:
+            print(f"    - {lbl}")
+        if len(incomplete) > CAP:
+            print(f"    ... and {len(incomplete) - CAP} more "
+                  f"(see status!='ok*' rows in the CSV).")
+    print(f"{'='*80}")
+    return buckets
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def run_experiments():
@@ -535,9 +928,9 @@ def run_experiments():
     out_dir    = os.path.join(script_dir, "experiment_results")
     os.makedirs(out_dir, exist_ok=True)
     log_path   = os.path.join(out_dir, "LAHyper_Full_Experiments.log")
-    csv_path   = os.path.join(out_dir, "LAHyper_Full_Experiments.csv")
+    csv_path   = os.path.join(out_dir, "LAHyper_Results.csv")     # single results file
 
-    # Append mode — safe to restart: existing rows are preserved, header is
+    # Append mode — safe to restart: existing rows are preserved, the header is
     # written only when the CSV does not yet exist (or is empty).
     csv_is_new = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
 
@@ -550,16 +943,19 @@ def run_experiments():
                       file=sys.stderr)
                 sys.exit(1)
 
-    # Build deduped config list (baseline shared across all sweeps)
+    # Build deduped config list (baseline shared across all sweeps).  Only the
+    # sweeps named in ENABLED_SWEEPS contribute configs, so the run can be phased.
     # Config tuple: (sweep_name, num_dcs, target_util, large_frac, distribution, pred_noise)
     seen, configs = set(), []
     def _add(sweep, dcs, util, lf, dist=BASELINE_DISTRIBUTION, noise=BASELINE_PRED_NOISE):
+        if sweep not in ENABLED_SWEEPS:
+            return
         key = (dcs, util, lf, dist, noise)
         if key not in seen:
             seen.add(key)
             configs.append((sweep, dcs, util, lf, dist, noise))
 
-    # Baseline (shared across all non-noise, non-origin sweeps)
+    # Baseline (shared anchor for every sweep)
     _add("baseline",  BASELINE_DCS,  BASELINE_UTIL,       BASELINE_LARGE_FRAC)
     # DC sweep
     for dcs  in DC_SWEEP_VALUES:         _add("dc_sweep",   dcs,          BASELINE_UTIL, BASELINE_LARGE_FRAC)
@@ -576,9 +972,28 @@ def run_experiments():
         if noise != BASELINE_PRED_NOISE:
             _add("noise_sweep", BASELINE_DCS, BASELINE_UTIL, BASELINE_LARGE_FRAC, noise=noise)
 
+    # An origin/noise-only phase still needs the baseline anchor for its tables;
+    # those rows come from an earlier phase's CSV, so warn if neither is present.
+    if not configs:
+        print("ERROR: ENABLED_SWEEPS produced no configs — nothing to run.",
+              file=sys.stderr)
+        sys.exit(1)
+
     unique_lf_all     = sorted({lf for _, _, _, lf, _, _ in configs})
     total_trace_files = len(TRACES) * len(unique_lf_all)
     total_runs        = len(TRACES) * len(configs) * len(FRAMEWORKS) * NUM_RUNS
+
+    # Resume: how many of these cells already have a usable result on disk?
+    prior_status = _load_run_status(csv_path)
+    already_done = 0
+    for tr in TRACES:
+        for _, dcs, util, lf, dist, noise in configs:
+            for fw in FRAMEWORKS:
+                for run_num in range(1, NUM_RUNS + 1):
+                    k = _run_key(tr["name"], fw, dcs, util, lf, dist, noise, run_num)
+                    if _is_done(prior_status.get(k, "")):
+                        already_done += 1
+    remaining = total_runs - already_done
 
     print("=" * 76)
     print(f"  OVERNIGHT SWEEP  —  {len(TRACES)} TRACES x {len(configs)} CONFIGS x "
@@ -587,6 +1002,7 @@ def run_experiments():
     for tr in TRACES:
         print(f"  {tr['label']:<14}  {', '.join(tr['inputs'])}")
     print("-" * 76)
+    print(f"  Enabled sw.: {', '.join(sorted(ENABLED_SWEEPS))}")
     print(f"  Frameworks : {', '.join(FRAMEWORKS)}")
     print(f"  parliament : online-only (no --offline-train)")
     print(f"  DC sweep   : {DC_SWEEP_VALUES} @ util={BASELINE_UTIL*100:.0f}%  lf={BASELINE_LARGE_FRAC:.2f}")
@@ -595,9 +1011,17 @@ def run_experiments():
     print(f"  Origin sw. : dist={ORIGIN_SWEEP_VALUES} @ baseline config")
     print(f"  Noise sw.  : pred_noise={PRED_NOISE_SWEEP_VALUES} @ baseline config")
     print(f"  Trace files: {total_trace_files}  |  NUM_RUNS={NUM_RUNS}  (need >=2 for 95% CI)")
+    print(f"  Hang guard : idle timeout {PER_RUN_IDLE_TIMEOUT_MIN} min"
+          if PER_RUN_IDLE_TIMEOUT_MIN
+          else "  Hang guard : disabled (runs never interrupted)")
+    print(f"  Resume     : {already_done} done, {remaining} remaining "
+          f"(retry-failed={RERUN_FAILED})")
     print(f"  Log : {log_path}")
     print(f"  CSV : {csv_path}")
     print("=" * 76 + "\n")
+
+    # Preflight: make sure each sweep's flag is actually understood downstream.
+    _preflight_flags(script_dir)
 
     with open(log_path, "a") as log_file, \
          open(csv_path,  "a", newline="") as summary_file:
@@ -627,8 +1051,11 @@ def run_experiments():
 
         # ── Phase 2: Run experiments ──────────────────────────────────────────
         print("[PHASE 2] Running experiments ...")
-        run_counter  = 0
-        active_key   = None   # (trace_name, lf) currently active
+        run_counter  = 0            # position in the full matrix (1..total_runs)
+        executed     = 0            # actually launched this session
+        skipped      = 0            # already done on disk
+        active_key   = None         # (trace_name, lf) currently active
+        elapsed_hist = []           # minutes per executed run, for ETA
 
         for tr in TRACES:
             print(f"\n{'#'*70}")
@@ -641,47 +1068,93 @@ def run_experiments():
                                 f"util={target_util*100:.0f}% lf={large_frac:.2f} "
                                 f"dist={distribution} noise={pred_noise:.2f}")
 
-                tk = (tr["name"], large_frac)
-                if tk != active_key:
-                    activate_trace(trace_paths[tk], script_dir)
-                    active_key = tk
-                    msg = f"\n[TRACE] Active: {os.path.basename(trace_paths[tk])}\n"
-                    print(msg, end=""); log_file.write(msg)
-
                 for framework in FRAMEWORKS:
                     for run_num in range(1, NUM_RUNS + 1):
                         run_counter += 1
+                        key = _run_key(tr["name"], framework, num_dcs,
+                                       target_util, large_frac, distribution,
+                                       pred_noise, run_num)
+
+                        # Resume: skip cells that already have a usable result.
+                        if _is_done(prior_status.get(key, "")):
+                            skipped += 1
+                            print(f"[SKIP {run_counter}/{total_runs}] "
+                                  f"{tr['name']}|{framework}|{config_label}|run{run_num} "
+                                  f"(status={prior_status.get(key)})")
+                            continue
+
+                        # Activate the right trace only when a run will actually
+                        # execute (avoids needless copies on a full resume).
+                        tk = (tr["name"], large_frac)
+                        if tk != active_key:
+                            activate_trace(trace_paths[tk], script_dir)
+                            active_key = tk
+                            msg = f"\n[TRACE] Active: {os.path.basename(trace_paths[tk])}\n"
+                            print(msg, end=""); log_file.write(msg)
+
+                        eta = ""
+                        if elapsed_hist:
+                            mean_min = sum(elapsed_hist) / len(elapsed_hist)
+                            left     = total_runs - run_counter + 1
+                            eta_h    = mean_min * left / 60.0
+                            eta = f"  ~{mean_min:.1f} min/run, ETA {eta_h:.1f} h"
+
                         print(f"\n{'='*70}")
                         print(f"Run {run_counter}/{total_runs}  "
-                              f"[{tr['label']}|{framework}|{config_label}|run{run_num}]")
+                              f"(exec {executed+1}, skipped {skipped}){eta}")
+                        print(f"  [{tr['label']}|{framework}|{config_label}|run{run_num}]")
                         print(f"{'='*70}")
                         log_file.write(f"\n{'='*70}\n"
                                        f"Run {run_counter}/{total_runs} "
                                        f"[{tr['name']}|{framework}|{config_label}|{run_num}]\n")
+
+                        t0 = time.time()
                         try:
                             _run_one(tr, framework, sweep_name, num_dcs,
                                      target_util, large_frac, run_num,
                                      script_dir, log_file, writer, summary_file,
+                                     run_counter,
                                      distribution=distribution,
                                      prediction_noise=pred_noise)
+                            executed += 1
+                            elapsed_hist.append((time.time() - t0) / 60.0)
                         except Exception as exc:
                             err = (f"\n[{datetime.now()}] FATAL: "
                                    f"{tr['label']}|{framework}|{config_label} "
                                    f"run{run_num}: {exc}\n")
                             print(err); log_file.write(err); log_file.flush()
 
-        log_file.write(f"\n=== COMPLETED {datetime.now()} ===\n")
+        print(f"\n[PHASE 2] Done — {executed} run(s) executed, "
+              f"{skipped} skipped (already done).")
+        log_file.write(f"\n=== COMPLETED {datetime.now()}  "
+                       f"executed={executed} skipped={skipped} ===\n")
 
     # ── Phase 3: Analysis & reporting ────────────────────────────────────────
     print("\n" + "="*80)
     print("ALL EXPERIMENTS COMPLETED")
     print("="*80)
-    print(f"Log : {log_path}\nCSV : {csv_path}\n")
+    print(f"Log : {log_path}")
+    print(f"CSV : {csv_path}\n")
 
     try:
         import pandas as pd
 
         df = pd.read_csv(csv_path)
+        # Long-form CSV: the summary tables operate on run-level rows only;
+        # the scope=<mode> rows are the lahyper per-agent breakdown.
+        if "scope" in df.columns:
+            df = df[df["scope"] == "run"].copy()
+        # Only average runs that produced a final report.  crashed/timeout/
+        # no-data rows stay in the CSV for the coverage audit but must not enter
+        # the means (their summed metrics span fewer epochs and aren't
+        # comparable).  Keep "ok" and "ok-short".
+        if "status" in df.columns:
+            usable = df["status"].fillna("").str.startswith("ok")
+            n_drop = int((~usable).sum())
+            if n_drop:
+                print(f"  (excluding {n_drop} non-ok run row(s) from the "
+                      f"sweep tables; see coverage audit below)")
+            df = df[usable].copy()
         for col in METRICS + ["total_energy_kwh", "avg_epoch_phv",
                                "target_util", "num_dcs", "large_frac", "prediction_noise"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -798,7 +1271,7 @@ def run_experiments():
             print(hdr)
             print(f"  {'':->14}", end="")
             for _ in trace_labels:
-                print(f"  {'':->W}", end="")
+                print(f"  {'':->{W}}", end="")
             print()
             for fw in FRAMEWORKS:
                 row_str = f"  {fw:<14}"
@@ -829,6 +1302,14 @@ def run_experiments():
 
     except Exception as e:
         print(f"\n(Summary error: {e})")
+        import traceback; traceback.print_exc()
+
+    # Coverage audit runs regardless of whether the pandas summary succeeded —
+    # it depends only on the CSV and the intended matrix.
+    try:
+        _audit_coverage(csv_path, TRACES, FRAMEWORKS, configs, NUM_RUNS)
+    except Exception as e:
+        print(f"\n(Coverage audit error: {e})")
         import traceback; traceback.print_exc()
 
 

@@ -148,28 +148,31 @@ DEFAULT_POPULATION_WEIGHTS = {0: 0.12, 1: 0.10, 2: 0.08, 3: 0.15, 4: 0.10, 5: 0.
 DEFAULT_TIMEZONE_OFFSETS = {0: -5, 1: -8, 2: -6, 3: 0, 4: 1, 5: 2, 6: 8, 7: 9, 8: 7, 9: -3, 10: 3, 11: 2}
 DEFAULT_BASE_POPULATION = DEFAULT_POPULATION_WEIGHTS
 AUTOSCALE_MAX_MULTIPLIER = 700000.0
-# Fraction of the autoscale multiplier assigned to ROW replication; the
-# remainder goes to token scaling (then hard-clamped at AUTOSCALE_MAX_TOKEN_SCALE).
-# Lowered from 0.95 -> 0.90 to favour token scaling slightly: fewer replicated
-# rows means fewer per-request scheduling operations, so the simulator runs
-# faster.  The token multiplier is still clamped at AUTOSCALE_MAX_TOKEN_SCALE
-# (2.0x) — request sizes cannot exceed the realistic range no matter what this
-# value is.  This trims count_mult by roughly 20%; it is a modest speedup, not
-# a substitute for reducing run scale or profiling the simulator hot path.
-AUTOSCALE_COUNT_SHARE = 0.90
-AUTOSCALE_MAX_COUNT_MULT = 1000
+# ── Autoscale load split: row replication x token scaling ─────────────────────
+# A total autoscale multiplier m is split into (count_mult, remainder_scale)
+# such that count_mult * remainder_scale == m EXACTLY.  Because the product is
+# preserved, the split changes only HOW the load is delivered (more rows vs
+# fatter requests) — it never changes the achieved utilisation.
+#
+# AUTOSCALE_TARGET_TOKEN_SCALE is the token multiplier the split aims for: row
+# replication is chosen as round(m / target), so the leftover token scale
+# (m / count_mult) lands at ~target.  A HIGHER target means FEWER replicated
+# rows, which is the whole point — fewer rows means less memory and fewer
+# per-request scheduling operations.  At 5x this cuts per-epoch row counts
+# roughly 3-4x versus the old row-dominated split (which produced only
+# ~1.1-1.6x token scale and millions of rows) with no change to target util.
+AUTOSCALE_TARGET_TOKEN_SCALE = 50.0
+AUTOSCALE_MAX_COUNT_MULT = 1000000
 AUTOSCALE_MAX_DROP_FRAC = 0.05
 AUTOSCALE_SEARCH_STEPS = 7
 AUTOSCALE_MAX_EXPANDED_ROWS = 250000
-# Maximum factor by which per-request token counts may be inflated during
-# autoscaling.  Load should be scaled primarily by REPLICATING requests (more
-# arrivals = realistic "more traffic"), NOT by multiplying token counts (which
-# turns every request into an unrealistic mega-prompt and inflates TTFT, since
-# TTFT = ms_per_token x tokens).  A modest token bump (<=2x) gives the
-# autoscaler headroom to hit utilisation targets without distorting request
-# sizes the way the old uncapped behaviour did (100x+ token inflation).  Beyond
-# 2x, request-size realism degrades — so row replication must carry the rest.
-AUTOSCALE_MAX_TOKEN_SCALE = 2.0
+# Safety ceiling on token inflation.  The split TARGETS AUTOSCALE_TARGET_TOKEN_
+# SCALE (5x); this ceiling only ever trips when the row-replication budget
+# (count_cap / --autoscale-max-rows) is exhausted, so token scaling alone would
+# otherwise have to carry an unreasonable share of the load.  When it trips the
+# run honestly reaches a lower utilisation rather than fabricating mega-prompts.
+# Kept comfortably above the 5x target so normal operation never clamps.
+AUTOSCALE_MAX_TOKEN_SCALE = 50.0
 
 
 def _even_src_dc(df: pd.DataFrame, num_dcs: int) -> pd.Series:
@@ -483,22 +486,28 @@ def summarize_epoch_rate(df: pd.DataFrame):
 def _split_autoscale_multiplier(multiplier: float, count_cap: Optional[int] = None) -> Tuple[int, float]:
     """Split a total autoscale multiplier into (row-replication, token-scale).
 
-    Load is scaled primarily by replicating rows (realistic: more arrivals).
-    The token multiplier is HARD-CAPPED at AUTOSCALE_MAX_TOKEN_SCALE so the
-    workload never degenerates into a few unrealistically huge requests.
+    The split targets a fixed token scale (AUTOSCALE_TARGET_TOKEN_SCALE): row
+    replication is chosen as round(m / target) so the leftover token multiplier
+    lands at ~target.  Because remainder_scale is then defined as m / count_mult,
+    the product count_mult * remainder_scale equals m exactly — the split never
+    changes the achieved utilisation, only the row/token mix.  Targeting a
+    larger token scale yields fewer replicated rows (less memory, faster sim).
 
-    If row replication is capped (by count_cap) and the token cap is also hit,
-    the effective multiplier achieved (count_mult * remainder_scale) will be
-    LESS than the requested multiplier.  That is intentional and honest — the
-    run will reach a lower utilisation rather than fabricate a token-heavy
-    workload to hit the target.
+    If row replication is capped (by count_cap) the leftover token scale rises
+    above the target to keep the product equal to m.  Only if it would exceed
+    AUTOSCALE_MAX_TOKEN_SCALE is it clamped — in which case the effective
+    multiplier (count_mult * remainder_scale) is LESS than requested and the run
+    honestly reaches a lower utilisation rather than fabricating mega-prompts.
     """
     m = max(0.0, float(multiplier))
     if m <= 1.0:
         return 1, m
     cap = AUTOSCALE_MAX_COUNT_MULT if count_cap is None else max(1, int(count_cap))
-    count_mult = int(math.floor(m * AUTOSCALE_COUNT_SHARE))
-    count_mult = max(1, min(count_mult, cap))
+    # Pick row replication so the leftover token scale lands at ~the target.
+    # remainder_scale = m / count_mult below, so count_mult * remainder_scale
+    # == m exactly: utilisation is unaffected, only the row/token split moves.
+    count_mult = max(1, int(round(m / AUTOSCALE_TARGET_TOKEN_SCALE)))
+    count_mult = min(count_mult, cap)
     remainder_scale = m / float(count_mult)
     # Cap token inflation.  Realistic LLM requests are hundreds-to-thousands of
     # tokens; multiplying that by 100x produces a workload no real system sees.
@@ -1248,10 +1257,10 @@ if __name__ == "__main__":
                     count_cap_by_rows = max(1, int(max_rows // base_req_count))
                     min_count_for_target = max(1, int(math.ceil((float(args.target_util) * float(total_nodes)) / float(base_req_count))))
 
-                    # ── Row replication must carry the load ──────────────────
-                    # Token inflation is now hard-capped at AUTOSCALE_MAX_TOKEN_SCALE
-                    # (realistic request sizes).  That means row replication must
-                    # supply the rest of the multiplier.  A do-a-quick-probe to
+                    # ── Size the row-replication cap for the split ───────────
+                    # The autoscale split targets AUTOSCALE_TARGET_TOKEN_SCALE for
+                    # the token multiplier; row replication supplies m / target.
+                    # Do a quick probe to
                     # estimate the multiplier the peak epoch needs, then ensure
                     # count_cap is large enough that replication (not token
                     # scaling) can deliver it.
@@ -1261,9 +1270,10 @@ if __name__ == "__main__":
                     _probe_util = float(_probe.get("util", 0.0))
                     if _probe_util > 0.0:
                         _needed_mult = float(args.target_util) / max(_probe_util, 1e-9)
-                        # count_mult must reach ~ needed_mult / token_cap so that
-                        # row replication alone (x token cap) covers the target.
-                        _needed_count = int(math.ceil(_needed_mult / max(1.0, AUTOSCALE_MAX_TOKEN_SCALE)))
+                        # count_mult must reach ~ needed_mult / target_token_scale
+                        # so the split (which targets that token scale) is not
+                        # starved of row-replication headroom by the count cap.
+                        _needed_count = int(math.ceil(_needed_mult / max(1.0, AUTOSCALE_TARGET_TOKEN_SCALE)))
                     else:
                         _needed_count = AUTOSCALE_MAX_COUNT_MULT
                     # count_cap is the largest of: the row-budget cap, the static
@@ -1404,9 +1414,17 @@ if __name__ == "__main__":
                     mode = sol["mode"]
                     if mode not in lahyper_scheme_sums:
                         lahyper_scheme_sums[mode] = {"ttft_sum": 0.0, "carbon_sum": 0.0, "water_sum": 0.0,
-                                                     "energy_sum": 0.0, "total_energy_sum": 0.0, "epochs": 0}
+                                                     "energy_sum": 0.0, "total_energy_sum": 0.0, "epochs": 0,
+                                                     "ttft_weighted_sum": 0.0, "ttft_weight": 0.0}
                     agg = lahyper_scheme_sums[mode]
-                    agg["ttft_sum"] += float(sol.get("ttft", 0.0))
+                    # TTFT is request-weighted (weight = requests served) to
+                    # match simulator_LLM's final_avg_ttft.  ttft_sum/epochs is
+                    # kept only as a divide-by-zero fallback for all-zero-served
+                    # modes (e.g. Zero_Traffic).
+                    _sol_served = float(sol.get("served", 0.0))
+                    agg["ttft_sum"]          += float(sol.get("ttft", 0.0))
+                    agg["ttft_weighted_sum"] += float(sol.get("ttft", 0.0)) * _sol_served
+                    agg["ttft_weight"]       += _sol_served
                     agg["carbon_sum"] += float(sol.get("carbon", 0.0))
                     agg["water_sum"] += float(sol.get("water", 0.0))
                     agg["energy_sum"] += float(sol.get("cost", 0.0))
@@ -1464,8 +1482,14 @@ if __name__ == "__main__":
             agg = lahyper_scheme_sums[mode]
             ep = max(1, agg["epochs"])
 
-            # TTFT is Averaged, everything else is strictly Summed
-            avg_ttft = agg["ttft_sum"] / ep
+            # TTFT is request-weighted across epochs — the SAME aggregation
+            # as the Final Report's final_avg_ttft, so a scheme's TTFT here
+            # matches the headline number.  Plain epoch-mean only as a
+            # divide-by-zero fallback when nothing was served.
+            if agg["ttft_weight"] > 0.0:
+                avg_ttft = agg["ttft_weighted_sum"] / agg["ttft_weight"]
+            else:
+                avg_ttft = agg["ttft_sum"] / ep
             total_carb = agg["carbon_sum"]
             total_wat = agg["water_sum"]
             total_cost = agg["energy_sum"]
