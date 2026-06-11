@@ -1,0 +1,650 @@
+{
+  "azure_code|dcs10|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:56:31",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "275.8780",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs12|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:56:45",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "276.4820",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs4|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:56:01",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "273.9405",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs6|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:56:15",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "274.2827",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util0.65|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:56:59",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "276.5863",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util0.75|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:57:14",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "276.5863",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util0.85|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:57:28",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "276.5863",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util0.95|lf0.00|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:58:00",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "270.5016",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util0.95|lf0.25|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:58:16",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "273.0408",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util0.95|lf0.50|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:58:32",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "274.5286",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:55:48",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "276.5863",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util0.95|lf0.75|even|noise0.10": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:59:29",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "276.5863",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util0.95|lf0.75|even|noise0.20": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:59:43",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "276.5863",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util0.95|lf0.75|even|noise0.30": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:59:57",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "276.5863",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util0.95|lf0.75|population|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:59:02",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "278.4858",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util0.95|lf0.75|time|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:59:15",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "276.5863",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util0.95|lf1.00|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:58:47",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "276.7659",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_code|dcs8|util1.05|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:57:43",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "276.5863",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs10|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:00:52",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "288.4763",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs12|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:01:05",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "287.7865",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs4|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:00:25",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "288.5522",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs6|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:00:39",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "286.9520",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util0.65|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:01:19",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "288.4666",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util0.75|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:01:33",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "288.4666",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util0.85|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:01:46",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "288.4666",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util0.95|lf0.00|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:02:13",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "285.8636",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util0.95|lf0.25|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:02:28",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "287.3796",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util0.95|lf0.50|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:02:43",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "287.2774",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:00:12",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "288.4666",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util0.95|lf0.75|even|noise0.10": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:03:38",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "288.4666",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util0.95|lf0.75|even|noise0.20": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:03:51",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "288.4666",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util0.95|lf0.75|even|noise0.30": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:04:05",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "288.4666",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util0.95|lf0.75|population|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:03:11",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "289.9133",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util0.95|lf0.75|time|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:03:24",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "288.4666",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util0.95|lf1.00|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:02:57",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "290.1093",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "azure_conv|dcs8|util1.05|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T14:01:59",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "288.4666",
+    "status": "clamped-low",
+    "token_scale": 1.0
+  },
+  "burstgpt|dcs10|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:53:23",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.9343",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs12|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:53:32",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.8934",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs4|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:53:05",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "2.0199",
+    "status": "in-band",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs6|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:53:14",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "2.5819",
+    "status": "in-band",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util0.65|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:53:41",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.8368",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util0.75|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:53:51",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.8368",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util0.85|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:54:00",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.8368",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util0.95|lf0.00|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:54:19",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.1866",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util0.95|lf0.25|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:54:28",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.4261",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util0.95|lf0.50|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:54:37",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.7726",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util0.95|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:52:56",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.8368",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util0.95|lf0.75|even|noise0.10": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:55:14",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.8368",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util0.95|lf0.75|even|noise0.20": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:55:23",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.8368",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util0.95|lf0.75|even|noise0.30": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:55:32",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.8368",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util0.95|lf0.75|population|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:54:55",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.9775",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util0.95|lf0.75|time|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:55:05",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.8368",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util0.95|lf1.00|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:54:46",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "4.7358",
+    "status": "in-band",
+    "token_scale": 50.0
+  },
+  "burstgpt|dcs8|util1.05|lf0.75|even|noise0.00": {
+    "band": [
+      2.0,
+      5.0
+    ],
+    "calibrated_at": "2026-06-11T13:54:10",
+    "framework": "helix",
+    "machine": "ETS02009",
+    "measured_ttft": "1.8368",
+    "status": "clamped-high",
+    "token_scale": 50.0
+  }
+}

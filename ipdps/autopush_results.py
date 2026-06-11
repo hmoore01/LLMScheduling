@@ -139,6 +139,22 @@ def push_once(min_interval=DEFAULT_MIN_INTERVAL_SEC, snapshots=False):
     targets = [COMMITTED_REL]
     shutil.copy2(src, os.path.join(REPO_DIR, COMMITTED_REL))
 
+    # Shared calibration caches: normally read-only during sweeps (populated
+    # by the one-time --calibrate-only pass), but if THIS machine discovered
+    # and calibrated a new (trace, config) key mid-sweep, the tracked JSONs
+    # now differ from the index.  Left uncommitted, that local modification
+    # collides with every `pull --rebase --autostash` once any other commit
+    # touches them — the classic stuck-rebase loop.  Committing them here
+    # propagates the new key through the normal push cycle instead.  (Keep the
+    # operational rule: avoid two machines calibrating the SAME new key
+    # concurrently — pre-calibrate new configs on one machine first.)
+    for _rel in ("experiment_results/ttft_calibration.json",
+                 "experiment_results/autoscale_plans.json"):
+        if os.path.exists(os.path.join(REPO_DIR, _rel)):
+            _st = run_git(["status", "--porcelain", "--", _rel])
+            if _st.returncode == 0 and _st.stdout.strip():
+                targets.append(_rel)
+
     # Optional: also keep timestamped point-in-time copies (repo grows over time).
     if snapshots:
         stamp    = datetime.now().strftime("%Y%m%d_%H%M%S")
