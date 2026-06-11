@@ -55,6 +55,7 @@ Runtime estimate
 """
 
 import csv
+import json
 import os
 import re
 import shutil
@@ -64,6 +65,7 @@ import threading
 import time
 import numpy as np
 from datetime import datetime
+import autopush_results   # local module -- must sit beside this script
 
 # ── Trace definitions ─────────────────────────────────────────────────────────
 TRACES = [
@@ -93,11 +95,7 @@ TRACES = [
 # nsga2.  If any of those are intended baselines, add their CLI name here — they
 # are NOT run unless listed.
 FRAMEWORKS = [   # online-only — no --offline-train
-    "lahyper",
-    "parliament",
-    "qlearning",
-    "ddqn",
-    "actorcritic",
+    "nsga2",
 ]
 
 # ── Sweep axes ────────────────────────────────────────────────────────────────
@@ -105,7 +103,7 @@ BASELINE_DCS        = 8
 BASELINE_UTIL       = 0.95
 BASELINE_LARGE_FRAC = 0.75
 
-DC_SWEEP_VALUES         = [4, 6, 8, 12]
+DC_SWEEP_VALUES         = [4, 6, 8, 10, 12]
 UTIL_SWEEP_VALUES       = [0.65, 0.75, 0.85, 0.95, 1.05]
 LARGE_FRAC_SWEEP_VALUES = [0.0, 0.25, 0.50, 0.75, 1.0]
 
@@ -168,6 +166,43 @@ MAX_MULT       = 1_500_000
 # and honestly reach a lower utilisation rather than inflate tokens.
 MAX_ROWS       = 16_000_000
 SEARCH_STEPS   = 9
+
+# ── TTFT-band token-scale calibration ─────────────────────────────────────────
+# Static token scaling lands at very different average TTFTs depending on the
+# trace's token distribution.  When TTFT_CALIBRATE is on, the first run of each
+# (trace, config) is preceded by ONE calibration pass: simulator_LLM.py bisects
+# the autoscale token-scale target until the HELIX baseline's request-weighted
+# average TTFT falls inside TTFT_BAND.  The calibrated value is then passed to
+# EVERY framework of that config via --autoscale-target-token-scale, so all
+# frameworks (on this machine and any other) see byte-identical workloads and
+# remain directly comparable.  Only the rows-vs-tokens split moves; the total
+# multiplier — and therefore the achieved utilisation — is untouched.
+#
+# Results are cached in CALIB_FILE so resume never recalibrates.  MULTI-MACHINE
+# NOTE: because each machine runs a different FRAMEWORKS list, all machines
+# must use the SAME calibrated value for the same config.  Run one machine
+# first (or a quick helix-only calibration phase), commit CALIB_FILE to the
+# shared repo, and pull it on the others — a key found in the file is always
+# reused as-is, never recomputed.
+TTFT_CALIBRATE    = True
+TTFT_BAND         = (2.0, 5.0)     # helix avg-TTFT target band, seconds
+TTFT_CALIB_EPOCHS = 2              # representative epochs per calibration probe
+CALIB_FRAMEWORK   = "helix"
+CALIB_FILE        = "experiment_results/ttft_calibration.json"
+
+# Global autoscale plans are identical across frameworks and runs of the same
+# (trace, config); caching them skips the dry-run peak search + probe on every
+# run after the first.  The calibration pass seeds this cache, so by the time
+# real runs start the plan is usually already a cache hit.
+PLAN_CACHE_FILE   = "experiment_results/autoscale_plans.json"
+
+# "--calibrate-only" on the command line: walk every (trace, config) in the
+# sweep, run the TTFT calibration (which also seeds the autoscale plan cache)
+# for each, and exit WITHOUT executing any experiments.  Run this once on one
+# machine, commit experiment_results/ttft_calibration.json and
+# autoscale_plans.json, pull on the others — then every machine starts its
+# experiments immediately with identical, pre-shared scaling.
+CALIBRATE_ONLY = "--calibrate-only" in sys.argv
 
 # ── CSV schema ────────────────────────────────────────────────────────────────
 # Two CSVs are written, each at its natural granularity so each stays readable:
@@ -504,7 +539,8 @@ def activate_trace(trace_path, script_dir):
 # ── Command builder ───────────────────────────────────────────────────────────
 
 def _build_command(framework, num_dcs, target_util,
-                   distribution="even", prediction_noise=0.0):
+                   distribution="even", prediction_noise=0.0,
+                   token_scale_target=None, plan_key=None):
     cmd = [
         sys.executable, "-u", "simulator_LLM.py",
         "--framework",              framework,
@@ -520,17 +556,159 @@ def _build_command(framework, num_dcs, target_util,
     ]
     if prediction_noise > 0.0:
         cmd += ["--prediction-noise", str(prediction_noise)]
+    if token_scale_target is not None and float(token_scale_target) > 0.0:
+        cmd += ["--autoscale-target-token-scale", f"{float(token_scale_target):.6f}"]
+    if plan_key:
+        cmd += ["--autoscale-plan-cache", PLAN_CACHE_FILE,
+                "--autoscale-plan-key",   str(plan_key)]
     return cmd
+
+
+# ── TTFT calibration (one shared token scale per trace+config) ────────────────
+
+_CALIB_RESULT_RE = re.compile(
+    r"\[TTFT-Calib\]\s+RESULT\s+token_scale_target=([0-9eE+\-\.]+)"
+    r"\s+measured_ttft=([0-9eE+\-\.]+|nan)"
+    r".*?status=([\w\-]+)",
+    re.IGNORECASE,
+)
+
+_CALIB_MEM = {}          # in-process cache: {key: token_scale or None}
+
+
+def _calib_key(trace_name, num_dcs, target_util, large_frac,
+               distribution, prediction_noise):
+    return (f"{trace_name}|dcs{int(num_dcs)}|util{float(target_util):.2f}"
+            f"|lf{float(large_frac):.2f}|{distribution}"
+            f"|noise{float(prediction_noise):.2f}")
+
+
+def _calib_path(script_dir):
+    return os.path.join(script_dir, CALIB_FILE)
+
+
+def _load_calibrations(script_dir):
+    try:
+        with open(_calib_path(script_dir)) as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_calibration(script_dir, key, entry):
+    path = _calib_path(script_dir)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    data = _load_calibrations(script_dir)
+    data[key] = entry
+    tmp = path + ".tmp"
+    with open(tmp, "w") as fh:
+        json.dump(data, fh, indent=2, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _ensure_token_scale(trace_cfg, num_dcs, target_util, large_frac,
+                        distribution, prediction_noise, script_dir, log_file):
+    """Return the calibrated token-scale target for this (trace, config),
+    calibrating once with the helix baseline if no cached value exists.
+
+    The matching trace file MUST already be active (simulator_ready_trace.csv)
+    — the caller activates it before the first real run of the config, which is
+    exactly when this is invoked.  Returns None when calibration is disabled or
+    fails, in which case runs fall back to the simulator's static split (the
+    pre-calibration behaviour) and a warning is logged."""
+    if not TTFT_CALIBRATE:
+        return None
+    key = _calib_key(trace_cfg["name"], num_dcs, target_util, large_frac,
+                     distribution, prediction_noise)
+    if key in _CALIB_MEM:
+        return _CALIB_MEM[key]
+    disk = _load_calibrations(script_dir)
+    if key in disk:
+        ts = float(disk[key]["token_scale"])
+        _CALIB_MEM[key] = ts
+        msg = (f"[CALIB] Reusing cached token scale {ts:.4f}x for {key} "
+               f"(measured helix TTFT {disk[key].get('measured_ttft', '?')} s, "
+               f"status={disk[key].get('status', '?')})\n")
+        print(msg, end=""); log_file.write(msg); log_file.flush()
+        return ts
+
+    cmd = _build_command(CALIB_FRAMEWORK, num_dcs, target_util,
+                         distribution=distribution,
+                         prediction_noise=prediction_noise,
+                         plan_key=key) + [
+        "--ttft-calibrate-only",
+        "--ttft-band-low",     str(TTFT_BAND[0]),
+        "--ttft-band-high",    str(TTFT_BAND[1]),
+        "--ttft-calib-epochs", str(TTFT_CALIB_EPOCHS),
+    ]
+    hdr = (f"\n[CALIB] {trace_cfg['label']}: calibrating token scale for "
+           f"helix avg TTFT in [{TTFT_BAND[0]:.1f}, {TTFT_BAND[1]:.1f}] s "
+           f"(dcs={num_dcs} util={target_util:.2f} lf={large_frac:.2f} "
+           f"dist={distribution} noise={prediction_noise:.2f})\n")
+    print(hdr, end=""); log_file.write(hdr)
+    log_file.write(f"  cmd: {' '.join(cmd)}\n"); log_file.flush()
+
+    lines = []
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True,
+                                bufsize=1, cwd=script_dir)
+        for line in proc.stdout:
+            print(line, end=""); log_file.write(line)
+            lines.append(line)
+        proc.wait(timeout=30)
+        log_file.flush()
+    except Exception as exc:
+        msg = f"[CALIB] WARNING: calibration subprocess failed ({exc})\n"
+        print(msg, end=""); log_file.write(msg); log_file.flush()
+        _CALIB_MEM[key] = None
+        return None
+
+    result = None
+    for line in lines:
+        m = _CALIB_RESULT_RE.search(line)
+        if m:
+            result = m            # keep the LAST result line
+    if result is None or proc.returncode != 0:
+        msg = (f"[CALIB] WARNING: no calibration result for {key} "
+               f"(exit {proc.returncode}); runs for this config will use the "
+               f"simulator's static token scaling.\n")
+        print(msg, end=""); log_file.write(msg); log_file.flush()
+        _CALIB_MEM[key] = None
+        return None
+
+    ts = float(result.group(1))
+    entry = {
+        "token_scale":   ts,
+        "measured_ttft": result.group(2),
+        "status":        result.group(3),
+        "band":          list(TTFT_BAND),
+        "framework":     CALIB_FRAMEWORK,
+        "calibrated_at": datetime.now().isoformat(timespec="seconds"),
+        "machine":       autopush_results.MACHINE_ID,
+    }
+    _save_calibration(script_dir, key, entry)
+    _CALIB_MEM[key] = ts
+    msg = (f"[CALIB] Done: token scale {ts:.4f}x "
+           f"(helix avg TTFT {entry['measured_ttft']} s, "
+           f"status={entry['status']}) — cached in {CALIB_FILE}\n")
+    print(msg, end=""); log_file.write(msg); log_file.flush()
+    return ts
 
 
 # ── Single-run executor ───────────────────────────────────────────────────────
 
 def _run_one(trace_cfg, framework, sweep_name, num_dcs, target_util,
              large_frac, run_num, script_dir, log_file, writer, summary_file,
-             run_id, distribution="even", prediction_noise=0.0):
+             run_id, distribution="even", prediction_noise=0.0,
+             token_scale_target=None):
+    plan_key   = _calib_key(trace_cfg["name"], num_dcs, target_util,
+                            large_frac, distribution, prediction_noise)
     cmd        = _build_command(framework, num_dcs, target_util,
                                 distribution=distribution,
-                                prediction_noise=prediction_noise)
+                                prediction_noise=prediction_noise,
+                                token_scale_target=token_scale_target,
+                                plan_key=plan_key)
     start_dt   = datetime.now()
     start_time = time.time()
 
@@ -821,6 +999,11 @@ def _preflight_flags(script_dir):
          "prediction-noise sweep" if len(PRED_NOISE_SWEEP_VALUES) > 1 else None),
         ("simulator_LLM.py", "--num-dcs",  "DC sweep"),
         ("simulator_LLM.py", "--target-util", "utilisation sweep"),
+        ("simulator_LLM.py", "--ttft-calibrate-only",
+         "TTFT calibration" if TTFT_CALIBRATE else None),
+        ("simulator_LLM.py", "--autoscale-target-token-scale",
+         "TTFT calibration" if TTFT_CALIBRATE else None),
+        ("simulator_LLM.py", "--autoscale-plan-cache", "autoscale plan cache"),
         (TRACE_SCRIPT,       "--large-frac",  "model-mix sweep"),
     ]
     # --day-offset only matters if some trace uses it.
@@ -930,6 +1113,16 @@ def run_experiments():
     log_path   = os.path.join(out_dir, "LAHyper_Full_Experiments.log")
     csv_path   = os.path.join(out_dir, "LAHyper_Results.csv")     # single results file
 
+    # Start the background GitHub uploader: pushes THIS machine's results
+    # under a unique per-host filename, at most once every 30 min. Set
+    # AUTOPUSH=0 in the environment to disable (e.g. for local test runs).
+    # The preflight check warns immediately if pushing isn't possible, so a
+    # misconfigured machine is caught now -- before you walk away overnight.
+    if os.environ.get("AUTOPUSH", "1") != "0":
+        autopush_results.check_can_push(script_dir)
+        autopush_results.start_background_pusher(script_dir, min_interval=1800)
+        print(f"  AUTOPUSH: uploader started (machine={autopush_results.MACHINE_ID})")
+
     # Append mode — safe to restart: existing rows are preserved, the header is
     # written only when the CSV does not yet exist (or is empty).
     csv_is_new = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
@@ -1010,6 +1203,9 @@ def run_experiments():
     print(f"  Mix sweep  : lf={LARGE_FRAC_SWEEP_VALUES} @ {BASELINE_DCS}DCs  util={BASELINE_UTIL*100:.0f}%")
     print(f"  Origin sw. : dist={ORIGIN_SWEEP_VALUES} @ baseline config")
     print(f"  Noise sw.  : pred_noise={PRED_NOISE_SWEEP_VALUES} @ baseline config")
+    print(f"  TTFT calib : helix avg TTFT -> [{TTFT_BAND[0]:.1f}, {TTFT_BAND[1]:.1f}] s, "
+          f"cache={CALIB_FILE}" if TTFT_CALIBRATE
+          else "  TTFT calib : disabled (static token scaling)")
     print(f"  Trace files: {total_trace_files}  |  NUM_RUNS={NUM_RUNS}  (need >=2 for 95% CI)")
     print(f"  Hang guard : idle timeout {PER_RUN_IDLE_TIMEOUT_MIN} min"
           if PER_RUN_IDLE_TIMEOUT_MIN
@@ -1076,7 +1272,9 @@ def run_experiments():
                                        pred_noise, run_num)
 
                         # Resume: skip cells that already have a usable result.
-                        if _is_done(prior_status.get(key, "")):
+                        # (In calibrate-only mode nothing executes anyway, so
+                        # never skip — every config must still get calibrated.)
+                        if not CALIBRATE_ONLY and _is_done(prior_status.get(key, "")):
                             skipped += 1
                             print(f"[SKIP {run_counter}/{total_runs}] "
                                   f"{tr['name']}|{framework}|{config_label}|run{run_num} "
@@ -1091,6 +1289,24 @@ def run_experiments():
                             active_key = tk
                             msg = f"\n[TRACE] Active: {os.path.basename(trace_paths[tk])}\n"
                             print(msg, end=""); log_file.write(msg)
+
+                        # One calibrated token scale per (trace, config) —
+                        # measured against the helix baseline, cached on disk,
+                        # then shared by every framework of this config.  Runs
+                        # lazily here (not up-front) because the right trace
+                        # must be active, and a fully-resumed config should
+                        # never trigger a needless calibration.
+                        ts_target = _ensure_token_scale(
+                            tr, num_dcs, target_util, large_frac,
+                            distribution, pred_noise, script_dir, log_file)
+
+                        # --calibrate-only: the calibration above (which also
+                        # seeds the autoscale plan cache) is the whole job for
+                        # this cell — both caches are keyed per (trace, config),
+                        # so the in-memory cache makes the framework x run
+                        # repeats of the same config instant no-ops.
+                        if CALIBRATE_ONLY:
+                            continue
 
                         eta = ""
                         if elapsed_hist:
@@ -1115,7 +1331,8 @@ def run_experiments():
                                      script_dir, log_file, writer, summary_file,
                                      run_counter,
                                      distribution=distribution,
-                                     prediction_noise=pred_noise)
+                                     prediction_noise=pred_noise,
+                                     token_scale_target=ts_target)
                             executed += 1
                             elapsed_hist.append((time.time() - t0) / 60.0)
                         except Exception as exc:
@@ -1124,6 +1341,10 @@ def run_experiments():
                                    f"run{run_num}: {exc}\n")
                             print(err); log_file.write(err); log_file.flush()
 
+        if CALIBRATE_ONLY:
+            print(f"\n[PHASE 2] CALIBRATE-ONLY done — no experiments executed. "
+                  f"Commit {CALIB_FILE} and {PLAN_CACHE_FILE} to the shared repo "
+                  f"and pull on the other machines before starting their sweeps.")
         print(f"\n[PHASE 2] Done — {executed} run(s) executed, "
               f"{skipped} skipped (already done).")
         log_file.write(f"\n=== COMPLETED {datetime.now()}  "
@@ -1311,6 +1532,13 @@ def run_experiments():
     except Exception as e:
         print(f"\n(Coverage audit error: {e})")
         import traceback; traceback.print_exc()
+
+    # Final push so the very last results land regardless of the throttle.
+    if os.environ.get("AUTOPUSH", "1") != "0":
+        try:
+            autopush_results.push_once(min_interval=0)
+        except Exception as e:
+            print(f"(final push error: {e})")
 
 
 if __name__ == "__main__":

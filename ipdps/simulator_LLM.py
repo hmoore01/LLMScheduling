@@ -174,6 +174,24 @@ AUTOSCALE_MAX_EXPANDED_ROWS = 250000
 # Kept comfortably above the 5x target so normal operation never clamps.
 AUTOSCALE_MAX_TOKEN_SCALE = 50.0
 
+# Runtime-tunable copy of AUTOSCALE_TARGET_TOKEN_SCALE.  One static value lands
+# at very different per-request latencies depending on the trace's token
+# distribution, so this is now a mutable target: it is overwritten either by
+# the --autoscale-target-token-scale flag (explicit pin, used by the sweep
+# runner to keep every framework of a config on the SAME scaling) or by the
+# --ttft-calibrate search, which bisects it until the helix baseline's average
+# TTFT lands inside the requested band (default 2-5 s).  Changing this value
+# only re-balances the (rows x tokens) split — the total multiplier, and hence
+# the achieved utilisation, is untouched.
+_TARGET_TOKEN_SCALE = AUTOSCALE_TARGET_TOKEN_SCALE
+
+
+def _set_target_token_scale(value: float) -> float:
+    """Clamp + install a new token-scale target for the autoscale split."""
+    global _TARGET_TOKEN_SCALE
+    _TARGET_TOKEN_SCALE = max(1.0, min(float(value), AUTOSCALE_MAX_TOKEN_SCALE))
+    return _TARGET_TOKEN_SCALE
+
 
 def _even_src_dc(df: pd.DataFrame, num_dcs: int) -> pd.Series:
     out = np.zeros(len(df), dtype=int)
@@ -439,7 +457,16 @@ def _apply_prediction_noise(df: pd.DataFrame, noise_level: float, epoch_idx: int
 
     The RNG is seeded from epoch_idx and noise_level for reproducibility.
     """
-    if noise_level <= 0.0:
+    # Zero-traffic epochs (epoch index absent from the trace) reach this
+    # function as an EMPTY frame — the [ZERO TRAFFIC] path builds one and the
+    # rest of the loop handles it fine.  Without this guard the volume-noise
+    # step computes target_n = max(1, round(0 * vol)) = 1 and then tries to
+    # sample 1 row from a 0-row frame, which raises
+    # "ValueError: a must be greater than 0 unless no samples are taken" and
+    # killed every noise-sweep run at its first empty epoch (noise=0 runs were
+    # unaffected because of the early return below).  An empty forecast has
+    # nothing to perturb, so the identity is the only sane result.
+    if noise_level <= 0.0 or len(df) == 0:
         return df
     rng = np.random.default_rng(seed=int(epoch_idx) * 997 + int(noise_level * 10_000))
     out = df.copy()
@@ -458,7 +485,7 @@ def _apply_prediction_noise(df: pd.DataFrame, noise_level: float, epoch_idx: int
     target_n      = max(1, int(round(n * vol_factor)))
     if target_n < n:
         out = out.sample(n=target_n, random_state=int(epoch_idx)).reset_index(drop=True)
-    elif target_n > n:
+    elif target_n > n and n > 0:
         extra = out.sample(n=target_n - n, replace=True, random_state=int(epoch_idx) + 1)
         out   = pd.concat([out, extra], ignore_index=True)
 
@@ -506,7 +533,7 @@ def _split_autoscale_multiplier(multiplier: float, count_cap: Optional[int] = No
     # Pick row replication so the leftover token scale lands at ~the target.
     # remainder_scale = m / count_mult below, so count_mult * remainder_scale
     # == m exactly: utilisation is unaffected, only the row/token split moves.
-    count_mult = max(1, int(round(m / AUTOSCALE_TARGET_TOKEN_SCALE)))
+    count_mult = max(1, int(round(m / _TARGET_TOKEN_SCALE)))
     count_mult = min(count_mult, cap)
     remainder_scale = m / float(count_mult)
     # Cap token inflation.  Realistic LLM requests are hundreds-to-thousands of
@@ -640,14 +667,40 @@ def _build_global_peak_plan(
     if not candidate_epochs:
         return {"enabled": False, "reason": "no_traffic_epochs"}
 
+    # ── Peak-epoch selection: token-sum proxy + top-K verification ───────────
+    # Dry-running EVERY epoch at 1x just to locate the peak costs ~N_epochs of
+    # simulation per run — and it is recomputed identically for every framework
+    # and every run of the same (trace, config).  Total token volume is a very
+    # strong proxy for baseline utilisation, so rank epochs by token sum
+    # (vectorised, free) and dry-run only the top PEAK_PROBE_CANDIDATES to pick
+    # the true utilisation peak among them.
+    PEAK_PROBE_CANDIDATES = 5
+    cand_set = set(candidate_epochs)
+    try:
+        tok_sums = grouped_trace["num_tokens"].sum()
+        ranked = [int(e) for e in tok_sums.sort_values(ascending=False).index
+                  if int(e) in cand_set]
+    except Exception:
+        ranked = []
+    probe_epochs = ranked[:PEAK_PROBE_CANDIDATES] if ranked else list(candidate_epochs)
+    if len(probe_epochs) < len(candidate_epochs):
+        print(f"[Auto-Scale] Peak search: probing top {len(probe_epochs)} "
+              f"epochs by token volume (of {len(candidate_epochs)} candidates) "
+              f"instead of dry-running all.", flush=True)
+
+    # Row maximum still spans ALL candidate epochs (it sizes the count cap).
+    try:
+        _sizes = grouped_trace.size()
+        max_epoch_rows = int(max(int(_sizes.get(e, 0)) for e in candidate_epochs))
+    except Exception:
+        max_epoch_rows = max(len(grouped_trace.get_group(e)) for e in candidate_epochs)
+
     peak_epoch = None
     peak_util = 0.0
     peak_df = None
-    max_epoch_rows = 0
 
-    for epoch_idx in candidate_epochs:
+    for epoch_idx in probe_epochs:
         ep_df = grouped_trace.get_group(epoch_idx).copy()
-        max_epoch_rows = max(max_epoch_rows, len(ep_df))
         base_eval = _evaluate_autoscale_candidate(dry_sim, epoch_idx, ep_df, 1.0, count_cap=1)
         if float(base_eval.get("util", 0.0)) >= peak_util:
             peak_util = float(base_eval.get("util", 0.0))
@@ -756,6 +809,186 @@ def _build_global_peak_plan(
     }
 
 
+# ── TTFT-band token-scale calibration ─────────────────────────────────────────
+# Static token scaling produces wildly different per-request latencies across
+# traces (BurstGPT vs the Azure traces have very different token distributions).
+# These helpers replace the static choice with a measured one: bisect the
+# token-scale target until the HELIX baseline's request-weighted average TTFT
+# lands inside a band (default 2-5 s).  The total autoscale multiplier — and
+# therefore the achieved utilisation — is held fixed throughout; only the
+# (rows x tokens) split moves.
+
+def _measure_calib_ttft(FW_calib, grouped_trace, calib_epochs, plan_multiplier,
+                        token_scale, calib_count_cap, node_properties,
+                        active_dc_ids, spec_dir):
+    """Run the calibration framework (helix) over the chosen epochs at the
+    candidate token scale; return the request-weighted average TTFT (s).
+
+    The real run replicates rows count_mult = round(m / token_scale) times.
+    Building that full frame for every probe would be far too slow, so the
+    probe frame caps count_mult at calib_count_cap while holding the TOKEN
+    SCALE EXACTLY at the candidate value (eff_mult = capped_count x scale, so
+    the split resolves to precisely that token scale).  Per-request service
+    time — the part of TTFT the token scale drives — is therefore measured
+    faithfully; queueing at the reduced replication is slightly optimistic,
+    but the full run prints its true average TTFT so the landing point is
+    always verifiable in the results."""
+    global _TARGET_TOKEN_SCALE
+    prev = _TARGET_TOKEN_SCALE
+    _TARGET_TOKEN_SCALE = max(1.0, float(token_scale))
+    try:
+        ttft_w_sum = 0.0
+        weight_sum = 0.0
+        plain = []
+        for epoch_idx in calib_epochs:
+            ep_df = grouped_trace.get_group(int(epoch_idx)).copy()
+            cm_full = max(1, int(round(plan_multiplier / max(1e-9, float(token_scale)))))
+            cm_cal = min(cm_full, max(1, int(calib_count_cap)))
+            eff_mult = float(cm_cal) * float(token_scale)
+            scaled, _cm, _rs = _apply_autoscale_multiplier(
+                ep_df, eff_mult, int(epoch_idx),
+                epoch_length_s=900, count_cap=cm_cal)
+            scaled["arrival_ms"] = _derive_arrival_ms(scaled, epoch_length_s=900)
+            stats, _results, _leftovers = FW_calib.milp_optimizer(
+                epoch_data=scaled,
+                epoch_idx=int(epoch_idx),
+                node_properties=node_properties,
+                epoch_summary={
+                    "node_types": [0, 1, 2, 3, 4, 5],
+                    "datacenters": active_dc_ids,
+                    "avg_input_tokens": 100,
+                    "avg_output_tokens": 100,
+                    "spec_dir": spec_dir,
+                    "epoch_length": 900,
+                },
+            )
+            flat = stats
+            if (isinstance(stats, dict) and stats
+                    and all(isinstance(v, dict) for v in stats.values())):
+                flat = next(iter(stats.values()))
+            ttft = float(flat.get("avg_ttft", flat.get("avg_ttft_sec", 0.0)))
+            served = float(flat.get(
+                "requests_completed",
+                flat.get("served_requests", flat.get("requests", 0.0))))
+            plain.append(ttft)
+            if served > 0.0:
+                ttft_w_sum += ttft * served
+                weight_sum += served
+        if weight_sum > 0.0:
+            return ttft_w_sum / weight_sum
+        return sum(plain) / max(1, len(plain))
+    finally:
+        _TARGET_TOKEN_SCALE = prev
+
+
+def _calibrate_token_scale(FW_calib, grouped_trace, plan, args,
+                           node_properties, active_dc_ids) -> Dict[str, Any]:
+    """Bisect the token-scale target so helix's avg TTFT lands in the band.
+
+    TTFT is monotonically increasing in the token scale (fatter requests run
+    longer), so a bisection on a geometric midpoint converges quickly.  The
+    search stops as soon as a probe lands inside [band_lo, band_hi]; if the
+    band is unreachable at either end of [1, AUTOSCALE_MAX_TOKEN_SCALE] the
+    nearest endpoint is returned with an explicit clamped status."""
+    band_lo = float(getattr(args, "ttft_band_low", 2.0))
+    band_hi = float(getattr(args, "ttft_band_high", 5.0))
+    if band_hi < band_lo:
+        band_lo, band_hi = band_hi, band_lo
+    steps = max(1, int(getattr(args, "ttft_calib_steps", 6)))
+    n_epochs = max(1, int(getattr(args, "ttft_calib_epochs", 2)))
+    max_rows = max(1, int(getattr(args, "ttft_calib_max_rows", 250_000)))
+    plan_mult = float(plan.get("chosen_multiplier", 1.0))
+    spec_dir = getattr(args, "spec_dir", "sim_specs")
+
+    avail = sorted(int(e) for e in grouped_trace.groups
+                   if len(grouped_trace.get_group(int(e))) > 0)
+    if not avail:
+        return {"token_scale": _TARGET_TOKEN_SCALE,
+                "measured_ttft": float("nan"), "status": "no-epochs"}
+
+    # Representative epochs: the plan's peak epoch first (the load the
+    # multiplier was sized for), then epochs at the median / quartiles of
+    # per-epoch request counts so the measured TTFT reflects typical load.
+    by_load = sorted(avail, key=lambda e: len(grouped_trace.get_group(e)))
+    picks = []
+    peak_ep = int(plan.get("peak_epoch", by_load[-1]))
+    if peak_ep in avail:
+        picks.append(peak_ep)
+    for q in (0.50, 0.75, 0.25, 0.90, 0.10):
+        if len(picks) >= n_epochs:
+            break
+        cand = by_load[min(len(by_load) - 1, int(round(q * (len(by_load) - 1))))]
+        if cand not in picks:
+            picks.append(cand)
+    picks = picks[:n_epochs]
+
+    base_rows = max(len(grouped_trace.get_group(e)) for e in picks)
+    calib_count_cap = max(1, max_rows // max(1, base_rows))
+
+    def measure(ts):
+        return _measure_calib_ttft(
+            FW_calib, grouped_trace, picks, plan_mult, ts,
+            calib_count_cap, node_properties, active_dc_ids, spec_dir)
+
+    lo_s, hi_s = 1.0, float(AUTOSCALE_MAX_TOKEN_SCALE)
+    print(f"[TTFT-Calib] Calibrating token scale for band "
+          f"[{band_lo:.2f}, {band_hi:.2f}] s on epochs {picks} "
+          f"(probe count_cap={calib_count_cap}, framework=helix). "
+          f"Preferring the HIGHEST in-band scale — fewer replicated rows, "
+          f"faster runs.", flush=True)
+
+    ttft_lo = measure(lo_s)
+    print(f"[TTFT-Calib]   probe scale={lo_s:.3f}x -> avg TTFT {ttft_lo:.3f} s", flush=True)
+    if ttft_lo > band_hi:
+        # Even unscaled requests exceed the band — nothing lower exists.
+        print(f"[TTFT-Calib]   WARNING: avg TTFT at 1.0x already above "
+              f"{band_hi:.2f} s; band unreachable, using 1.0x.", flush=True)
+        return {"token_scale": lo_s, "measured_ttft": ttft_lo, "status": "clamped-low"}
+
+    ttft_hi = measure(hi_s)
+    print(f"[TTFT-Calib]   probe scale={hi_s:.3f}x -> avg TTFT {ttft_hi:.3f} s", flush=True)
+    if ttft_hi < band_lo:
+        print(f"[TTFT-Calib]   WARNING: avg TTFT at the {hi_s:.0f}x ceiling is "
+              f"still below {band_lo:.2f} s; band unreachable, using {hi_s:.0f}x.",
+              flush=True)
+        return {"token_scale": hi_s, "measured_ttft": ttft_hi, "status": "clamped-high"}
+    if band_lo <= ttft_hi <= band_hi:
+        # The ceiling itself is in band — it is also the cheapest-to-simulate
+        # scale possible (maximum tokens per row, minimum rows).  Take it.
+        return {"token_scale": hi_s, "measured_ttft": ttft_hi, "status": "in-band"}
+
+    # Here ttft(lo) < band_hi and ttft(hi) > band_hi: the band edge lies
+    # between them.  TTFT is monotonically increasing in the token scale, so
+    # bisect (geometric midpoint — the scale axis is multiplicative) for the
+    # LARGEST scale whose TTFT stays inside the band.  Among all in-band
+    # scales the largest is the cheapest to run: count_mult = m / scale, so
+    # landing at 4.5 s instead of 2.2 s roughly halves every epoch's row
+    # count for every framework and run of this config.
+    aim_hi = band_lo + 0.85 * (band_hi - band_lo)   # stop early near the ceiling
+    best = (lo_s, ttft_lo) if band_lo <= ttft_lo <= band_hi else None
+    for i in range(steps):
+        mid = math.sqrt(lo_s * hi_s)
+        ttft_mid = measure(mid)
+        print(f"[TTFT-Calib]   step {i + 1}/{steps}: scale={mid:.3f}x -> "
+              f"avg TTFT {ttft_mid:.3f} s", flush=True)
+        if ttft_mid <= band_hi:
+            if ttft_mid >= band_lo and (best is None or mid > best[0]):
+                best = (mid, ttft_mid)
+            lo_s = mid
+            if ttft_mid >= aim_hi:
+                break   # within 15% of the ceiling — close enough, stop probing
+        else:
+            hi_s = mid
+    if best is not None:
+        return {"token_scale": best[0], "measured_ttft": best[1], "status": "in-band"}
+    # No probe landed in band (band narrower than the search resolved):
+    # return the endpoint measurement closest to the band midpoint.
+    target_mid = 0.5 * (band_lo + band_hi)
+    if abs(ttft_lo - target_mid) <= abs(ttft_hi - target_mid):
+        return {"token_scale": lo_s, "measured_ttft": ttft_lo, "status": "nearest"}
+    return {"token_scale": hi_s, "measured_ttft": ttft_hi, "status": "nearest"}
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('-e', '--epoch', type=int, default=96)
@@ -811,6 +1044,42 @@ if __name__ == "__main__":
                              "simulator calls is unchanged at the OS level. "
                              "Measures how framework performance degrades when "
                              "its workload forecast is inaccurate.")
+    parser.add_argument('--autoscale-target-token-scale', type=float, default=0.0,
+                        help="Explicit token-scale target for the autoscale split, "
+                             "replacing the static AUTOSCALE_TARGET_TOKEN_SCALE. "
+                             "The sweep runner passes the helix-calibrated value here "
+                             "so every framework of a config uses identical scaling. "
+                             "0 = use the static default (or --ttft-calibrate).")
+    parser.add_argument('--ttft-calibrate', action='store_true',
+                        help="Before the run, bisect the token-scale target until the "
+                             "helix baseline's average TTFT lands inside "
+                             "[--ttft-band-low, --ttft-band-high] seconds, then run "
+                             "with the calibrated value.")
+    parser.add_argument('--ttft-calibrate-only', action='store_true',
+                        help="Run the TTFT calibration, print the machine-readable "
+                             "'[TTFT-Calib] RESULT ...' line, and exit without running "
+                             "the framework. Used by the sweep runner to compute one "
+                             "shared value per (trace, config).")
+    parser.add_argument('--ttft-band-low', type=float, default=2.0,
+                        help="Lower edge of the helix avg-TTFT target band (s).")
+    parser.add_argument('--ttft-band-high', type=float, default=5.0,
+                        help="Upper edge of the helix avg-TTFT target band (s).")
+    parser.add_argument('--ttft-calib-epochs', type=int, default=2,
+                        help="Representative epochs evaluated per calibration probe.")
+    parser.add_argument('--ttft-calib-steps', type=int, default=6,
+                        help="Max bisection probes after the two endpoint probes.")
+    parser.add_argument('--ttft-calib-max-rows', type=int, default=250000,
+                        help="Row budget per calibration probe epoch (keeps probes fast; "
+                             "the token scale is still measured at its exact candidate value).")
+    parser.add_argument('--autoscale-plan-cache', type=str, default='',
+                        help="Path to a JSON cache of global autoscale plans. The plan "
+                             "for a (trace, config) is identical across frameworks and "
+                             "runs, so caching it skips the dry-run peak search and "
+                             "probe on every run after the first.")
+    parser.add_argument('--autoscale-plan-key', type=str, default='',
+                        help="Cache key identifying this (trace, config) in "
+                             "--autoscale-plan-cache. Both flags must be set for "
+                             "caching to activate.")
     args = parser.parse_args()
 
     workload_path = "simulator_ready_trace.csv"
@@ -938,24 +1207,66 @@ if __name__ == "__main__":
         from Rate_Flow_Sim_v2 import LLM_Simulator
         autoscale_dry_sim = LLM_Simulator(debug=False, spec_dir=args.spec_dir)
         if autoscale_mode == "global_peak":
-            print(f"[DEBUG] calling _build_global_peak_plan — "
-                  f"number_of_epoch={number_of_epoch} "
-                  f"grouped_trace type={type(grouped_trace).__name__} "
-                  f"n_groups={len(grouped_trace.groups)} "
-                  f"key sample={list(grouped_trace.groups)[:5]}", flush=True)
-            global_autoscale_plan = _build_global_peak_plan(
-                dry_sim=autoscale_dry_sim,
-                grouped_trace=grouped_trace,
-                number_of_epoch=number_of_epoch,
-                target_util=float(args.target_util),
-                max_multiplier=max(1.0, float(getattr(args, "autoscale_max_mult", AUTOSCALE_MAX_MULTIPLIER))),
-                max_rows=max(1, int(getattr(args, "autoscale_max_rows", AUTOSCALE_MAX_EXPANDED_ROWS))),
-                max_drop=min(1.0, max(0.0, float(getattr(args, "autoscale_max_drop", AUTOSCALE_MAX_DROP_FRAC)))),
-                search_steps=max(1, int(getattr(args, "autoscale_search_steps", AUTOSCALE_SEARCH_STEPS))),
-            )
-            print(f"[DEBUG] _build_global_peak_plan RETURNED — "
-                  f"enabled={global_autoscale_plan.get('enabled')} "
-                  f"reason={global_autoscale_plan.get('reason', 'n/a')}", flush=True)
+            # ── Plan cache ────────────────────────────────────────────────
+            # The global plan depends only on (trace, config) — not on the
+            # framework or run number — so the dry-run peak search and probe
+            # are pure recomputation on every run after the first.  When the
+            # runner supplies a cache path + key, reuse a stored plan.
+            _plan_cache_path = str(getattr(args, "autoscale_plan_cache", "") or "")
+            _plan_cache_key  = str(getattr(args, "autoscale_plan_key", "") or "")
+            _plan_from_cache = False
+            if _plan_cache_path and _plan_cache_key:
+                try:
+                    import json as _json
+                    with open(_plan_cache_path) as _fh:
+                        _plan_data = _json.load(_fh)
+                    if _plan_cache_key in _plan_data:
+                        global_autoscale_plan = _plan_data[_plan_cache_key]
+                        _plan_from_cache = True
+                        print(f"[Auto-Scale] Plan cache HIT for '{_plan_cache_key}' "
+                              f"({_plan_cache_path}) — skipping dry-run peak search.",
+                              flush=True)
+                except (OSError, ValueError):
+                    pass
+            if not _plan_from_cache:
+                print(f"[DEBUG] calling _build_global_peak_plan — "
+                      f"number_of_epoch={number_of_epoch} "
+                      f"grouped_trace type={type(grouped_trace).__name__} "
+                      f"n_groups={len(grouped_trace.groups)} "
+                      f"key sample={list(grouped_trace.groups)[:5]}", flush=True)
+                global_autoscale_plan = _build_global_peak_plan(
+                    dry_sim=autoscale_dry_sim,
+                    grouped_trace=grouped_trace,
+                    number_of_epoch=number_of_epoch,
+                    target_util=float(args.target_util),
+                    max_multiplier=max(1.0, float(getattr(args, "autoscale_max_mult", AUTOSCALE_MAX_MULTIPLIER))),
+                    max_rows=max(1, int(getattr(args, "autoscale_max_rows", AUTOSCALE_MAX_EXPANDED_ROWS))),
+                    max_drop=min(1.0, max(0.0, float(getattr(args, "autoscale_max_drop", AUTOSCALE_MAX_DROP_FRAC)))),
+                    search_steps=max(1, int(getattr(args, "autoscale_search_steps", AUTOSCALE_SEARCH_STEPS))),
+                )
+                print(f"[DEBUG] _build_global_peak_plan RETURNED — "
+                      f"enabled={global_autoscale_plan.get('enabled')} "
+                      f"reason={global_autoscale_plan.get('reason', 'n/a')}", flush=True)
+                if _plan_cache_path and _plan_cache_key:
+                    try:
+                        import json as _json
+                        try:
+                            with open(_plan_cache_path) as _fh:
+                                _plan_data = _json.load(_fh)
+                        except (OSError, ValueError):
+                            _plan_data = {}
+                        _plan_data[_plan_cache_key] = global_autoscale_plan
+                        _dirn = os.path.dirname(_plan_cache_path)
+                        if _dirn:
+                            os.makedirs(_dirn, exist_ok=True)
+                        _tmp = _plan_cache_path + ".tmp"
+                        with open(_tmp, "w") as _fh:
+                            _json.dump(_plan_data, _fh, indent=2, sort_keys=True)
+                        os.replace(_tmp, _plan_cache_path)
+                        print(f"[Auto-Scale] Plan cached as '{_plan_cache_key}' "
+                              f"in {_plan_cache_path}.", flush=True)
+                    except Exception as _exc:
+                        print(f"[Auto-Scale] (plan cache write failed: {_exc})", flush=True)
             if bool(global_autoscale_plan.get("enabled", False)):
                 print(
                     f"[Auto-Scale] Global peak epoch {int(global_autoscale_plan['peak_epoch'])} baseline "
@@ -981,6 +1292,55 @@ if __name__ == "__main__":
                 )
             else:
                 print(f"[Auto-Scale] Global plan unavailable: {str(global_autoscale_plan.get('reason', 'unknown'))}.")
+
+    # ── Token-scale selection: explicit flag > TTFT calibration > static ──
+    # Order matters: an explicit --autoscale-target-token-scale (what the sweep
+    # runner passes after calibrating once with helix) always wins, so every
+    # framework of a config runs with byte-identical scaling.  Otherwise, if
+    # calibration was requested, bisect against the helix baseline now.
+    _explicit_ts = float(getattr(args, "autoscale_target_token_scale", 0.0) or 0.0)
+    if _explicit_ts > 0.0:
+        _set_target_token_scale(_explicit_ts)
+        print(f"[TTFT-Calib] Using explicit token-scale target "
+              f"{_TARGET_TOKEN_SCALE:.4f}x (calibration skipped).", flush=True)
+    elif getattr(args, "ttft_calibrate", False) or getattr(args, "ttft_calibrate_only", False):
+        if (getattr(args, "target_util", 0.0) > 0.0
+                and autoscale_mode == "global_peak"
+                and global_autoscale_plan
+                and bool(global_autoscale_plan.get("enabled", False))):
+            FW_calib = get_framework("helix")
+            _calib = _calibrate_token_scale(
+                FW_calib, grouped_trace, global_autoscale_plan, args,
+                node_properties, active_dc_ids)
+            _set_target_token_scale(float(_calib["token_scale"]))
+            print(f"[TTFT-Calib] RESULT "
+                  f"token_scale_target={_TARGET_TOKEN_SCALE:.4f} "
+                  f"measured_ttft={float(_calib['measured_ttft']):.4f} "
+                  f"band=[{float(args.ttft_band_low):.2f},{float(args.ttft_band_high):.2f}] "
+                  f"status={_calib['status']}", flush=True)
+        else:
+            print(f"[TTFT-Calib] RESULT "
+                  f"token_scale_target={_TARGET_TOKEN_SCALE:.4f} "
+                  f"measured_ttft=nan "
+                  f"band=[{float(getattr(args, 'ttft_band_low', 2.0)):.2f},"
+                  f"{float(getattr(args, 'ttft_band_high', 5.0)):.2f}] "
+                  f"status=plan-unavailable", flush=True)
+    # The plan's informational split was computed under the static target; the
+    # per-epoch application re-splits with the live target anyway, but re-derive
+    # and reprint here so the log shows what will actually run.
+    if (global_autoscale_plan and bool(global_autoscale_plan.get("enabled", False))
+            and abs(_TARGET_TOKEN_SCALE - AUTOSCALE_TARGET_TOKEN_SCALE) > 1e-9):
+        _cm, _rs = _split_autoscale_multiplier(
+            float(global_autoscale_plan["chosen_multiplier"]),
+            count_cap=int(global_autoscale_plan.get("count_cap", AUTOSCALE_MAX_COUNT_MULT)))
+        global_autoscale_plan["chosen_count_mult"] = int(_cm)
+        global_autoscale_plan["chosen_remainder_scale"] = float(_rs)
+        print(f"[Auto-Scale] Split re-derived for token-scale target "
+              f"{_TARGET_TOKEN_SCALE:.4f}x -> Requests x{_cm}, Tokens x{_rs:.3f} "
+              f"(total multiplier, and thus utilisation, unchanged).", flush=True)
+    if getattr(args, "ttft_calibrate_only", False):
+        print("[DONE]")
+        exit(0)
 
     # ── Model loading (before offline training or inference) ──────────────
     if getattr(args, 'load_model', False) and framework.lower() == "parliament":
@@ -1273,7 +1633,7 @@ if __name__ == "__main__":
                         # count_mult must reach ~ needed_mult / target_token_scale
                         # so the split (which targets that token scale) is not
                         # starved of row-replication headroom by the count cap.
-                        _needed_count = int(math.ceil(_needed_mult / max(1.0, AUTOSCALE_TARGET_TOKEN_SCALE)))
+                        _needed_count = int(math.ceil(_needed_mult / max(1.0, _TARGET_TOKEN_SCALE)))
                     else:
                         _needed_count = AUTOSCALE_MAX_COUNT_MULT
                     # count_cap is the largest of: the row-budget cap, the static
@@ -1374,7 +1734,17 @@ if __name__ == "__main__":
         # ── Prediction noise: give the framework a perturbed forecast ─────────
         _pred_noise = float(getattr(args, "prediction_noise", 0.0))
         if _pred_noise > 0.0:
-            framework_epoch_data = _apply_prediction_noise(epoch_data, _pred_noise, epoch_idx)
+            # Safety net: a noise-injection failure on ONE epoch must never
+            # abort the whole run (that's how the noise sweep produced blank
+            # rows).  Fall back to the clean forecast for that epoch, loudly —
+            # a warned epoch is recoverable, a dead run is not.
+            try:
+                framework_epoch_data = _apply_prediction_noise(epoch_data, _pred_noise, epoch_idx)
+            except Exception as _noise_exc:
+                print(f"  [PredNoise] WARNING: noise injection failed on epoch "
+                      f"{epoch_idx} ({type(_noise_exc).__name__}: {_noise_exc}); "
+                      f"using the clean forecast for this epoch.", flush=True)
+                framework_epoch_data = epoch_data
             print(f"  [PredNoise] noise={_pred_noise:.2f} | "
                   f"real_reqs={len(epoch_data)} → forecast_reqs={len(framework_epoch_data)}")
         else:

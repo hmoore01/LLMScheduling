@@ -1,0 +1,4 @@
+ipdps/simulator_ready_trace.csv
+ipdps/trace_*_lf*.csv
+ipdps/sim_specs_synth/
+__pycache__/

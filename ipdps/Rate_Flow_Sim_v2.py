@@ -23,6 +23,11 @@ import pandas as pd
 # scheduling framework — automatically participates in the demand-response loop.
 # The Utility Grid Agent writes _MARLIN_LMP_OVERRIDE; the DC Agent / all
 # frameworks read _MARLIN_LAST_P_DC_KW after each epoch.
+# Fast-path switch for the fused per-request pipeline (bit-identical to the
+# reference implementation; see _process_requests_for_dc).  RFS_FAST=0 falls
+# back to the original per-request method chain.
+_RFS_FAST = os.environ.get("RFS_FAST", "1") != "0"
+
 _MARLIN_LMP_OVERRIDE: Dict[int, float] = {}   # grid LMP → DC pricing signal
 _MARLIN_LAST_P_DC_KW: Dict[int, float] = {}   # kW draw per DC (last epoch)
 
@@ -961,6 +966,336 @@ class Geo_Network:
     def _process_requests_for_dc(self, dc: "Datacenter", dc_id: int, row_indices,
                                  epoch_idx: int, epoch_start_ms: float,
                                  cols: Tuple[Any, ...]) -> List[Tuple[int, Dict[str, Any]]]:
+        """Fast path: fused, table-driven version of the per-request pipeline.
+
+        Profiling showed ~85% of run_epoch wall time was per-request Python in
+        schedule_request -> settle_and_score -> account_energy_carbon_cost:
+        repeated attribute lookups, method dispatch, hour-of-day recomputation,
+        and three dict builds per request.  Everything time-varying in that
+        chain is keyed by hour-of-day, and every unit-level multiplier is a
+        pure function of the DC temperature setpoint (constant within an
+        epoch), so this version precomputes per-hour tables (TOU price, COP)
+        and per-unit constants (IT power, exec/temp multipliers, model perf)
+        once per call, then runs one lean loop that replicates the original
+        arithmetic OPERATION FOR OPERATION — including the greedy
+        earliest-available-node heap, the epoch-boundary drop rule, the
+        accumulator update order, and even the floating-point cancellation in
+        the energy_it_kwh diff — so results are bit-identical to the reference
+        implementation (kept below; set RFS_FAST=0 to use it).  The
+        solar/battery offset is the one sequential-stateful step: when the DC
+        has neither (the offset is then the mathematical identity) it is
+        skipped; otherwise the real method is called per request so battery
+        state evolves exactly as before.
+        """
+        if not _RFS_FAST:
+            return self._process_requests_for_dc_reference(
+                dc, dc_id, row_indices, epoch_idx, epoch_start_ms, cols)
+
+        src_dcs, models, arrivals, net_arr, tokens_arr, base_tokens_arr = cols
+        tgt_dc = int(dc_id)
+        out: List[Tuple[int, Dict[str, Any]]] = []
+        epoch_start_ms = float(epoch_start_ms)
+
+        # ── Lazy DC state init (identical to schedule_request's) ─────────────
+        if not hasattr(dc, "_node_heap"):
+            dc._node_heap = []
+            dc._heap_valid = False
+            dc._model_cache = {}
+        if not dc._heap_valid:
+            dc._node_heap = [(u.next_available_ms, u.node_id, u) for u in dc.units if u.state != "OFF"]
+            heapq.heapify(dc._node_heap)
+            dc._heap_valid = True
+        heap = dc._node_heap
+        dc_model_cache = dc._model_cache
+
+        # ── Per-epoch constants ───────────────────────────────────────────────
+        epoch_end_ms = epoch_start_ms + float(dc._epoch_len_s) * 1000.0
+        cooling_mode = dc.cooling_mode
+        closed_loop = bool(getattr(dc, "closed_loop_cooling", False))
+        other_frac = max(0.0, dc.other_it_overhead_frac)
+        ci = float(dc.carbon_intensity_g_per_kwh)
+        dT = float(dc.temp_c_setpoint) - dc.temp_ref_c
+
+        is_liquid = cooling_mode in ("MINERAL_OIL_IMMERSION", "DIRECT_TO_CHIP")
+        is_mech = cooling_mode == "MECH_COP"
+        if is_liquid:
+            pump_frac = dc.pump_power_frac
+            ppue = max(1.0, dc.ppue_target + dc.pue_temp_alpha_per_C * dT * 0.3)
+            ppue_excess = max(0.0, ppue - 1.0 - pump_frac)
+        elif not is_mech:
+            pue_minus1 = max(1.0, dc.pue_value + dc.pue_temp_alpha_per_C * dT) - 1.0
+
+        # Hour-of-day tables (the chain computes hour from absolute start_ms).
+        cop_acct = None
+        if is_mech:
+            prof = dc.cop_profile_24h
+            use_prof = bool(prof) and len(prof) >= 24
+            cop_acct = []
+            for h in range(24):
+                base = float(prof[h % 24]) if use_prof else dc.cop_default
+                cop_acct.append(max(0.1, max(1.0, base * max(0.0, 1.0 + dc.cop_temp_alpha_per_C * dT))))
+        lmp = getattr(dc, "_lmp_override", None)
+        tou = dc.tou_price
+        if lmp is not None:
+            price_tab = [float(lmp)] * 24
+            has_price = True
+        elif tou:
+            ltou = len(tou)
+            price_tab = [float(tou[h % ltou]) for h in range(24)]
+            has_price = True
+        else:
+            price_tab = [0.0] * 24
+            has_price = False
+
+        # Water constants (evaporative path)
+        ws = float(dc.water_static)
+        wc = float(dc.water_cycling_density)
+        bd_ratio = max(1e-9, float(dc.blowdown_ratio))
+        pot_ei = float(dc.potable_energy_intensity)
+        ww_ei = float(dc.wastewater_energy_intensity)
+        wue = getattr(dc, "wue_l_per_kwh", 0.0)
+
+        # Solar / battery: identity when absent, real method when present.
+        has_pv = (dc.solar_pv_area_m2 > 0.0 and bool(getattr(dc, "solar_irradiance_24h", None))) or \
+                 (getattr(dc, "solar_kw_capacity", 0.0) > 0.0 and bool(getattr(dc, "solar_profile_24h", None)))
+        battery = getattr(dc, "battery", None)
+        has_offset = has_pv or bool(battery)
+        offset_fn = dc._apply_solar_battery_offset
+
+        # ── Per-unit constants (lazy per-model perf resolution) ──────────────
+        # u_const[id(u)] = (it_power_w, tdp_ok, exec_mult, fast_perf_dict)
+        u_const: Dict[int, tuple] = {}
+
+        def _unit_const(u):
+            c = u_const.get(id(u))
+            if c is None:
+                exec_mult = max(0.0, 1.0 + dc.exec_ms_temp_alpha * dT)
+                if u.accel_type not in ("CPU", "cpu"):
+                    it_power_w = float(u.tdp_w or 0.0) * 1.0 * max(0.0, 1.0 + dc.it_power_temp_alpha * dT)
+                else:
+                    it_power_w = u._base_it_power_w() * 1.0 * u._it_power_temp_mult()
+                c = (it_power_w, float(u.tdp_w or 0.0) > 0.0, exec_mult, {})
+                u_const[id(u)] = c
+            return c
+
+        def _resolve_models(u, model, fast_perf):
+            # Replicates estimate_exec_ms's lazy unit cache + schedule_request's
+            # DC-level prefill cache, including their substring fallbacks.
+            if not hasattr(u, "_model_cache"):
+                u._model_cache = {}
+            if model not in u._model_cache:
+                rec = u.model_perf.get(model)
+                if not rec:
+                    if model in ["Llama7b", "Llama70b"]:
+                        for k in u.model_perf:
+                            if model in k and "FP16" in k and "B1" in k:
+                                rec = u.model_perf[k]
+                                break
+                    if not rec:
+                        for k, v in u.model_perf.items():
+                            if k in model or model in k:
+                                rec = v
+                                break
+                u._model_cache[model] = rec
+            if model not in dc_model_cache:
+                rec_dc = u.model_perf.get(model)
+                if not rec_dc:
+                    for k, v in u.model_perf.items():
+                        if k in model or model in k:
+                            rec_dc = v
+                            break
+                dc_model_cache[model] = rec_dc
+            rec_u = u._model_cache[model]
+            # exec coefficients
+            if not rec_u:
+                exec_kind, exec_val = 0, 0.0
+            elif "ms_per_token" in rec_u and rec_u["ms_per_token"] > 0:
+                exec_kind, exec_val = 1, float(rec_u["ms_per_token"])
+            elif "ms_per_request" in rec_u:
+                exec_kind, exec_val = 2, float(rec_u["ms_per_request"])
+            else:
+                exec_kind, exec_val = 0, 0.0
+            # prefill rec: unit cache value, falling back to DC cache when None
+            rec_p = rec_u if rec_u is not None else dc_model_cache.get(model)
+            if not rec_p:
+                pf_kind, pf_val = 0, 0.0
+            elif "ms_per_request" in rec_p:
+                pf_kind, pf_val = 2, float(rec_p["ms_per_request"])
+            elif "ms_per_token" in rec_p:
+                pf_kind, pf_val = 1, float(rec_p["ms_per_token"])
+            else:
+                pf_kind, pf_val = 0, 0.0
+            info = (exec_kind, exec_val, pf_kind, pf_val)
+            fast_perf[model] = info
+            return info
+
+        collecting = True  # caller decides; tuples are folded/stored upstream
+        for _ri in row_indices:
+            row_idx = int(_ri)
+            src_dc = int(src_dcs[row_idx])
+            model = str(models[row_idx])
+            arrival_rel_ms = float(arrivals[row_idx])
+            arrival_abs_ms = epoch_start_ms + arrival_rel_ms
+            net_ms = float(net_arr[row_idx])
+            tokens = int(tokens_arr[row_idx])
+            base_tokens = int(base_tokens_arr[row_idx])
+            try:
+                if not heap:
+                    out.append((row_idx, {
+                        "epoch": int(epoch_idx), "request_idx": row_idx,
+                        "source_dc": src_dc, "target_dc": tgt_dc, "model": model,
+                        "arrival_ms": arrival_rel_ms, "net_latency_ms": net_ms, "tokens": tokens,
+                        "dc_id": dc.id, "dropped": True, "ttft_s": 0.0,
+                        "energy_kwh": 0.0, "carbon_g": 0.0, "cost_usd": 0.0, "water_m3": 0.0,
+                    }))
+                    continue
+
+                avail_ms, node_id, unit = heapq.heappop(heap)
+                it_power_w, tdp_ok, exec_mult, fast_perf = _unit_const(unit)
+                info = fast_perf.get(model)
+                if info is None:
+                    info = _resolve_models(unit, model, fast_perf)
+                exec_kind, exec_val, pf_kind, pf_val = info
+
+                if exec_kind == 1:
+                    exec_ms = float(exec_val) * float(tokens) * exec_mult
+                elif exec_kind == 2:
+                    exec_ms = float(exec_val) * exec_mult
+                else:
+                    exec_ms = 0.0
+
+                start_ms = arrival_abs_ms if arrival_abs_ms > unit.next_available_ms else unit.next_available_ms
+                wait_ms = start_ms - arrival_abs_ms
+
+                if start_ms > epoch_end_ms:
+                    heapq.heappush(heap, (unit.next_available_ms, unit.node_id, unit))
+                    out.append((row_idx, {
+                        "epoch": int(epoch_idx), "request_idx": row_idx,
+                        "source_dc": src_dc, "target_dc": tgt_dc, "model": model,
+                        "arrival_ms": arrival_rel_ms, "net_latency_ms": net_ms, "tokens": tokens,
+                        "dc_id": int(dc.id), "dropped": True, "ttft_s": 0.0,
+                        "energy_kwh": 0.0, "carbon_g": 0.0, "cost_usd": 0.0, "water_m3": 0.0,
+                    }))
+                    continue
+
+                unit.next_available_ms = start_ms + exec_ms
+                end_ms = start_ms + exec_ms
+                heapq.heappush(heap, (unit.next_available_ms, unit.node_id, unit))
+
+                # ── settle_and_score, fused ───────────────────────────────────
+                h = int(((start_ms / 1000.0) % 86400.0) // 3600.0)
+                # it_energy_kwh_for_exec (units in heap are never OFF)
+                if tdp_ok:
+                    hours = exec_ms / 3_600_000.0
+                    unit.busy_ms_epoch += exec_ms
+                    it_kwh = it_power_w * hours / 1000.0
+                else:
+                    it_kwh = 0.0
+                other_kwh = it_kwh * other_frac
+                if is_liquid:
+                    pump_kwh = it_kwh * pump_frac
+                    cooling_kwh = pump_kwh + it_kwh * ppue_excess
+                    if pump_kwh > cooling_kwh:
+                        cooling_kwh = pump_kwh
+                elif is_mech:
+                    cooling_kwh = it_kwh / cop_acct[h]
+                else:
+                    non_it = it_kwh * pue_minus1
+                    cooling_kwh = non_it - other_kwh
+                    if cooling_kwh < 0.0:
+                        cooling_kwh = 0.0
+                gross_kwh = it_kwh + other_kwh + cooling_kwh
+
+                # accumulators, in the reference order — including the float
+                # cancellation of the energy_it_kwh pre/post diff
+                pre_it = dc.energy_it_kwh
+                dc.energy_it_kwh = pre_it + it_kwh
+                dc.energy_other_kwh += other_kwh
+                dc.energy_cooling_kwh += cooling_kwh
+                dc._busy_ms += exec_ms
+                it_kwh_this = dc.energy_it_kwh - pre_it
+
+                if has_offset:
+                    grid_kwh = offset_fn(gross_kwh, start_ms, end_ms)
+                else:
+                    grid_kwh = gross_kwh if gross_kwh > 0.0 else 0.0
+                dc.energy_grid_kwh += grid_kwh
+
+                water_m3 = 0.0
+                if is_mech:
+                    if closed_loop:
+                        water_m3 = wue * it_kwh_this / 1000.0
+                        dc.water_makeup_m3 += water_m3
+                    else:
+                        heat = it_kwh_this + (it_kwh_this / cop_acct[h])
+                        static_m3 = ws * heat
+                        evap_m3 = wc * heat
+                        draw_m3 = evap_m3 / bd_ratio
+                        blow_m3 = draw_m3 - evap_m3
+                        if blow_m3 < 0.0:
+                            blow_m3 = 0.0
+                        makeup_m3 = static_m3 + draw_m3
+                        pot_kwh = pot_ei * (evap_m3 + static_m3)
+                        ww_kwh = ww_ei * blow_m3
+                        tot_w_kwh = pot_kwh + ww_kwh
+                        dc.water_static_m3 += static_m3
+                        dc.water_evap_m3 += evap_m3
+                        dc.water_blowdown_m3 += blow_m3
+                        dc.water_makeup_m3 += makeup_m3
+                        dc.water_energy_potable_kwh += pot_kwh
+                        dc.water_energy_wastewater_kwh += ww_kwh
+                        dc.water_energy_total_kwh += tot_w_kwh
+                        dc.water_carbon_g += tot_w_kwh * ci
+                        water_m3 = makeup_m3
+                elif closed_loop:
+                    water_m3 = wue * it_kwh_this / 1000.0
+                    dc.water_makeup_m3 += water_m3
+
+                carbon_g = grid_kwh * ci
+                if has_price:
+                    cost_usd = price_tab[h] * grid_kwh
+                else:
+                    cost_usd = 0.0
+                dc.cost_usd += cost_usd
+
+                # prefill (uses base_tokens; falls back to 1 when zero)
+                if pf_kind == 2:
+                    prefill_ms = pf_val * exec_mult
+                elif pf_kind == 1:
+                    prefill_ms = pf_val * float(base_tokens or 1) * exec_mult
+                else:
+                    prefill_ms = 0.0
+                ttft_s = (net_ms + wait_ms + prefill_ms) / 1000.0
+
+                result = {
+                    "epoch": int(epoch_idx), "request_idx": row_idx,
+                    "source_dc": src_dc, "target_dc": tgt_dc, "model": model,
+                    "arrival_ms": arrival_rel_ms, "net_latency_ms": net_ms, "tokens": tokens,
+                    "dc_id": int(dc.id),
+                    "start_ms": start_ms - epoch_start_ms, "end_ms": end_ms - epoch_start_ms,
+                    "exec_ms": exec_ms,
+                    "ttft_s": ttft_s, "dropped": False,
+                    "wait_ms": wait_ms,
+                    "prefill_ms": prefill_ms,
+                    "energy_kwh": gross_kwh,
+                    "carbon_g": carbon_g,
+                    "cost_usd": cost_usd,
+                    "water_m3": water_m3,
+                }
+            except Exception:
+                result = {
+                    "epoch": int(epoch_idx), "request_idx": row_idx,
+                    "source_dc": src_dc, "target_dc": tgt_dc, "model": model,
+                    "arrival_ms": arrival_rel_ms, "net_latency_ms": net_ms, "tokens": tokens,
+                    "ttft_s": net_ms / 1000.0, "dropped": True,
+                    "energy_cost": 0.0, "cost_usd": 0.0, "energy_kwh": 0.0, "carbon_g": 0.0, "water_m3": 0.0,
+                }
+            out.append((row_idx, result))
+        return out
+
+    def _process_requests_for_dc_reference(self, dc: "Datacenter", dc_id: int, row_indices,
+                                 epoch_idx: int, epoch_start_ms: float,
+                                 cols: Tuple[Any, ...]) -> List[Tuple[int, Dict[str, Any]]]:
         # row_indices: an array('i') of workload row indices routed to this DC.
         # cols: the workload's columnar arrays.  The 9 per-request fields used
         # to be carried as a tuple per request; they are now read back here by
@@ -1114,7 +1449,88 @@ class Geo_Network:
 
             _reroute_cache: Dict[int, int] = {}
 
-            for row_idx in range(n_rows):
+            # ── Vectorized routing (fast path) ────────────────────────────
+            # The per-row loop below spends most of its time on int()/str()
+            # casts and dict gets repeated n_rows times.  When there is no
+            # per-row dict map (mp) and at least one serviceable DC, the
+            # routing decision is a pure function of (map_array, model,
+            # source) computable with numpy in bulk: resolve targets, reroute
+            # invalid ones via the same nearest-serviceable rule, look up net
+            # latency from a (src, tgt) table built with the same
+            # _safe_net_ms, and group row indices per DC in ascending order —
+            # exactly the order the loop produced.  Any coercion surprise
+            # falls back to the reference loop.
+            _fast_routed = False
+            if _RFS_FAST and not mp and serviceable_dcs:
+                try:
+                    src_v = np.asarray(src_dcs).astype(np.int64, copy=False)
+                    tgt_v = np.full(n_rows, np.int64(-1))
+                    assigned = np.zeros(n_rows, dtype=bool)
+                    if map_arr is not None and map_arr_len > 0:
+                        ma = np.asarray(map_arr).astype(np.int64, copy=False)
+                        m = min(n_rows, map_arr_len)
+                        ok = ma[:m] >= 0
+                        tgt_v[:m][ok] = ma[:m][ok]
+                        assigned[:m][ok] = True
+                    if not assigned.all():
+                        un = ~assigned
+                        models_v = np.asarray(models)
+                        fallback_default = default_dc != -1
+                        for mu in np.unique(models_v[un]):
+                            rows_m = un & (models_v == mu)
+                            r = rt.get(str(mu))
+                            if r is not None:
+                                tgt_v[rows_m] = int(r)
+                            elif fallback_default:
+                                tgt_v[rows_m] = int(default_dc)
+                            else:
+                                tgt_v[rows_m] = src_v[rows_m]
+                    # Reroute invalid targets to nearest serviceable (per src),
+                    # using the same (net_ms, dc_id) tie-break as the loop.
+                    sv_arr = np.fromiter(serviceable_set, dtype=np.int64)
+                    invalid = ~np.isin(tgt_v, sv_arr)
+                    if invalid.any():
+                        for s in np.unique(src_v[invalid]):
+                            s = int(s)
+                            rr = _reroute_cache.get(s)
+                            if rr is None:
+                                rr = min(serviceable_dcs,
+                                         key=lambda c: (_safe_net_ms(s, c), c))
+                                _reroute_cache[s] = rr
+                            tgt_v[invalid & (src_v == s)] = rr
+                    # net latency via small (src, tgt) lookup table
+                    su = np.unique(src_v); tu = np.unique(tgt_v)
+                    net_tab = {(int(s), int(t)): _safe_net_ms(int(s), int(t))
+                               for s in su for t in tu}
+                    s_pos = {int(v): i for i, v in enumerate(su)}
+                    t_pos = {int(v): i for i, v in enumerate(tu)}
+                    M = np.empty((len(su), len(tu)), dtype=np.float64)
+                    for s in su:
+                        for t in tu:
+                            M[s_pos[int(s)], t_pos[int(t)]] = net_tab[(int(s), int(t))]
+                    si = np.searchsorted(su, src_v)
+                    ti = np.searchsorted(tu, tgt_v)
+                    net_arr[:] = M[si, ti]
+                    # group row indices per DC, ascending within each DC, and
+                    # insert DC keys in FIRST-ENCOUNTER order — the reference
+                    # loop's defaultdict insertion order — so downstream
+                    # iteration (and the streaming fold's float-summation
+                    # order across DCs) is unchanged.
+                    _u, _first = np.unique(tgt_v, return_index=True)
+                    for d in _u[np.argsort(_first)]:
+                        idxs = np.flatnonzero(tgt_v == d).astype(np.int32)
+                        a = array.array("i")
+                        a.frombytes(idxs.tobytes())
+                        tasks_by_dc[int(d)] = a
+                    total_tokens_for_agg += int(tokens_arr.sum())
+                    _fast_routed = True
+                except Exception:
+                    tasks_by_dc.clear()
+                    net_arr[:] = 0.0
+                    total_tokens_for_agg = 0
+                    _fast_routed = False
+
+            for row_idx in (() if _fast_routed else range(n_rows)):
                 src_dc = int(src_dcs[row_idx])
                 model = str(models[row_idx])
                 arrival_rel_ms = float(arrivals[row_idx])

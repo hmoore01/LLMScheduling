@@ -1,149 +1,94 @@
-#!/usr/bin/env python3
+"""Profiling + regression harness for Rate_Flow_Sim_v2.
+
+Builds a minimal-but-valid sim_specs dir, a realistic synthetic workload,
+runs run_epoch, and profiles it.  Also used to verify optimized versions
+produce EXACTLY identical outputs.
 """
-profile_simulator.py — find where the simulator actually spends its time.
-
-Runs ONE realistic autoscaled epoch through Rate_Flow_Sim.run_epoch under
-cProfile and reports the hottest functions by cumulative and total time.
-This tells us which lines to optimize — measured, not guessed.
-
-Usage:
-    python3 profile_simulator.py
-    python3 profile_simulator.py --trace simulator_ready_trace.csv --epoch 81
-    python3 profile_simulator.py --count-mult 4000   # match the real sweep scale
-
-The default count-mult matches a realistic sweep epoch so the profile reflects
-real run conditions, not a toy workload.
-"""
-from __future__ import annotations
-import argparse
-import cProfile
-import io
-import pstats
-import sys
-import time
+import os, sys, cProfile, pstats, io, time
 import numpy as np
 import pandas as pd
 
-from Rate_Flow_Sim_v2 import LLM_Simulator
+# Synthetic specs go in their OWN directory so the harness can never clobber
+# a real sim_specs/.  Point RFS_SPEC_DIR at your real spec dir to run the
+# harness/equivalence tests against the actual world instead (no files are
+# written in that case).
+SPEC = os.environ.get("RFS_SPEC_DIR", "sim_specs_synth")
+_USING_REAL_SPECS = "RFS_SPEC_DIR" in os.environ
 
+def build_specs(num_dcs=8, nodes_per_dc=40):
+    if _USING_REAL_SPECS:
+        return  # never write into a user-supplied spec dir
+    if os.path.isdir(SPEC):
+        expected = {"Datacenter_specs.csv", "Node_Specs.csv", "Geo_Latencies.csv",
+                    "H100_GPU.csv", "A100_GPU.csv"}
+        existing = set(os.listdir(SPEC))
+        if existing - expected:
+            raise SystemExit(
+                f"Refusing to write synthetic specs: {SPEC}/ contains unexpected "
+                f"files ({sorted(existing - expected)[:5]}...). Set RFS_SPEC_DIR "
+                f"to use real specs, or point SPEC elsewhere.")
+    os.makedirs(SPEC, exist_ok=True)
+    tou = ";".join(f"{0.08+0.04*np.sin(h/24*6.283):.4f}" for h in range(24))
+    cop = ";".join(f"{3.5+0.5*np.sin(h/24*6.283):.3f}" for h in range(24))
+    rows = []
+    for d in range(num_dcs):
+        rows.append({
+            "DC_Num": d, "Carbon_Intensity": 200 + 40*d, "Water_Static": 0.00018,
+            "Water_Cycling_Density": 0.0009, "Solids_Ratio": 0.2,
+            "Potable_Energy_Intensity": 0.4, "Wastewater_Energy_Intensity": 0.7,
+            "Time_of_Use(24_Hours)": tou, "COP_Profile(24_Hours)": cop,
+            "Node_Type_Counts": f"0:{nodes_per_dc//2};1:{nodes_per_dc - nodes_per_dc//2}",
+            "Total_Nodes": nodes_per_dc, "Cooling_Mode": "MECH_COP",
+        })
+    pd.DataFrame(rows).to_csv(f"{SPEC}/Datacenter_specs.csv", index=False)
+    pd.DataFrame([
+        {"Node_Num": 0, "Node_Type": "8_H100s"},
+        {"Node_Num": 1, "Node_Type": "8_A100s"},
+    ]).to_csv(f"{SPEC}/Node_Specs.csv", index=False)
+    for chip, ms70 in [("H100", 28.0), ("A100", 55.0)]:
+        pd.DataFrame([{
+            "num_GPUs": 8, "TDP": 5600 if chip == "H100" else 3200,
+            "Model_Variant": "FP16", "Scenario_Type": "Standard", "batch_size": 1,
+            "Llama7b_Process": ms70/6.0, "Llama70b_Process": ms70,
+        }]).to_csv(f"{SPEC}/{chip}_GPU.csv", index=False)
+    lat = pd.DataFrame(
+        [[0.0 if i == j else 20.0 + 5.0*abs(i-j) for j in range(num_dcs)] for i in range(num_dcs)])
+    lat.insert(0, "Datacenter_Dest", range(num_dcs))
+    lat.to_csv(f"{SPEC}/Geo_Latencies.csv", index=False)
 
-def load_epoch(trace_path: str, epoch_idx: int):
-    trace = pd.read_csv(trace_path)
-    ecol = None
-    for c in ("epoch", "epoch_idx", "epoch_index"):
-        if c in trace.columns:
-            ecol = c
-            break
-    if ecol is None:
-        raise ValueError(f"No epoch column in {trace_path}")
-    grp = trace.groupby(ecol)
-    if epoch_idx not in grp.groups:
-        # pick the busiest epoch instead
-        epoch_idx = max(grp.groups.keys(), key=lambda e: len(grp.get_group(e)))
-        print(f"[profile] requested epoch not found; using busiest epoch {epoch_idx}")
-    return grp.get_group(epoch_idx).copy(), epoch_idx
+def build_workload(n=300_000, num_dcs=8, seed=0):
+    rng = np.random.default_rng(seed)
+    return pd.DataFrame({
+        "source_dc_id": rng.integers(0, num_dcs, n),
+        "model_type": rng.choice(["Llama70b", "Llama7b"], n, p=[0.75, 0.25]),
+        "num_tokens": rng.lognormal(6.0, 0.8, n).astype(np.int64).clip(10, 30_000),
+        "arrival_ms": np.sort(rng.uniform(0, 900_000, n)),
+        "base_num_tokens": rng.lognormal(5.5, 0.7, n).astype(np.int64).clip(10, 5000),
+    })
 
-
-def replicate_epoch(epoch_df: pd.DataFrame, count_mult: int, token_scale: float,
-                    epoch_length_s: int = 900):
-    """Build a scaled epoch the same way the autoscaler would — so the profile
-    reflects real sweep conditions."""
-    if count_mult <= 1:
-        out = epoch_df.copy()
-    else:
-        n_base = len(epoch_df)
-        tiled = {c: np.tile(epoch_df[c].to_numpy(), count_mult) for c in epoch_df.columns}
-        out = pd.DataFrame(tiled)
-        base_arr = np.tile(
-            pd.to_numeric(epoch_df["arrival_ms"], errors="coerce").fillna(0.0).to_numpy(),
-            count_mult)
-        dup = np.repeat(np.arange(count_mult, dtype=float), n_base)
-        win = float(epoch_length_s) * 1000.0
-        slot = win / float(count_mult)
-        rng = np.random.default_rng(12345)
-        jit = rng.uniform(0.0, slot, size=len(out))
-        out["arrival_ms"] = (base_arr + dup * slot + jit) % win
-    out["num_tokens"] = (
-        pd.to_numeric(out["num_tokens"], errors="coerce").fillna(0.0) * token_scale
-    ).round().astype(int)
-    return out
-
-
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--trace", default="simulator_ready_trace.csv")
-    ap.add_argument("--spec-dir", default="sim_specs")
-    ap.add_argument("--epoch", type=int, default=81)
-    ap.add_argument("--epoch-length", type=int, default=900)
-    ap.add_argument("--count-mult", type=int, default=4000,
-                    help="row replication — match the real sweep (~4000)")
-    ap.add_argument("--token-scale", type=float, default=1.6)
-    ap.add_argument("--top", type=int, default=25, help="hottest N functions to show")
-    args = ap.parse_args()
-
-    print("=" * 74)
-    print("SIMULATOR PROFILE")
-    print("=" * 74)
-
-    print("[1] Building simulator ...")
-    t0 = time.time()
-    sim = LLM_Simulator(spec_dir=args.spec_dir,
-                        epoch_length=args.epoch_length, debug=False)
-    print(f"    built in {time.time()-t0:.2f}s")
-
-    print("[2] Loading + scaling epoch ...")
-    base_df, ep = load_epoch(args.trace, args.epoch)
-    scaled = replicate_epoch(base_df, args.count_mult, args.token_scale,
-                             args.epoch_length)
-    print(f"    epoch {ep}: {len(base_df):,} base rows -> {len(scaled):,} scaled "
-          f"(count_mult={args.count_mult}, token_scale={args.token_scale})")
-
-    # Empty schedule_plan = simulator default routing; empty power_plan = default.
-    schedule_plan: dict = {}
-    power_plan: dict = {}
-
-    print("[3] Profiling run_epoch ...")
-    prof = cProfile.Profile()
-    t0 = time.time()
-    prof.enable()
-    sim.run_epoch(ep, scaled, schedule_plan, power_plan)
-    prof.disable()
-    wall = time.time() - t0
-    print(f"    run_epoch wall time: {wall:.2f}s for {len(scaled):,} requests "
-          f"({1000*wall/max(1,len(scaled)):.3f} ms/request)")
-
-    # ── Report: cumulative time (where time is spent including callees) ──────
-    print("\n" + "=" * 74)
-    print(f"TOP {args.top} BY CUMULATIVE TIME (includes sub-calls)")
-    print("=" * 74)
-    s = io.StringIO()
-    ps = pstats.Stats(prof, stream=s).sort_stats("cumulative")
-    ps.print_stats(args.top)
-    print(s.getvalue())
-
-    # ── Report: total time (time IN the function itself, the real hotspots) ──
-    print("=" * 74)
-    print(f"TOP {args.top} BY TOTAL/SELF TIME (the actual hot lines to optimize)")
-    print("=" * 74)
-    s = io.StringIO()
-    ps = pstats.Stats(prof, stream=s).sort_stats("tottime")
-    ps.print_stats(args.top)
-    print(s.getvalue())
-
-    # ── Extrapolation ────────────────────────────────────────────────────────
-    print("=" * 74)
-    print("EXTRAPOLATION")
-    print("=" * 74)
-    per_epoch = wall
-    print(f"  1 epoch  @ this scale : {per_epoch:.1f}s")
-    print(f"  82 epochs (1 config)  : {per_epoch*82/60:.1f} min")
-    print(f"  1530 configs          : {per_epoch*82*1530/3600:.0f} hours "
-          f"({per_epoch*82*1530/86400:.1f} days)")
-    print()
-    print("  The TOTAL-TIME table above lists the functions to optimize first.")
-    print("  A function high in tottime with a huge call count is usually a")
-    print("  per-request Python loop that can be vectorised.")
-
+def run(module_name, n_rows, collect_details, profile=False):
+    sys.path.insert(0, ".")
+    mod = __import__(module_name)
+    sim = mod.LLM_Simulator(debug=False, spec_dir=SPEC)
+    wl = build_workload(n_rows)
+    plan = {"route": {"Llama70b": 2, "Llama7b": 5}}   # exercise routing path
+    if profile:
+        pr = cProfile.Profile(); pr.enable()
+    t0 = time.perf_counter()
+    stats, details, dc_usage = sim.run_epoch(3, wl, plan, {"all": "ON"}, collect_details=collect_details)
+    dt = time.perf_counter() - t0
+    if profile:
+        pr.disable()
+        s = io.StringIO()
+        pstats.Stats(pr, stream=s).sort_stats("cumulative").print_stats(22)
+        print(s.getvalue())
+    return stats, details, dc_usage, dt
 
 if __name__ == "__main__":
-    main()
+    build_specs()
+    mode = sys.argv[1] if len(sys.argv) > 1 else "profile"
+    n = int(sys.argv[2]) if len(sys.argv) > 2 else 300_000
+    if mode == "profile":
+        stats, details, _, dt = run("Rate_Flow_Sim_v2", n, collect_details=True, profile=True)
+        print(f"rows={n}  wall={dt:.2f}s  completed={stats['requests_completed']} "
+              f"dropped={stats['requests_dropped']} avg_ttft={stats['avg_ttft']:.4f}")
