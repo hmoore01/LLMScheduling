@@ -94,9 +94,7 @@ TRACES = [
 # additionally recognise these FRONT tags: helix, splitwise, perllm, hybrid,
 # nsga2.  If any of those are intended baselines, add their CLI name here — they
 # are NOT run unless listed.
-FRAMEWORKS = [   # online-only — no --offline-train
-    "nsga2",
-]
+FRAMEWORKS = [f.strip() for f in os.environ.get("SWEEP_FRAMEWORKS", "nsga2").split(",") if f.strip()]
 
 # ── Sweep axes ────────────────────────────────────────────────────────────────
 BASELINE_DCS        = 8
