@@ -62,3 +62,10 @@ run_id,trace,framework,sweep,num_dcs,target_util,large_frac,distribution,predict
 9,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,4,cost_agent,ok,96,96,multi-agent-summary,3.1370,20296.4700,1172522.6250,8643.9980,58460.6680,,,,,,
 9,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,4,Balanced,ok,96,96,multi-agent-summary,2.4428,20852.4600,1021571.8310,9477.6890,59560.8630,,,,,,
 9,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,4,Pareto_Sample,ok,96,96,multi-agent-summary,3.1006,184518.5360,9702355.2830,77920.1480,513932.0550,,,,,,
+10,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,5,run,ok,96,96,final-report,2.242409,21555.342,1620219.9631,8420.393,65242.625,5928595829248862.00,475.16,0,2026-06-16T04:52:32,2026-06-16T12:48:35,/home/hmoore01/anaconda3/envs/mrl/bin/python3 -u simulator_LLM.py --framework lahyper --epoch 96 --num-dcs 4 --target-util 0.95 --autoscale-mode global_peak --autoscale-max-drop 0.02 --autoscale-max-mult 1500000 --autoscale-max-rows 16000000 --autoscale-search-steps 9 --distribution even --autoscale-target-token-scale 50.000000 --autoscale-plan-cache experiment_results/autoscale_plans.json --autoscale-plan-key burstgpt|dcs4|util0.95|lf0.75|even|noise0.00
+10,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,5,time_agent,ok,96,96,multi-agent-summary,1.6515,49657.6700,2978903.6870,19804.0740,137316.2620,,,,,,
+10,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,5,carbon_agent,ok,96,96,multi-agent-summary,2.8388,18634.8110,1874879.2970,8461.9310,64916.6820,,,,,,
+10,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,5,water_agent,ok,96,96,multi-agent-summary,6.9688,27238.7120,1262765.5000,9663.5970,70891.5160,,,,,,
+10,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,5,cost_agent,ok,96,96,multi-agent-summary,3.6253,20964.5460,1742767.5660,7666.6380,64262.3080,,,,,,
+10,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,5,Balanced,ok,96,96,multi-agent-summary,2.2424,21555.3420,1620219.9630,8420.3930,65242.6250,,,,,,
+10,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,5,Pareto_Sample,ok,96,96,multi-agent-summary,6.0537,164507.5880,10687408.2100,64196.4070,472671.6180,,,,,,
