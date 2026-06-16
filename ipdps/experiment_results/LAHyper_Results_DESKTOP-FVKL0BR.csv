@@ -55,3 +55,10 @@ run_id,trace,framework,sweep,num_dcs,target_util,large_frac,distribution,predict
 8,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,3,cost_agent,ok,96,96,multi-agent-summary,3.4384,18833.3720,1174692.9740,8683.5150,57593.2880,,,,,,
 8,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,3,Balanced,ok,96,96,multi-agent-summary,2.4323,18066.2700,962457.7340,9620.3080,56578.6150,,,,,,
 8,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,3,Pareto_Sample,ok,96,96,multi-agent-summary,4.4832,166062.1080,9063424.4980,78474.0910,488676.9920,,,,,,
+9,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,4,run,ok,96,96,final-report,2.442771,20852.460,1021571.8312,9477.689,59560.863,4320941527396094.50,472.57,0,2026-06-15T20:59:12,2026-06-16T04:52:32,/home/hmoore01/anaconda3/envs/mrl/bin/python3 -u simulator_LLM.py --framework lahyper --epoch 96 --num-dcs 4 --target-util 0.95 --autoscale-mode global_peak --autoscale-max-drop 0.02 --autoscale-max-mult 1500000 --autoscale-max-rows 16000000 --autoscale-search-steps 9 --distribution even --autoscale-target-token-scale 50.000000 --autoscale-plan-cache experiment_results/autoscale_plans.json --autoscale-plan-key burstgpt|dcs4|util0.95|lf0.75|even|noise0.00
+9,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,4,time_agent,ok,96,96,multi-agent-summary,1.6905,47838.2940,2567189.4260,19851.8310,131304.6670,,,,,,
+9,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,4,carbon_agent,ok,96,96,multi-agent-summary,2.4788,18124.5330,1313188.9490,9414.9950,59501.2780,,,,,,
+9,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,4,water_agent,ok,96,96,multi-agent-summary,5.2456,22947.5990,787411.0620,9899.6550,60267.2980,,,,,,
+9,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,4,cost_agent,ok,96,96,multi-agent-summary,3.1370,20296.4700,1172522.6250,8643.9980,58460.6680,,,,,,
+9,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,4,Balanced,ok,96,96,multi-agent-summary,2.4428,20852.4600,1021571.8310,9477.6890,59560.8630,,,,,,
+9,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,4,Pareto_Sample,ok,96,96,multi-agent-summary,3.1006,184518.5360,9702355.2830,77920.1480,513932.0550,,,,,,
