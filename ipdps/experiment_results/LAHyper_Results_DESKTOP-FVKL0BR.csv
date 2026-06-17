@@ -69,3 +69,10 @@ run_id,trace,framework,sweep,num_dcs,target_util,large_frac,distribution,predict
 10,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,5,cost_agent,ok,96,96,multi-agent-summary,3.6253,20964.5460,1742767.5660,7666.6380,64262.3080,,,,,,
 10,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,5,Balanced,ok,96,96,multi-agent-summary,2.2424,21555.3420,1620219.9630,8420.3930,65242.6250,,,,,,
 10,burstgpt,lahyper,dc_sweep,4,0.95,0.75,even,0.00,5,Pareto_Sample,ok,96,96,multi-agent-summary,6.0537,164507.5880,10687408.2100,64196.4070,472671.6180,,,,,,
+11,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,1,run,ok,96,96,final-report,2.343416,18230.137,1063183.0139,9437.634,58419.113,5469329859270857.00,563.43,0,2026-06-16T12:48:35,2026-06-16T22:12:51,/home/hmoore01/anaconda3/envs/mrl/bin/python3 -u simulator_LLM.py --framework lahyper --epoch 96 --num-dcs 6 --target-util 0.95 --autoscale-mode global_peak --autoscale-max-drop 0.02 --autoscale-max-mult 1500000 --autoscale-max-rows 16000000 --autoscale-search-steps 9 --distribution even --autoscale-target-token-scale 50.000000 --autoscale-plan-cache experiment_results/autoscale_plans.json --autoscale-plan-key burstgpt|dcs6|util0.95|lf0.75|even|noise0.00
+11,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,1,time_agent,ok,96,96,multi-agent-summary,1.8199,50564.1530,2873840.8640,21088.9650,140290.0890,,,,,,
+11,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,1,carbon_agent,ok,96,96,multi-agent-summary,2.7529,13068.6090,1722627.7150,8688.6600,58941.0810,,,,,,
+11,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,1,water_agent,ok,96,96,multi-agent-summary,6.3452,23489.6820,694274.1090,10958.2220,64343.3390,,,,,,
+11,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,1,cost_agent,ok,96,96,multi-agent-summary,2.7152,15895.3320,1527293.0130,7924.1310,58429.7090,,,,,,
+11,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,1,Balanced,ok,96,96,multi-agent-summary,2.3434,18230.1370,1063183.0140,9437.6340,58419.1130,,,,,,
+11,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,1,Pareto_Sample,ok,96,96,multi-agent-summary,7.6742,164809.5120,10064434.7720,75669.4190,500002.6910,,,,,,
