@@ -76,3 +76,10 @@ run_id,trace,framework,sweep,num_dcs,target_util,large_frac,distribution,predict
 11,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,1,cost_agent,ok,96,96,multi-agent-summary,2.7152,15895.3320,1527293.0130,7924.1310,58429.7090,,,,,,
 11,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,1,Balanced,ok,96,96,multi-agent-summary,2.3434,18230.1370,1063183.0140,9437.6340,58419.1130,,,,,,
 11,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,1,Pareto_Sample,ok,96,96,multi-agent-summary,7.6742,164809.5120,10064434.7720,75669.4190,500002.6910,,,,,,
+12,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,2,run,ok,96,96,final-report,1.932195,45524.440,2585523.3199,18008.431,124273.634,3369888828134586.00,565.47,0,2026-06-16T22:12:51,2026-06-17T07:39:03,/home/hmoore01/anaconda3/envs/mrl/bin/python3 -u simulator_LLM.py --framework lahyper --epoch 96 --num-dcs 6 --target-util 0.95 --autoscale-mode global_peak --autoscale-max-drop 0.02 --autoscale-max-mult 1500000 --autoscale-max-rows 16000000 --autoscale-search-steps 9 --distribution even --autoscale-target-token-scale 50.000000 --autoscale-plan-cache experiment_results/autoscale_plans.json --autoscale-plan-key burstgpt|dcs6|util0.95|lf0.75|even|noise0.00
+12,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,2,time_agent,ok,96,96,multi-agent-summary,1.5372,59163.7320,3280958.3670,23563.1950,160283.3110,,,,,,
+12,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,2,carbon_agent,ok,96,96,multi-agent-summary,2.0698,41185.3960,2893203.0030,18193.9520,122582.8370,,,,,,
+12,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,2,water_agent,ok,96,96,multi-agent-summary,2.9716,47462.8520,2329032.9780,18430.9300,123978.3010,,,,,,
+12,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,2,cost_agent,ok,96,96,multi-agent-summary,2.0819,44899.6530,2818936.7260,16703.8230,122300.4280,,,,,,
+12,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,2,Balanced,ok,96,96,multi-agent-summary,1.9322,45524.4400,2585523.3200,18008.4310,124273.6340,,,,,,
+12,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,2,Pareto_Sample,ok,96,96,multi-agent-summary,2.3812,289157.2250,16243445.2360,114208.4580,783190.2800,,,,,,
