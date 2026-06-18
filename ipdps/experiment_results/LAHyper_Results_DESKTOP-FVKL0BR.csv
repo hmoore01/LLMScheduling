@@ -97,3 +97,10 @@ run_id,trace,framework,sweep,num_dcs,target_util,large_frac,distribution,predict
 14,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,4,cost_agent,ok,96,96,multi-agent-summary,4.8499,25229.4810,517331.6400,5420.8890,49996.1550,,,,,,
 14,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,4,Balanced,ok,96,96,multi-agent-summary,2.5952,26247.9890,498793.3990,5858.1370,51945.1340,,,,,,
 14,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,4,Pareto_Sample,ok,96,96,multi-agent-summary,3.6137,198942.1020,7318688.9410,58707.0880,461644.2060,,,,,,
+15,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,5,run,ok,96,96,final-report,2.204259,34339.423,1985537.5698,13585.212,94256.576,5619153829839275.00,557.48,0,2026-06-18T01:48:25,2026-06-18T11:06:40,/home/hmoore01/anaconda3/envs/mrl/bin/python3 -u simulator_LLM.py --framework lahyper --epoch 96 --num-dcs 6 --target-util 0.95 --autoscale-mode global_peak --autoscale-max-drop 0.02 --autoscale-max-mult 1500000 --autoscale-max-rows 16000000 --autoscale-search-steps 9 --distribution even --autoscale-target-token-scale 50.000000 --autoscale-plan-cache experiment_results/autoscale_plans.json --autoscale-plan-key burstgpt|dcs6|util0.95|lf0.75|even|noise0.00
+15,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,5,time_agent,ok,96,96,multi-agent-summary,1.6528,55095.5710,3103913.5870,22004.6650,149936.2620,,,,,,
+15,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,5,carbon_agent,ok,96,96,multi-agent-summary,2.6389,29951.7090,2401293.5540,13699.2050,94527.9180,,,,,,
+15,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,5,water_agent,ok,96,96,multi-agent-summary,3.5623,37952.0920,1752004.9150,14470.5990,98804.0970,,,,,,
+15,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,5,cost_agent,ok,96,96,multi-agent-summary,2.4307,33797.2290,2204228.6010,12477.0000,94533.5760,,,,,,
+15,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,5,Balanced,ok,96,96,multi-agent-summary,2.2043,34339.4230,1985537.5700,13585.2120,94256.5760,,,,,,
+15,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,5,Pareto_Sample,ok,96,96,multi-agent-summary,3.2812,242975.6470,13888539.0550,95838.2960,665739.1210,,,,,,
