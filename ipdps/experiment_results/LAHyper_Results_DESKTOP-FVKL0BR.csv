@@ -104,3 +104,10 @@ run_id,trace,framework,sweep,num_dcs,target_util,large_frac,distribution,predict
 15,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,5,cost_agent,ok,96,96,multi-agent-summary,2.4307,33797.2290,2204228.6010,12477.0000,94533.5760,,,,,,
 15,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,5,Balanced,ok,96,96,multi-agent-summary,2.2043,34339.4230,1985537.5700,13585.2120,94256.5760,,,,,,
 15,burstgpt,lahyper,dc_sweep,6,0.95,0.75,even,0.00,5,Pareto_Sample,ok,96,96,multi-agent-summary,3.2812,242975.6470,13888539.0550,95838.2960,665739.1210,,,,,,
+16,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,1,run,ok,96,96,final-report,3.510896,12446.545,584378.6249,8568.318,43167.057,4029809852154497.50,470.15,0,2026-06-18T11:06:40,2026-06-18T18:57:43,/home/hmoore01/anaconda3/envs/mrl/bin/python3 -u simulator_LLM.py --framework lahyper --epoch 96 --num-dcs 10 --target-util 0.95 --autoscale-mode global_peak --autoscale-max-drop 0.02 --autoscale-max-mult 1500000 --autoscale-max-rows 16000000 --autoscale-search-steps 9 --distribution even --autoscale-target-token-scale 50.000000 --autoscale-plan-cache experiment_results/autoscale_plans.json --autoscale-plan-key burstgpt|dcs10|util0.95|lf0.75|even|noise0.00
+16,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,1,time_agent,ok,96,96,multi-agent-summary,1.9034,50588.6350,2966115.3590,21327.2420,141495.6740,,,,,,
+16,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,1,carbon_agent,ok,96,96,multi-agent-summary,4.2456,10780.2980,703256.5590,8578.5490,42286.5770,,,,,,
+16,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,1,water_agent,ok,96,96,multi-agent-summary,5.4553,13829.3730,434734.8060,8678.3950,43151.9020,,,,,,
+16,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,1,cost_agent,ok,96,96,multi-agent-summary,4.9694,12797.2900,705272.3980,7972.7810,43096.4710,,,,,,
+16,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,1,Balanced,ok,96,96,multi-agent-summary,3.5109,12446.5450,584378.6250,8568.3180,43167.0570,,,,,,
+16,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,1,Pareto_Sample,ok,96,96,multi-agent-summary,3.9648,148688.6310,8365195.6170,77374.2620,454655.6040,,,,,,
