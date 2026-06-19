@@ -118,3 +118,10 @@ run_id,trace,framework,sweep,num_dcs,target_util,large_frac,distribution,predict
 17,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,2,cost_agent,ok,96,96,multi-agent-summary,4.6636,19364.9920,1186470.7970,9534.7140,60023.8150,,,,,,
 17,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,2,Balanced,ok,96,96,multi-agent-summary,2.5882,19881.4290,1002550.0260,10446.5840,60973.7660,,,,,,
 17,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,2,Pareto_Sample,ok,96,96,multi-agent-summary,4.0363,162583.4360,9347863.9960,79922.4980,486126.2640,,,,,,
+18,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,3,run,ok,96,96,final-report,3.291416,3898.182,1243461.8772,1631.823,25092.475,4875912188708570.00,448.82,0,2026-06-19T02:21:01,2026-06-19T09:50:42,/home/hmoore01/anaconda3/envs/mrl/bin/python3 -u simulator_LLM.py --framework lahyper --epoch 96 --num-dcs 10 --target-util 0.95 --autoscale-mode global_peak --autoscale-max-drop 0.02 --autoscale-max-mult 1500000 --autoscale-max-rows 16000000 --autoscale-search-steps 9 --distribution even --autoscale-target-token-scale 50.000000 --autoscale-plan-cache experiment_results/autoscale_plans.json --autoscale-plan-key burstgpt|dcs10|util0.95|lf0.75|even|noise0.00
+18,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,3,time_agent,ok,96,96,multi-agent-summary,1.9539,50064.0970,3098156.1130,20450.7550,139793.6850,,,,,,
+18,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,3,carbon_agent,ok,96,96,multi-agent-summary,3.6461,2361.5100,1330725.2100,1610.9420,24019.1500,,,,,,
+18,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,3,water_agent,ok,96,96,multi-agent-summary,5.0532,8547.6090,1053986.6240,3008.3660,31984.9210,,,,,,
+18,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,3,cost_agent,ok,96,96,multi-agent-summary,4.1510,3956.5910,1194582.2860,1414.5600,24384.2310,,,,,,
+18,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,3,Balanced,ok,96,96,multi-agent-summary,3.2914,3898.1820,1243461.8770,1631.8230,25092.4750,,,,,,
+18,burstgpt,lahyper,dc_sweep,10,0.95,0.75,even,0.00,3,Pareto_Sample,ok,96,96,multi-agent-summary,7.2145,111278.6170,10541050.7110,45550.7340,363827.3780,,,,,,
