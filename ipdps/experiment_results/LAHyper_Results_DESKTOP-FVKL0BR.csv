@@ -258,3 +258,10 @@ run_id,trace,framework,sweep,num_dcs,target_util,large_frac,distribution,predict
 37,burstgpt,lahyper,util_sweep,8,0.85,0.75,even,0.00,2,cost_agent,ok,96,96,multi-agent-summary,3.2507,10092.5190,1320119.2450,2911.3140,36557.2340,,,,,,
 37,burstgpt,lahyper,util_sweep,8,0.85,0.75,even,0.00,2,Balanced,ok,96,96,multi-agent-summary,2.8274,9201.1850,1333977.6620,3177.1050,36552.0620,,,,,,
 37,burstgpt,lahyper,util_sweep,8,0.85,0.75,even,0.00,2,Pareto_Sample,ok,96,96,multi-agent-summary,7.9134,131462.9300,10482695.0040,49316.3210,397522.9840,,,,,,
+38,burstgpt,lahyper,util_sweep,8,0.85,0.75,even,0.00,3,run,ok,96,96,final-report,3.300426,10098.141,280820.5479,8063.682,36002.371,5303938503338196.00,441.37,0,2026-06-25T04:57:30,2026-06-25T12:19:40,/home/hmoore01/anaconda3/envs/mrl/bin/python3 -u simulator_LLM.py --framework lahyper --epoch 96 --num-dcs 8 --target-util 0.85 --autoscale-mode global_peak --autoscale-max-drop 0.02 --autoscale-max-mult 1500000 --autoscale-max-rows 16000000 --autoscale-search-steps 9 --distribution even --autoscale-target-token-scale 50.000000 --autoscale-plan-cache experiment_results/autoscale_plans.json --autoscale-plan-key burstgpt|dcs8|util0.85|lf0.75|even|noise0.00
+38,burstgpt,lahyper,util_sweep,8,0.85,0.75,even,0.00,3,time_agent,ok,96,96,multi-agent-summary,1.8802,50146.4800,2906846.1320,21230.2830,139421.2200,,,,,,
+38,burstgpt,lahyper,util_sweep,8,0.85,0.75,even,0.00,3,carbon_agent,ok,96,96,multi-agent-summary,4.6725,7707.5010,402689.7350,7618.5320,33213.1610,,,,,,
+38,burstgpt,lahyper,util_sweep,8,0.85,0.75,even,0.00,3,water_agent,ok,96,96,multi-agent-summary,4.8564,9907.8030,209613.9120,7924.4520,34647.6570,,,,,,
+38,burstgpt,lahyper,util_sweep,8,0.85,0.75,even,0.00,3,cost_agent,ok,96,96,multi-agent-summary,5.0579,9206.0540,356469.7250,7339.2400,33948.8350,,,,,,
+38,burstgpt,lahyper,util_sweep,8,0.85,0.75,even,0.00,3,Balanced,ok,96,96,multi-agent-summary,3.3004,10098.1410,280820.5480,8063.6820,36002.3710,,,,,,
+38,burstgpt,lahyper,util_sweep,8,0.85,0.75,even,0.00,3,Pareto_Sample,ok,96,96,multi-agent-summary,4.1744,145291.9860,7660036.0210,77250.7810,446586.5770,,,,,,
